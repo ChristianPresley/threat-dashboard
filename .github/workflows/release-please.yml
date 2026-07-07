@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # release-please maintains a release PR from conventional commits
+  # (feat: → minor, fix: → patch, feat!:/BREAKING CHANGE → major).
+  # Merging that PR creates the tag + GitHub release and bumps the
+  # version in version.txt and build.zig.zon.
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: rp
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # When a release was just created, build the app and attach the
+  # packaged zip to it.
+  publish:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/threat-dashboard | Out-Null
+          Copy-Item zig-out/bin/threat-dashboard.exe dist/threat-dashboard/
+          Copy-Item -Recurse assets dist/threat-dashboard/assets
+          Copy-Item README.md dist/threat-dashboard/
+          $tag = "${{ needs.release-please.outputs.tag_name }}"
+          Compress-Archive -Path dist/threat-dashboard -DestinationPath "dist/threat-dashboard-$tag-windows-x86_64.zip"
+
+      - name: Attach to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ needs.release-please.outputs.tag_name }}"
+          gh release upload $tag "dist/threat-dashboard-$tag-windows-x86_64.zip" --clobber

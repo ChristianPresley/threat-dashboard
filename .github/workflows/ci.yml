@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      # VULKAN_SDK is deliberately absent on CI: build.zig only copies the
+      # validation layer when the env var exists, and the renderer is not
+      # exercised headlessly.
+      - name: Build (Debug)
+        run: zig build
+
+      - name: Unit tests
+        run: zig build test
+
+      # Headless self-test: mock-world determinism, panel data paths,
+      # font atlas, layout.ini round-trip — leak-gated (Debug build).
+      - name: Selftest
+        run: zig-out/bin/threat-dashboard.exe --selftest
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/threat-dashboard | Out-Null
+          Copy-Item zig-out/bin/threat-dashboard.exe dist/threat-dashboard/
+          Copy-Item -Recurse assets dist/threat-dashboard/assets
+          Copy-Item README.md dist/threat-dashboard/
+          Compress-Archive -Path dist/threat-dashboard -DestinationPath dist/threat-dashboard-windows-x86_64.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: threat-dashboard-windows-x86_64
+          path: dist/threat-dashboard-windows-x86_64.zip
+          retention-days: 14
