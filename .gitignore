@@ -1,0 +1,11 @@
+zig-out/
+.zig-cache/
+zig-cache/
+zig-pkg/
+layout.ini
+layout.ini.tmp
+ui_state.json
+ui_state.json.tmp
+screenshots/
+shots*/
+log-export.csv

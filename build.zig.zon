@@ -1,0 +1,45 @@
+// ============================================================================
+// External system requirements (not Zig-fetchable, declared here for the
+// record so contributors know what to install before `zig build`):
+//
+//   LunarG Vulkan SDK >= 1.3.296.0
+//     Source : https://vulkan.lunarg.com/sdk/home#windows
+//     Purpose: provides VkLayer_khronos_validation.dll + manifest used by the
+//              dashboard's Vulkan renderer in Debug builds for layer-level
+//              validation (object lifetime, sync, parameter-correctness,
+//              best-practices). Without it, Debug runs silently skip
+//              validation; with it, build.zig copies the layer next to the
+//              executable and main.zig sets VK_LAYER_PATH at startup.
+//     Install: run the LunarG installer, ensure the `VULKAN_SDK` environment
+//              variable is set (the installer does this by default), then
+//              re-run `zig build`. To force just the layer install step:
+//              `zig build vulkan-layers`.
+// ============================================================================
+.{
+    .fingerprint = 0x7d08148f964a7107,
+    .name = .threat_dashboard,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{
+        .zgui = .{
+            .path = "deps/zgui",
+        },
+        .zglfw = .{
+            .url = "https://github.com/zig-gamedev/zglfw/archive/0dd29d8073487c9fe1e45e6b729b3aac271d5a71.tar.gz",
+            .hash = "zglfw-0.10.0-dev-zgVDNIG4IQBWN_sfMD-xfC9bJS2hbBN2W7jNlDLovcdC",
+        },
+        .pg = .{
+            .url = "git+https://github.com/karlseguin/pg.zig?ref=master#a4e126413decee1ba141db7dfd37c84b6cc385af",
+            .hash = "pg-0.0.0-Wp_7gW2hBgAOtBRRbTZtrQYx39itKpPR1A2rxiDCjT3A",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "deps",
+        "assets",
+    },
+}
