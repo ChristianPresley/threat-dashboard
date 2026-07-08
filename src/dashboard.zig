@@ -384,13 +384,14 @@ const keymap_global = [_]KeyBinding{
     .{ .chord = "Ctrl+Tab / Ctrl+Shift+Tab", .action = "cycle windows/tabs in the focused dock node (ImGui native)" },
     .{ .chord = "F11", .action = "borderless fullscreen toggle" },
     .{ .chord = "Ctrl+,", .action = "SET \u{00B7} Settings" },
+    .{ .chord = "Ctrl+Shift+A", .action = "AI \u{00B7} Assistant (Claude chat with dashboard + threat-intel tools)" },
     .{ .chord = "?", .action = "HELP directory (Shift+/ outside text inputs)" },
     .{ .chord = "Ctrl+S", .action = "snapshot layout + UI state now (toast confirms)" },
     .{ .chord = "Esc", .action = "clear command line \u{2192} close popup \u{2192} cancel modal (never confirms)" },
 };
 
 const keymap_tables = [_]KeyBinding{
-    .{ .chord = "Ctrl+F", .action = "focus the panel's filter box (ALQ EVT RUL IOC)" },
+    .{ .chord = "Ctrl+F", .action = "focus the panel's filter box (ALQ EVT RUL IOC YAR)" },
     .{ .chord = "\u{2191} \u{2193}", .action = "row selection (ALQ EVT RUL CAS)" },
     .{ .chord = "Enter", .action = "default row action (ALQ ack \u{00B7} EVT detail \u{00B7} RUL toggle detail)" },
     .{ .chord = "Ctrl+E", .action = "export visible rows to CSV (LOG \u{2014} toast with path)" },

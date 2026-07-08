@@ -163,8 +163,10 @@ pub const Client = struct {
             self.gpa.free(t.input_schema);
         }
         self.tools.deinit(self.gpa);
-        // Close stdin (EOF), then reap.
+        // Close stdin (EOF → the server exits), then clear the child's copy
+        // so wait()'s cleanup doesn't double-close the same handle.
         self.in_file.close(self.io);
+        self.child.stdin = null;
         _ = self.child.wait(self.io) catch {};
     }
 

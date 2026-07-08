@@ -32,6 +32,8 @@ pub fn main(init: std.process.Init) !void {
     var win_h: c_int = 900;
     var pg_uri: ?[:0]const u8 = null;
     var do_pgload = false;
+    var mcp_check = false;
+    var ai_ping = false;
 
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "pgload")) {
@@ -46,6 +48,18 @@ pub fn main(init: std.process.Init) !void {
             // Headless: mock-world determinism + panel data prep + font atlas
             // + layout round-trip, then exit.
             selftest = true;
+        } else if (std.mem.eql(u8, arg, "--mcp-check")) {
+            // Headless diagnostic: spawn the threat-intel MCP server, run
+            // the initialize handshake + tools/list, print the tool names,
+            // then exit. Needs no API keys — validates the stdio client
+            // against the real server.
+            mcp_check = true;
+        } else if (std.mem.eql(u8, arg, "--ai-ping")) {
+            // Headless diagnostic (hidden): run one message through the AI
+            // worker — TLS to the Anthropic API, encode/parse, channels,
+            // clean shutdown. Without a valid ANTHROPIC_API_KEY this still
+            // PASSes connectivity when the API's error envelope comes back.
+            ai_ping = true;
         } else if (std.mem.eql(u8, arg, "--validate")) {
             // GUI: force-cycle through all workspaces/panels, then auto-exit.
             validate_mode = true;
@@ -121,6 +135,103 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         std.log.info("pgload: seed {d} world uploaded to {s}", .{ seed, uri });
+        return;
+    }
+
+    // Headless MCP diagnostic: handshake + tools/list against the real
+    // threat-intel server, then exit (no GUI, no API keys required).
+    if (mcp_check) {
+        const cfg: ai.Config = .{
+            .api_key = "unused",
+            .mcp_cmd = init.environ_map.get("TD_MCP_CMD"),
+        };
+        var argv_buf: [16][]const u8 = undefined;
+        const argv = ai.resolveMcpArgv(cfg, &argv_buf);
+        std.log.info("mcp-check: spawning '{s}' \u{2026}", .{argv[0]});
+        var client = ai.mcp.Client.spawn(allocator, io, argv) catch |err| {
+            std.log.err("mcp-check: spawn failed: {s} (is threatintel-mcp installed and on PATH?)", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        defer client.deinit();
+        client.handshake() catch |err| {
+            std.log.err("mcp-check: handshake failed: {s}", .{@errorName(err)});
+            std.process.exit(1);
+        };
+        std.log.info("mcp-check: handshake OK \u{2014} {d} tool(s):", .{client.tools.items.len});
+        for (client.tools.items) |tool| {
+            std.log.info("  ti_{s} \u{2014} {s}", .{ tool.name, tool.description[0..@min(tool.description.len, 80)] });
+        }
+        if (client.tools.items.len == 0) {
+            std.log.err("mcp-check: server returned no tools", .{});
+            std.process.exit(1);
+        }
+        std.log.info("mcp-check: PASS", .{});
+        return;
+    }
+
+    // Headless AI-worker diagnostic: one message through the full stack.
+    if (ai_ping) {
+        const key = init.environ_map.get("ANTHROPIC_API_KEY") orelse "connectivity-probe-invalid-key";
+        const cfg: ai.Config = .{
+            .api_key = key,
+            .model = init.environ_map.get("TD_AI_MODEL") orelse "claude-sonnet-5",
+            .mcp_cmd = init.environ_map.get("TD_MCP_CMD"),
+        };
+        var argv_buf: [16][]const u8 = undefined;
+        const argv = ai.resolveMcpArgv(cfg, &argv_buf);
+        const worker = ai.worker.Worker.create(allocator, io, .{
+            .api_key = cfg.api_key.?,
+            .model = cfg.model,
+            .mcp_argv = argv,
+            .system_prompt = ai.SYSTEM_PROMPT,
+        }) catch {
+            std.log.err("ai-ping: worker alloc failed", .{});
+            std.process.exit(1);
+        };
+        defer worker.shutdown();
+        std.log.info("ai-ping: sending one message (model {s})\u{2026}", .{cfg.model});
+        worker.send("Reply with the single word: pong", null);
+
+        var events: std.ArrayList(ai.worker.WorkerToUi) = .empty;
+        defer events.deinit(allocator);
+        var api_reachable = false;
+        var got_text = false;
+        var done = false;
+        var waited_ms: u32 = 0;
+        while (!done and waited_ms < 90_000) : (waited_ms += 100) {
+            std.Io.sleep(io, std.Io.Duration.fromMilliseconds(100), .awake) catch {};
+            worker.drain(&events);
+            for (events.items) |ev| {
+                switch (ev) {
+                    .mcp_state => |ms| std.log.info("ai-ping: mcp {s}", .{@tagName(ms)}),
+                    .status => |s| std.log.info("ai-ping: status: {s}", .{s}),
+                    .assistant_text => |txt| {
+                        got_text = true;
+                        api_reachable = true;
+                        std.log.info("ai-ping: assistant: {s}", .{txt[0..@min(txt.len, 120)]});
+                    },
+                    .err => |m| {
+                        // An API error envelope means TLS + HTTP + parse all
+                        // worked — only auth was rejected.
+                        api_reachable = std.mem.startsWith(u8, m, "API error:");
+                        std.log.info("ai-ping: {s}", .{m});
+                    },
+                    .turn_done => |t| std.log.info("ai-ping: turn done ({d} in / {d} out tokens)", .{ t.input_tokens, t.output_tokens }),
+                    .idle => done = true,
+                    else => {},
+                }
+                ai.worker.freeOutbox(allocator, ev);
+            }
+            events.clearRetainingCapacity();
+        }
+        if (got_text) {
+            std.log.info("ai-ping: PASS (full round-trip)", .{});
+        } else if (api_reachable) {
+            std.log.info("ai-ping: PASS (API reachable; key rejected as expected without ANTHROPIC_API_KEY)", .{});
+        } else {
+            std.log.err("ai-ping: FAIL (API not reachable — TLS/network problem)", .{});
+            std.process.exit(1);
+        }
         return;
     }
 
@@ -577,6 +688,7 @@ fn printUsage() void {
         \\  --seed <u64>        Mock-world seed (default 42; same seed = same world)
         \\  --state-dir <dir>   Where layout.ini + ui_state.json live (default: cwd)
         \\  --selftest          Headless data-path self-test, then exit
+        \\  --mcp-check         Spawn the threat-intel MCP server, list its tools, exit
         \\  --validate          Force-cycle all workspaces for a bounded run, then exit
         \\  --screenshot <dir>  --validate + write one PNG per workspace into <dir>
         \\  --mailbox           Uncapped MAILBOX presentation (default: FIFO vsync)
