@@ -47,14 +47,28 @@ pub fn render(d: *Dashboard) void {
         zgui.textColored(if (n > 0) dash.sevColor(sv) else t.text.lo, "{s} {d}", .{ sv.label(), n });
     }
 
-    // MTTA over acked/resolved alerts (mock: alert ts → now spread).
+    // Triage SLA: real MTTA/MTTR from the alert ack/resolve stamps.
     {
-        var acked: u32 = 0;
+        var triaged: u32 = 0;
         for (s.alerts.items) |*a| {
-            if (!a.status.isOpen()) acked += 1;
+            if (!a.status.isOpen()) triaged += 1;
         }
+        const means = s.triageMeans();
         zgui.sameLine(.{ .spacing = 22 });
-        zgui.textColored(t.text.mid, "triaged: {d}", .{acked});
+        var mb: [16]u8 = undefined;
+        if (means.mtta_ms) |ms| {
+            zgui.textColored(t.text.mid, "MTTA {s}", .{ui.fmt.age(&mb, @divFloor(ms, 1000))});
+        } else {
+            zgui.textColored(t.text.lo, "MTTA \u{2014}", .{});
+        }
+        zgui.sameLine(.{ .spacing = 10 });
+        if (means.mttr_ms) |ms| {
+            zgui.textColored(t.text.mid, "MTTR {s}", .{ui.fmt.age(&mb, @divFloor(ms, 1000))});
+        } else {
+            zgui.textColored(t.text.lo, "MTTR \u{2014}", .{});
+        }
+        zgui.sameLine(.{ .spacing = 10 });
+        zgui.textColored(t.text.mid, "triaged {d}", .{triaged});
     }
 
     zgui.spacing();

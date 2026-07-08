@@ -66,11 +66,12 @@ pub fn render(d: *Dashboard) void {
             });
         }
         zgui.sameLine(.{ .spacing = 14 });
-        const running = d.jobs[Dashboard.JOB_YARA_CI].running;
-        if (running) {
-            zgui.textColored(t.sev.warn, "{s} CI running\u{2026}", .{ui.fonts.fa.arrows_rotate});
+        if (d.jobs.active(.yara_ci, 0)) |job| {
+            zgui.textColored(t.sev.warn, "{s} CI {s}\u{2026}", .{
+                ui.fonts.fa.arrows_rotate, if (job.state == .queued) "queued" else "running",
+            });
         } else if (zgui.smallButton("Run CI##yar")) {
-            d.startJob(Dashboard.JOB_YARA_CI);
+            _ = d.enqueueJob(.yara_ci, 0, "all rules");
         }
     }
     zgui.separator();

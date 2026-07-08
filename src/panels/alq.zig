@@ -198,7 +198,7 @@ pub fn render(d: *Dashboard) void {
             if (zgui.smallButton("False+ (F)")) markFp(d, sid);
             zgui.sameLine(.{ .spacing = 6 });
             if (zgui.smallButton("Resolve")) {
-                _ = s.setAlertStatus(sid, .resolved);
+                _ = s.setAlertStatus(sid, .resolved, dash.unixNowMs());
                 ui.events.post(.ok, "alerts", "alert #{d} resolved", .{sid});
             }
             zgui.sameLine(.{ .spacing = 12 });
@@ -227,13 +227,13 @@ pub fn render(d: *Dashboard) void {
 }
 
 fn ackAlert(d: *Dashboard, id: u32) void {
-    if (d.store.setAlertStatus(id, .acked)) {
+    if (d.store.setAlertStatus(id, .acked, dash.unixNowMs())) {
         ui.events.post(.ok, "alerts", "alert #{d} acked", .{id});
     }
 }
 
 fn markFp(d: *Dashboard, id: u32) void {
-    if (d.store.setAlertStatus(id, .false_positive)) {
+    if (d.store.setAlertStatus(id, .false_positive, dash.unixNowMs())) {
         // Tuning feedback: count it on the rule.
         if (d.store.alertById(id)) |a| {
             if (a.rule < d.store.rules.items.len) d.store.rules.items[a.rule].fp_7d += 1;

@@ -58,6 +58,8 @@ pub const panels = [_]Panel{
     .{ .code = "YAR", .name = "YARA Rules", .group = "Detect" },
     .{ .code = "ENR", .name = "IOC Enrichment", .group = "Intel" },
     .{ .code = "AI", .name = "AI Assistant", .group = "Intel" },
+    .{ .code = "PIP", .name = "Data Pipelines", .group = "Ops" },
+    .{ .code = "AUD", .name = "Audit Trail", .group = "Ops" },
 };
 
 pub const PANEL_PST: usize = 0;
@@ -82,6 +84,8 @@ pub const PANEL_HELP: usize = 18;
 pub const PANEL_YAR: usize = 19;
 pub const PANEL_ENR: usize = 20;
 pub const PANEL_AI: usize = 21;
+pub const PANEL_PIP: usize = 22;
+pub const PANEL_AUD: usize = 23;
 
 /// Workspace membership: only members of the ACTIVE workspace are
 /// submitted (plus force-opens). SET and HELP are in no preset — they
@@ -99,7 +103,8 @@ pub fn panelInWorkspace(idx: usize, ws: ui.layout.Workspace) bool {
         .intel => idx == PANEL_FEED or idx == PANEL_IOC or idx == PANEL_TA or
             idx == PANEL_CAS or idx == PANEL_LOG or idx == PANEL_ENR,
         .ops => idx == PANEL_SEN or idx == PANEL_ING or idx == PANEL_JOB or
-            idx == PANEL_ALQ or idx == PANEL_LOG,
+            idx == PANEL_ALQ or idx == PANEL_LOG or idx == PANEL_PIP or
+            idx == PANEL_AUD,
     };
 }
 
@@ -346,6 +351,8 @@ const commands = [_]ui.registry.Command{
     .{ .code = "FEED", .name = "Intel Feeds", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_FEED), .desc = "Focus Intel Feeds (sync status, staleness, IOC counts)" },
     .{ .code = "SEN", .name = "Sensor Health", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_SEN), .desc = "Focus Sensor Health (RAG grid: EDR/FW/IDS/DNS/proxy/cloud, EPS + lag)" },
     .{ .code = "ING", .name = "Ingestion Stats", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_ING), .desc = "Focus Ingestion Stats (events/sec per sensor kind over time)" },
+    .{ .code = "PIP", .name = "Data Pipelines", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_PIP), .desc = "Focus Data Pipelines (dbt-style ELT: pick a source, chain models, run tests, land in PostgreSQL or another sink)" },
+    .{ .code = "AUD", .name = "Audit Trail", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_AUD), .desc = "Focus the Audit Trail (chain of custody: every analyst/system action, who \u{00B7} what \u{00B7} when)" },
     .{ .code = "LOG", .name = "Event Log", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_LOG), .desc = "Focus the Event Log (app status/event stream, Ctrl+E exports CSV)" },
     .{ .code = "JOB", .name = "Jobs", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_JOB), .desc = "Focus Jobs (async work: phase, progress, cancel)" },
     .{ .code = "SET", .name = "Settings", .kind = .panel, .menu_group = "Panels", .key_hint = "Ctrl+,", .run = makePanelRun(PANEL_SET), .desc = "Focus Settings (appearance \u{00B7} mock seed \u{00B7} persistence paths)" },
@@ -399,7 +406,7 @@ const keymap_global = [_]KeyBinding{
 };
 
 const keymap_tables = [_]KeyBinding{
-    .{ .chord = "Ctrl+F", .action = "focus the panel's filter box (ALQ EVT RUL IOC YAR)" },
+    .{ .chord = "Ctrl+F", .action = "focus the panel's filter box (ALQ EVT RUL IOC YAR PIP)" },
     .{ .chord = "\u{2191} \u{2193}", .action = "row selection (ALQ EVT RUL CAS)" },
     .{ .chord = "Enter", .action = "default row action (ALQ ack \u{00B7} EVT detail \u{00B7} RUL toggle detail)" },
     .{ .chord = "Ctrl+E", .action = "export visible rows to CSV (LOG \u{2014} toast with path)" },
@@ -448,29 +455,48 @@ const UiStateJson = struct {
 };
 
 /// Command-line InputText callback: ↑↓ move the suggestion selection while
-/// matches are open (history recall is a later nicety).
+/// matches are open; on an empty line (or mid-recall) they walk the
+/// submitted-command history instead, shell-style.
 fn cmdInputCallback(cb_data: *zgui.InputTextCallbackData) callconv(.c) i32 {
     const self: *Dashboard = @ptrCast(@alignCast(cb_data.user_data orelse return 0));
     if (!cb_data.event_flag.callback_history) return 0;
     const n = self.palette_match_count;
-    if (n > 0) {
+    if (self.cmd_history_pos == null and n > 0) {
         if (cb_data.event_key == .up_arrow) {
             self.palette_sel = if (self.palette_sel == 0) n - 1 else self.palette_sel - 1;
         } else if (cb_data.event_key == .down_arrow) {
             self.palette_sel = (self.palette_sel + 1) % n;
         }
+        return 0;
     }
+    if (self.cmd_history_len == 0) return 0;
+    var pos: usize = undefined;
+    if (cb_data.event_key == .up_arrow) {
+        pos = if (self.cmd_history_pos) |p| @min(p + 1, self.cmd_history_len - 1) else 0;
+    } else if (cb_data.event_key == .down_arrow) {
+        const p = self.cmd_history_pos orelse return 0;
+        if (p == 0) {
+            // Walking past the newest entry clears the line.
+            self.cmd_history_pos = null;
+            cb_data.deleteChars(0, cb_data.buf_text_len);
+            return 0;
+        }
+        pos = p - 1;
+    } else return 0;
+    self.cmd_history_pos = pos;
+    cb_data.deleteChars(0, cb_data.buf_text_len);
+    cb_data.insertChars(0, std.mem.sliceTo(&self.cmd_history[pos], 0));
     return 0;
 }
 
-// ===== Mock async jobs (JOB panel + FEED sync) ===========================
+// ===== Jobs ==============================================================
+// The queue engine lives in data/jobs.zig (pure, unit-tested); completion
+// and cancel SIDE EFFECTS live here on the render thread (onJobComplete /
+// onJobCanceled) so every world write still goes through the Store API and
+// mirrors to PG.
 
-pub const MockJob = struct {
-    name: [:0]const u8,
-    phase: [:0]const u8 = "idle",
-    progress: f32 = 0,
-    running: bool = false,
-};
+/// Re-export for panels: `dash.jobs_mod.JobKind` etc.
+pub const jobs_mod = data.jobs;
 
 // ===== AI assistant UI state =============================================
 
@@ -533,6 +559,9 @@ pub const Dashboard = struct {
     /// trickle from writing over database truth.
     mock_ticking: bool = true,
     provider_label: [:0]const u8 = "mock generator",
+    /// Background PG worker (set by main when --pg is live). Owns the DB
+    /// connection; drained once per frame in drainPg.
+    pg_worker: ?*data.pg_worker.Worker = null,
 
     // -- Window/panel plumbing --
     panel_force_open: [panels.len]bool = @splat(false),
@@ -551,6 +580,10 @@ pub const Dashboard = struct {
     palette_sel: usize = 0,
     palette_matches: [8]ui.registry.Match = undefined,
     palette_match_count: usize = 0,
+    /// Submitted-command recall ring: newest at index 0.
+    cmd_history: [8][64:0]u8 = @splat(std.mem.zeroes([64:0]u8)),
+    cmd_history_len: usize = 0,
+    cmd_history_pos: ?usize = null,
 
     // -- ui_state persistence --
     state_dir: [256]u8 = @splat(0),
@@ -606,14 +639,40 @@ pub const Dashboard = struct {
     enr_history: [8]u32 = @splat(0), // pivot breadcrumb (back button)
     enr_history_len: u8 = 0,
 
-    // -- Mock jobs --
-    jobs: [5]MockJob = .{
-        .{ .name = "feed sync" },
-        .{ .name = "rule backtest" },
-        .{ .name = "ioc enrichment" },
-        .{ .name = "retention sweep" },
-        .{ .name = "yara ci" },
-    },
+    // -- CAS notes editing --
+    cas_notes_edit: ?u16 = null, // case id being edited
+    cas_notes_buf: [480:0]u8 = std.mem.zeroes([480:0]u8),
+
+    // -- PIP panel state --
+    pip_sel: ?u16 = null,
+    pip_filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8),
+    pip_focus_filter: bool = false,
+    pip_show_builder: bool = false,
+    pip_show_sources: bool = false,
+    pip_new_name: [48:0]u8 = std.mem.zeroes([48:0]u8),
+    pip_new_target: [64:0]u8 = std.mem.zeroes([64:0]u8),
+    pip_new_source: usize = 0, // index into store.sources
+    pip_new_sink: usize = 0, // SinkKind ordinal
+    pip_new_sched: i32 = 15,
+    pip_new_steps: [domain.PIPELINE_STEP_CAP]domain.PipelineStep = @splat(domain.PipelineStep{}),
+    pip_new_step_count: u8 = 0,
+
+    // -- Audit trail (chain of custody; owned here so PG snapshot swaps
+    //    can never erase it) --
+    audit: std.ArrayList(domain.AuditEntry) = .empty,
+    audit_next_id: u32 = 1,
+    /// True while job/scheduler side effects run — their mutations
+    /// attribute to "system" instead of the analyst.
+    audit_system: bool = false,
+    aud_filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8),
+
+    // -- Jobs (queue engine; side effects in onJobComplete/onJobCanceled) --
+    jobs: data.jobs.Engine,
+    /// Pipeline-scheduler throttle (last due-check wall ms).
+    sched_last_ms: i64 = 0,
+    /// True once the guided tour drives frames — suppresses the scheduler
+    /// so captures aren't perturbed by auto-enqueued runs.
+    tour_running: bool = false,
 
     // -- AI assistant --
     assistant: AssistantUi = .{},
@@ -623,15 +682,13 @@ pub const Dashboard = struct {
     tour_frame: u32 = 0,
     tour_cap_seq: u32 = 0,
 
-    pub const JOB_ENRICH: usize = 2;
-    pub const JOB_YARA_CI: usize = 4;
-
     pub fn init(allocator: Allocator, seed: u64) Dashboard {
         var d = Dashboard{
             .allocator = allocator,
             .store = data.Store.init(allocator),
             .gen = data.mock.Generator.init(seed, unixNowMs()),
             .seed = seed,
+            .jobs = data.jobs.Engine.init(allocator),
         };
         d.state_dir[0] = '.';
         ui.events.wallClock = &unixNow;
@@ -652,7 +709,57 @@ pub const Dashboard = struct {
         if (self.assistant.worker) |w| w.shutdown();
         for (self.assistant.transcript.items) |*it| self.allocator.free(it.text);
         self.assistant.transcript.deinit(self.allocator);
+        self.jobs.deinit();
+        self.audit.deinit(self.allocator);
         self.store.deinit();
+    }
+
+    /// Install the audit tap once `self` has its final address (init
+    /// returns by value, so this runs from render()/selfTest() instead).
+    fn ensureAuditHook(self: *Dashboard) void {
+        if (self.store.audit_hook != null) return;
+        self.store.audit_hook = .{ .ctx = self, .f = onAuditMutation };
+    }
+
+    pub const AUDIT_CAP = 512;
+
+    fn onAuditMutation(ctx: *anyopaque, m: data.Mutation) void {
+        const self: *Dashboard = @ptrCast(@alignCast(ctx));
+        var entry: domain.AuditEntry = .{
+            .id = self.audit_next_id,
+            .ts_ms = unixNowMs(),
+            .actor = domain.FixedStr(24).from(if (self.audit_system) "system" else "cpresley"),
+            .action = domain.FixedStr(28).from(@tagName(m)),
+        };
+        var tb: [64]u8 = undefined;
+        entry.target = domain.FixedStr(64).from(auditTarget(&tb, m));
+        self.audit.append(self.allocator, entry) catch return;
+        self.audit_next_id += 1;
+        if (self.audit.items.len > AUDIT_CAP) _ = self.audit.orderedRemove(0);
+    }
+
+    fn auditTarget(buf: []u8, m: data.Mutation) []const u8 {
+        const r = switch (m) {
+            .alert_status => |v| std.fmt.bufPrint(buf, "alert #{d} \u{2192} {s}", .{ v.id, v.status.label() }),
+            .rule_status => |v| std.fmt.bufPrint(buf, "rule #{d} \u{2192} {s}", .{ v.id, v.status.label() }),
+            .case_status => |v| std.fmt.bufPrint(buf, "case #{d} \u{2192} {s}", .{ v.id, v.status.label() }),
+            .case_assign => |v| std.fmt.bufPrint(buf, "alert #{d} \u{2192} case #{d}", .{ v.alert_id, v.case_id }),
+            .case_notes => |v| std.fmt.bufPrint(buf, "case #{d} notes edited", .{v.id}),
+            .yara_status => |v| std.fmt.bufPrint(buf, "yara #{d} \u{2192} {s}", .{ v.id, v.status.label() }),
+            .yara_ci => |v| std.fmt.bufPrint(buf, "yara #{d} CI recorded", .{v.id}),
+            .enrichment_upsert => |v| std.fmt.bufPrint(buf, "ioc #{d} enrichment {s}", .{ v.e.ioc_id, v.e.status.label() }),
+            .urlscan_submit => |v| std.fmt.bufPrint(buf, "urlscan #{d} for ioc #{d}", .{ v.id, v.ioc_id }),
+            .urlscan_update => |v| std.fmt.bufPrint(buf, "urlscan #{d} \u{2192} {s}", .{ v.id, v.state.label() }),
+            .source_tested => |v| std.fmt.bufPrint(buf, "source #{d} probed: {s}", .{ v.id, v.state.label() }),
+            .pipeline_status => |v| std.fmt.bufPrint(buf, "pipeline #{d} \u{2192} {s}", .{ v.id, v.status.label() }),
+            .pipeline_add => |v| std.fmt.bufPrint(buf, "pipeline {s} created", .{v.p.name.slice()}),
+            .pipeline_run_add => |v| std.fmt.bufPrint(buf, "run #{d} started (pipeline #{d})", .{ v.run.id, v.run.pipeline }),
+            .pipeline_run_update => |v| std.fmt.bufPrint(buf, "run #{d} \u{2192} {s}", .{ v.run.id, v.run.status.label() }),
+            .pipeline_tests => |v| std.fmt.bufPrint(buf, "pipeline #{d} tests updated", .{v.id}),
+            .dead_letter_add => |v| std.fmt.bufPrint(buf, "dead letter (pipeline #{d})", .{v.dl.pipeline}),
+            .dead_letter_state => |v| std.fmt.bufPrint(buf, "dead letter #{d} \u{2192} {s}", .{ v.id, v.state.label() }),
+        };
+        return r catch buf[0..0];
     }
 
     /// Wire the AI assistant from env-sourced config (GUI path only). The
@@ -771,6 +878,41 @@ pub const Dashboard = struct {
         }
     }
 
+    /// Drain PG worker → UI events once per frame (the only place worker
+    /// output touches the Store — mirror of drainAssistant).
+    fn drainPg(self: *Dashboard) void {
+        const w = self.pg_worker orelse return;
+        var batch: std.ArrayList(data.pg_worker.Event) = .empty;
+        defer batch.deinit(self.allocator);
+        w.drain(&batch);
+        for (batch.items) |ev| {
+            switch (ev) {
+                .snapshot => |snap| {
+                    // Stale-snapshot guard: a panel mutation queued after
+                    // the worker captured `seq` isn't in this snapshot —
+                    // swapping would revert it. Drop; the next cycle
+                    // reloads after the write lands.
+                    if (snap.seq == w.mutation_seq.load(.seq_cst)) {
+                        self.store.adoptFrom(snap.st);
+                        std.log.scoped(.pg_worker).debug("snapshot swapped in: {d} events / {d} alerts", .{ self.store.events.items.len, self.store.alerts.items.len });
+                    } else {
+                        std.log.scoped(.pg_worker).debug("stale snapshot dropped (seq {d} behind)", .{snap.seq});
+                        snap.st.deinit();
+                    }
+                    self.allocator.destroy(snap.st);
+                },
+                .state => |st| switch (st) {
+                    .connected => ui.events.post(.ok, "db", "PG worker connected — snapshot refresh every {d} s", .{data.pg_worker.REFRESH_MS / 1000}),
+                    .reconnecting => ui.events.post(.warn, "db", "PG connection lost — reconnecting", .{}),
+                },
+                .err => |m| {
+                    ui.events.post(.warn, "db", "{s}", .{m});
+                    self.allocator.free(m);
+                },
+            }
+        }
+    }
+
     // ── Guided-tour capture harness ──────────────────────────────────────
     //
     // `--tour <dir>` drives the app through a scripted sequence of scenes,
@@ -823,6 +965,7 @@ pub const Dashboard = struct {
     /// and drives the scene's on-screen state. `done` flips true when the
     /// whole tour has been captured.
     pub fn tourFrame(self: *Dashboard, done: *bool) ?TourCapture {
+        self.tour_running = true;
         if (self.tour_scene >= tour_scenes.len) {
             done.* = true;
             return null;
@@ -888,7 +1031,7 @@ pub const Dashboard = struct {
             self.yar_sel = 2; // Webshell_PHP_Eval_Base64 — shows an FP gate story
         } else if (std.mem.eql(u8, sc.name, "08-yara-ci")) {
             self.focusPanel(PANEL_YAR);
-            self.startJob(JOB_YARA_CI);
+            _ = self.jobs.enqueue(.yara_ci, 0, "all rules", unixNowMs());
         } else if (std.mem.eql(u8, sc.name, "09-attack-drill")) {
             self.focusPanel(PANEL_ATK);
             // Drill T1059.001 (PowerShell) → RUL filter, as a cell click does.
@@ -1014,6 +1157,8 @@ pub const Dashboard = struct {
         self.yar_technique_filter = null;
         self.enr_sel = null;
         self.enr_history_len = 0;
+        self.pip_sel = null;
+        self.cas_notes_edit = null;
         ui.events.post(.ok, "world", "world regenerated with seed {d}", .{seed});
     }
 
@@ -1050,6 +1195,14 @@ pub const Dashboard = struct {
                 nth += 1;
             }
         }
+        // Open PIP's detail + builder + sources sections once, mid-OPS-hold,
+        // so those render paths get crash coverage too.
+        if (ws == .ops and hold_pos == VALIDATE_HOLD - 24) {
+            if (self.store.pipelines.items.len > 0) self.pip_sel = self.store.pipelines.items[0].id;
+            self.pip_show_builder = true;
+            self.pip_show_sources = true;
+            self.panel_focus_request = PANEL_PIP;
+        }
         // Float SET + HELP + AI once, late in the OPS hold, for coverage.
         if (ws == .ops and hold_pos == VALIDATE_HOLD - 14) {
             self.panel_force_open[PANEL_SET] = true;
@@ -1070,6 +1223,7 @@ pub const Dashboard = struct {
     pub fn render(self: *Dashboard, dt: f32) void {
         self.dt = if (dt > 0) dt else 1.0 / 60.0;
         self.wall_clock_s += @as(f64, self.dt);
+        self.ensureAuditHook();
 
         // Event spine: per-frame flash clock + toast expiry + insert
         // flashes for events that arrived since the previous frame.
@@ -1095,7 +1249,9 @@ pub const Dashboard = struct {
         // Suppressed when a real provider owns the Store.
         if (self.mock_ticking) self.gen.tick(&self.store, unixNowMs());
         self.tickJobs();
+        self.tickScheduler();
         self.drainAssistant();
+        self.drainPg();
 
         self.tickValidateHarness();
         self.handleGlobalKeys();
@@ -1183,6 +1339,7 @@ pub const Dashboard = struct {
             self.rul_focus_filter = true;
             self.ioc_focus_filter = true;
             self.yar_focus_filter = true;
+            self.pip_focus_filter = true;
         }
 
         // `?` (Shift+/ outside text inputs) opens the HELP directory.
@@ -1315,6 +1472,8 @@ pub const Dashboard = struct {
         } else {
             self.palette_match_count = 0;
             self.palette_sel = 0;
+            // An empty line ends any in-progress history walk.
+            if (!cmd_active) self.cmd_history_pos = null;
         }
 
         if (submitted) {
@@ -1330,8 +1489,10 @@ pub const Dashboard = struct {
                 }
             }
             if (ran) {
+                self.pushCmdHistory(text);
                 @memset(&self.cmd_buf, 0);
                 self.palette_match_count = 0;
+                self.cmd_history_pos = null;
             }
             // Keep focus for chained commands.
             zgui.setKeyboardFocusHere(-1);
@@ -1380,26 +1541,100 @@ pub const Dashboard = struct {
         }
     }
 
+    /// Record a submitted command for ↑-recall (consecutive dupes skipped).
+    fn pushCmdHistory(self: *Dashboard, text: []const u8) void {
+        if (text.len == 0) return;
+        if (self.cmd_history_len > 0 and
+            std.mem.eql(u8, std.mem.sliceTo(&self.cmd_history[0], 0), text)) return;
+        var i: usize = @min(self.cmd_history_len, self.cmd_history.len - 1);
+        while (i > 0) : (i -= 1) self.cmd_history[i] = self.cmd_history[i - 1];
+        @memset(&self.cmd_history[0], 0);
+        const n = @min(text.len, self.cmd_history[0].len - 1);
+        @memcpy(self.cmd_history[0][0..n], text[0..n]);
+        self.cmd_history_len = @min(self.cmd_history_len + 1, self.cmd_history.len);
+    }
+
     fn tickJobs(self: *Dashboard) void {
-        for (&self.jobs, 0..) |*j, i| {
-            if (!j.running) continue;
-            j.progress += self.dt * 0.12;
-            if (j.progress >= 1.0) {
-                j.progress = 0;
-                j.running = false;
-                j.phase = "done";
-                ui.events.post(.ok, "jobs", "{s} finished", .{j.name});
-                self.onJobDone(i);
-            }
+        var completed: std.ArrayList(data.jobs.Job) = .empty;
+        defer completed.deinit(self.allocator);
+        self.jobs.tick(self.dt, unixNowMs(), &completed);
+        for (completed.items) |*j| {
+            ui.events.post(.ok, "jobs", "{s} finished", .{j.kind.label()});
+            self.audit_system = true;
+            defer self.audit_system = false;
+            self.onJobComplete(j);
+        }
+    }
+
+    /// Enqueue with a toast; dedupes identical kind+arg jobs.
+    pub fn enqueueJob(self: *Dashboard, kind: data.jobs.JobKind, arg: u32, detail: []const u8) ?u32 {
+        const id = self.jobs.enqueue(kind, arg, detail, unixNowMs());
+        if (id != null) {
+            ui.events.post(.info, "jobs", "{s} queued{s}{s}", .{
+                kind.label(), if (detail.len > 0) " \u{00B7} " else "", detail,
+            });
+        } else {
+            ui.events.post(.warn, "jobs", "{s} already queued/running", .{kind.label()});
+        }
+        return id;
+    }
+
+    /// Cancel + CLEANUP: a canceled job must never strand half-open state
+    /// (`.running` run rows, `.pending` enrichments, `.syncing` feeds).
+    pub fn cancelJob(self: *Dashboard, id: u32) void {
+        const j = self.jobs.find(id) orelse return;
+        const snapshot = j.*;
+        if (!self.jobs.cancel(id, unixNowMs())) return;
+        self.onJobCanceled(&snapshot);
+        ui.events.post(.warn, "jobs", "{s} canceled", .{snapshot.kind.label()});
+    }
+
+    fn onJobCanceled(self: *Dashboard, j: *const data.jobs.Job) void {
+        const now = unixNowMs();
+        switch (j.kind) {
+            .pipeline_run => {
+                // Fail (not strand) this pipeline's in-flight run rows.
+                for (self.store.pipeline_runs.items) |*r| {
+                    if (r.pipeline != @as(u16, @intCast(j.arg)) or r.status != .running) continue;
+                    var run = r.*;
+                    run.status = .failed;
+                    run.duration_ms = @max(0, now - run.started_ms);
+                    run.err = domain.FixedStr(64).from("canceled by analyst");
+                    _ = self.store.updatePipelineRun(run);
+                }
+            },
+            .ioc_enrichment => {
+                // Pending → err("canceled") so ENR shows its Retry button
+                // instead of a forever-stuck progress line.
+                for (self.store.enrichments.items) |*e| {
+                    if (e.status != .pending) continue;
+                    var upd = e.*;
+                    upd.status = .err;
+                    upd.err = domain.FixedStr(32).from("canceled");
+                    _ = self.store.upsertEnrichment(upd);
+                }
+                for (self.store.urlscans.items) |*u| {
+                    if (u.state == .pending) _ = self.store.setUrlScanState(u.id, .err, now);
+                }
+            },
+            .feed_sync => {
+                // A canceled sync is NOT a successful one: revert the spinner
+                // without stamping last_sync_ms.
+                for (self.store.feeds.items) |*f| {
+                    if (f.status == .syncing) f.status = .ok;
+                }
+                self.store.touch();
+            },
+            else => {},
         }
     }
 
     /// Job-completion side effects (render thread; panels see the results
     /// next frame via Store.generation).
-    fn onJobDone(self: *Dashboard, idx: usize) void {
+    fn onJobComplete(self: *Dashboard, j: *const data.jobs.Job) void {
         const now = unixNowMs();
-        switch (idx) {
-            JOB_ENRICH => {
+        switch (j.kind) {
+            .ioc_enrichment => {
                 // Complete every pending enrichment with its deterministic
                 // record (pure function of the IOC value — see mock.zig).
                 var done: u32 = 0;
@@ -1419,7 +1654,7 @@ pub const Dashboard = struct {
                 }
                 if (done > 0) ui.events.post(.ok, "enrich", "{d} IOC(s) enriched", .{done});
             },
-            JOB_YARA_CI => {
+            .yara_ci => {
                 // Re-run CI: fresh scan times with a small deterministic
                 // jitter keyed off the rule name (not the world PRNG).
                 var pass: u32 = 0;
@@ -1440,17 +1675,175 @@ pub const Dashboard = struct {
                     .{ pass, self.store.yara.items.len },
                 );
             },
-            else => {},
+            .pipeline_run => {
+                // Finalize THIS pipeline's in-flight runs with their
+                // deterministic result (pure fn — see mock.pipelineRunResult).
+                // Keyed by arg so a completion never touches another
+                // pipeline's queued/running rows.
+                const pid: u16 = @intCast(j.arg);
+                var failed = false;
+                var partial = false;
+                var i: usize = 0;
+                while (i < self.store.pipeline_runs.items.len) : (i += 1) {
+                    const r = &self.store.pipeline_runs.items[i];
+                    if (r.pipeline != pid or r.status != .running) continue;
+                    const result = data.mock.Generator.pipelineRunResult(&self.store, r.*, now);
+                    _ = self.store.updatePipelineRun(result);
+                    if (result.status == .failed) failed = true;
+                    if (result.status == .partial) {
+                        partial = true;
+                        self.spillDeadLetters(pid, &result, now);
+                    }
+                }
+                if (failed) {
+                    self.jobs.markFailed(j.id, "source unreachable");
+                    ui.events.post(.warn, "pipeline", "{s} run FAILED \u{2014} see PIP", .{j.detail.slice()});
+                } else {
+                    self.refreshPipelineTests(pid, now);
+                    ui.events.post(
+                        if (partial) .warn else .ok,
+                        "pipeline",
+                        "{s} run completed{s}",
+                        .{ j.detail.slice(), if (partial) " with rejected rows — see PIP dead letters" else "" },
+                    );
+                }
+            },
+            .feed_sync => {
+                // Per-feed (arg = id + 1) or fleet-wide (arg = 0). The
+                // err-story feed stays broken: its sync completes as a
+                // deterministic failure instead of silently healing.
+                var synced: u32 = 0;
+                for (self.store.feeds.items) |*f| {
+                    if (j.arg != 0 and f.id != j.arg - 1) continue;
+                    if (f.status != .syncing) continue;
+                    if (std.mem.eql(u8, f.name.slice(), "Emerging Threats")) {
+                        f.status = .err;
+                        ui.events.post(.warn, "feeds", "{s} sync FAILED: upstream 401 \u{2014} check credentials", .{f.name.slice()});
+                    } else {
+                        f.status = .ok;
+                        f.last_sync_ms = now;
+                        synced += 1;
+                    }
+                }
+                self.store.touch();
+                if (synced > 0) ui.events.post(.ok, "feeds", "{d} feed(s) synced", .{synced});
+            },
+            .rule_backtest => {
+                // Derived analysis only (no Store writes): surface the
+                // noisiest enabled rule so TUN has a pointer.
+                var worst: ?*domain.DetectionRule = null;
+                for (self.store.rules.items) |*r| {
+                    if (r.status != .enabled or r.fires_7d < 10) continue;
+                    if (worst == null or r.fpRate() > worst.?.fpRate()) worst = r;
+                }
+                if (worst) |w| {
+                    ui.events.post(.warn, "backtest", "noisiest rule {s} {s}: {d:.0}% FP over 7d \u{2014} see TUN", .{
+                        w.code.slice(), w.name.slice(), w.fpRate() * 100,
+                    });
+                }
+            },
+            .retention_sweep => {
+                // Bounded-history housekeeping (mock mode only — under PG
+                // the snapshot refresh owns the row set).
+                if (self.mock_ticking) {
+                    const runs = self.store.prunePipelineRuns(30);
+                    const dlq = self.store.pruneDeadLetters(now - 24 * std.time.ms_per_hour);
+                    ui.events.post(.ok, "retention", "sweep: {d} old run(s), {d} resolved dead letter(s) pruned", .{ runs, dlq });
+                }
+            },
         }
     }
 
-    /// Mark IOCs pending + kick the enrichment job. Mock flavor of the
-    /// live pipeline: a real MCP source would upsert the same shapes.
-    pub fn requestEnrichment(self: *Dashboard, ioc_ids: []const u32) void {
-        if (self.jobs[JOB_ENRICH].running) {
-            ui.events.post(.warn, "enrich", "enrichment rate-limited \u{2014} a run is already in flight", .{});
+    /// Spill a partial run's rejected rows into the dead-letter queue —
+    /// deterministic samples keyed off the pipeline name + run id, capped
+    /// so a chronically failing test can't flood the Store.
+    fn spillDeadLetters(self: *Dashboard, pid: u16, run: *const domain.PipelineRun, now: i64) void {
+        const p = self.store.pipelineById(pid) orelse return;
+        if (self.store.openDeadLetterCount(pid) >= 20) return;
+        for (p.tests[0..p.test_count]) |*ts| {
+            if (ts.status != .fail or ts.failures == 0 or ts.kind == .freshness) continue;
+            const hash = std.hash.Fnv1a_64.hash(p.name.slice()) +% run.id;
+            var k: u32 = 0;
+            while (k < @min(ts.failures, 4)) : (k += 1) {
+                _ = self.store.addDeadLetter(.{
+                    .id = 0,
+                    .pipeline = pid,
+                    .run_id = run.id,
+                    .ts_ms = now,
+                    .kind = ts.kind,
+                    .target = ts.target,
+                    .sample = domain.FixedStr(96).fromFmt("row #{d}: {s} violated", .{
+                        (hash +% k) % 100_000, ts.kind.label(),
+                    }),
+                });
+            }
+        }
+    }
+
+    /// Recompute freshness tests from the pipeline's watermark after a run:
+    /// fresh while the watermark lag stays under 3× the schedule (min 30 m).
+    fn refreshPipelineTests(self: *Dashboard, pid: u16, now: i64) void {
+        const p = self.store.pipelineById(pid) orelse return;
+        var tests = p.tests;
+        var changed = false;
+        for (tests[0..p.test_count]) |*ts| {
+            if (ts.kind != .freshness) continue;
+            const limit_min: i64 = @max(@as(i64, p.schedule_min) * 3, 30);
+            const fresh = p.watermark_ms > 0 and (now - p.watermark_ms) <= limit_min * std.time.ms_per_min;
+            const want: domain.GateResult = if (fresh) .pass else .fail;
+            if (ts.status != want) {
+                ts.status = want;
+                ts.failures = if (fresh) 0 else 1;
+                changed = true;
+            }
+        }
+        if (changed) _ = self.store.setPipelineTests(pid, tests, p.test_count);
+    }
+
+    /// Pipeline scheduler: auto-enqueue runs for ACTIVE pipelines whose
+    /// schedule elapsed. Mock mode only (a real orchestrator owns schedules
+    /// under PG) and suppressed inside the validate/tour harnesses so
+    /// captures stay reproducible.
+    fn tickScheduler(self: *Dashboard) void {
+        if (!self.mock_ticking or self.validate_cycle > 0 or self.tour_running) return;
+        const now = unixNowMs();
+        if (now - self.sched_last_ms < 5_000) return;
+        self.sched_last_ms = now;
+        self.audit_system = true;
+        defer self.audit_system = false;
+        for (self.store.pipelines.items) |*p| {
+            if (p.status != .active or p.schedule_min == 0) continue;
+            if (now - p.last_run_ms < @as(i64, p.schedule_min) * std.time.ms_per_min) continue;
+            if (self.jobs.active(.pipeline_run, p.id) != null) continue;
+            self.startPipelineRun(p.id, true);
+        }
+    }
+
+    /// Start a pipeline run: add a `.running` row + queue the job (arg =
+    /// pipeline id, so runs for different pipelines execute concurrently
+    /// across the engine's slots). Completion finalizes rows/tests/DLQ.
+    pub fn startPipelineRun(self: *Dashboard, pipeline_id: u16, scheduled: bool) void {
+        const p = self.store.pipelineById(pipeline_id) orelse return;
+        if (self.jobs.active(.pipeline_run, pipeline_id) != null) {
+            if (!scheduled) ui.events.post(.warn, "pipeline", "{s} already queued/running \u{2014} see JOB", .{p.name.slice()});
             return;
         }
+        if (self.store.addPipelineRun(.{ .id = 0, .pipeline = pipeline_id, .started_ms = unixNowMs() })) |_| {
+            _ = self.jobs.enqueue(.pipeline_run, pipeline_id, p.name.slice(), unixNowMs());
+            ui.events.post(.info, "pipeline", "{s} run {s}", .{
+                p.name.slice(), if (scheduled) "scheduled" else "queued",
+            });
+        }
+    }
+
+    /// Back-compat shim for the manual "Run now" path.
+    pub fn requestPipelineRun(self: *Dashboard, pipeline_id: u16) void {
+        self.startPipelineRun(pipeline_id, false);
+    }
+
+    /// Mark IOCs pending + queue the enrichment job. Mock flavor of the
+    /// live pipeline: a real MCP source would upsert the same shapes.
+    pub fn requestEnrichment(self: *Dashboard, ioc_ids: []const u32) void {
         var queued: u32 = 0;
         for (ioc_ids) |id| {
             if (self.store.iocById(id) == null) continue;
@@ -1469,16 +1862,8 @@ pub const Dashboard = struct {
             return;
         }
         ui.events.post(.info, "enrich", "{d} IOC(s) queued for enrichment", .{queued});
-        self.startJob(JOB_ENRICH);
-    }
-
-    pub fn startJob(self: *Dashboard, idx: usize) void {
-        var j = &self.jobs[idx];
-        if (j.running) return;
-        j.running = true;
-        j.progress = 0;
-        j.phase = "running";
-        ui.events.post(.info, "jobs", "{s} started", .{j.name});
+        // Dedupe is fine here: pending IOCs ride an already-active job.
+        _ = self.jobs.enqueue(.ioc_enrichment, 0, "pending IOCs", unixNowMs());
     }
 
     // ── View menu ────────────────────────────────────────────────────────
@@ -1685,7 +2070,9 @@ pub const Dashboard = struct {
                 var alq_node: zgui.Ident = 0;
                 _ = zgui.dockBuilderSplitNode(bottom, .left, 0.5, &job_node, &alq_node);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_SEN, ws), sen_node);
+                zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_PIP, ws), ing_node);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_ING, ws), ing_node);
+                zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_AUD, ws), job_node);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_LOG, ws), job_node);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_JOB, ws), job_node);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_ALQ, ws), alq_node);
@@ -2001,6 +2388,7 @@ pub const Dashboard = struct {
     /// Headless data-path exercise (no zgui): determinism, referential
     /// integrity, and every panel's filter/aggregate prep.
     pub fn selfTest(self: *Dashboard) !void {
+        self.ensureAuditHook();
         // Determinism: a second same-seed world checksums identically.
         {
             var s2 = data.Store.init(self.allocator);
@@ -2088,8 +2476,9 @@ pub const Dashboard = struct {
 
         // Mutation round-trip.
         const first_alert = s.alerts.items[0].id;
-        if (!s.setAlertStatus(first_alert, .acked)) return error.MutateFailed;
-        if (!s.setAlertStatus(first_alert, .new)) return error.MutateFailed;
+        if (!s.setAlertStatus(first_alert, .acked, unixNowMs())) return error.MutateFailed;
+        if (!s.setAlertStatus(first_alert, .new, unixNowMs())) return error.MutateFailed;
+        _ = s.triageMeans();
 
         // New mutation paths round-trip (no hook installed under selftest).
         const y0 = s.yara.items[0].id;
@@ -2102,6 +2491,97 @@ pub const Dashboard = struct {
             var filled = data.mock.Generator.enrichmentFor(s, &s.iocs.items[0], unixNowMs());
             filled.status = .done;
             if (!s.upsertEnrichment(filled)) return error.MutateFailed;
+        }
+
+        // Pipelines: sources/runs resolve, caps hold, aggregates run.
+        if (s.sources.items.len == 0 or s.pipelines.items.len == 0) return error.NoPipelines;
+        for (s.pipelines.items) |*p| {
+            if (s.sourceById(p.source) == null) return error.PipelineSourceDangling;
+            if (p.step_count == 0 or p.step_count > domain.PIPELINE_STEP_CAP) return error.PipelineStepsBad;
+            if (p.test_count > domain.PIPELINE_TEST_CAP) return error.PipelineTestsBad;
+        }
+        for (s.pipeline_runs.items) |*r| {
+            if (s.pipelineById(r.pipeline) == null) return error.RunPipelineDangling;
+        }
+        for (s.dead_letters.items) |*dl| {
+            if (s.pipelineById(dl.pipeline) == null) return error.DeadLetterPipelineDangling;
+        }
+        _ = s.pipelineStatusCounts();
+        _ = s.sourceStateCounts();
+        _ = s.pipelineTestCounts();
+        _ = s.rowsIngestedSince(0);
+
+        // Dead-letter lifecycle round-trip + retention.
+        {
+            const pid = s.pipelines.items[0].id;
+            const dl_id = s.addDeadLetter(.{
+                .id = 0,
+                .pipeline = pid,
+                .run_id = 1,
+                .ts_ms = unixNowMs(),
+                .kind = .unique,
+            }) orelse return error.MutateFailed;
+            if (s.openDeadLetterCount(pid) == 0) return error.MutateFailed;
+            if (!s.setDeadLetterState(dl_id, .dropped)) return error.MutateFailed;
+            _ = s.pruneDeadLetters(unixNowMs() + 1);
+        }
+
+        // Full job-completion plumbing: queue a run for the failing-tests
+        // pipeline, complete it through onJobComplete — the run finalizes
+        // PARTIAL, rejected rows spill to the DLQ, and the audit trail
+        // records the whole chain as "system".
+        {
+            const pid = blk: {
+                for (s.pipelines.items) |*p| {
+                    if (p.status == .active and p.testCounts().fail > 0) break :blk p.id;
+                }
+                break :blk s.pipelines.items[0].id;
+            };
+            const dlq_before = s.openDeadLetterCount(pid);
+            self.startPipelineRun(pid, false);
+            const job = self.jobs.active(.pipeline_run, pid) orelse return error.JobNotQueued;
+            const jcopy = job.*;
+            self.audit_system = true;
+            self.onJobComplete(&jcopy);
+            self.audit_system = false;
+            const last = s.lastRunFor(pid) orelse return error.RunMissing;
+            if (last.status == .running) return error.RunNotFinalized;
+            if (last.status == .partial and s.openDeadLetterCount(pid) <= dlq_before)
+                return error.DeadLettersNotSpilled;
+            if (self.audit.items.len == 0) return error.AuditSilent;
+            for (self.audit.items) |*ae| {
+                if (ae.target.len == 0) return error.AuditTargetEmpty;
+            }
+        }
+
+        // Scheduler tick crash-coverage (deterministic gating asserted by
+        // the harness flags; queued work is engine-local).
+        self.tickScheduler();
+
+        // Run lifecycle round-trip; the result function must be pure
+        // (independent of completion time).
+        {
+            const pid = s.pipelines.items[0].id;
+            _ = s.addPipelineRun(.{ .id = 0, .pipeline = pid, .started_ms = unixNowMs() }) orelse return error.MutateFailed;
+            const run = s.lastRunFor(pid).?.*;
+            const a = data.mock.Generator.pipelineRunResult(s, run, run.started_ms + 5_000);
+            const b = data.mock.Generator.pipelineRunResult(s, run, run.started_ms + 9_000);
+            if (a.rows_in != b.rows_in or a.status != b.status or a.rows_rejected != b.rows_rejected)
+                return error.PipelineRunNotPure;
+            if (!s.updatePipelineRun(a)) return error.MutateFailed;
+            if (!s.setPipelineStatus(pid, .paused)) return error.MutateFailed;
+            if (!s.setPipelineStatus(pid, .active)) return error.MutateFailed;
+            if (!s.recordSourceTest(s.pipelines.items[0].source, .ok, 3.0, unixNowMs())) return error.MutateFailed;
+            if (!s.setPipelineTests(pid, s.pipelines.items[0].tests, s.pipelines.items[0].test_count)) return error.MutateFailed;
+        }
+
+        // Case-notes editing round-trip.
+        {
+            const cid = s.cases.items[0].id;
+            const before = s.cases.items[0].notes;
+            if (!s.setCaseNotes(cid, "selftest probe note", unixNowMs())) return error.MutateFailed;
+            if (!std.mem.eql(u8, s.cases.items[0].notes.slice(), "selftest probe note")) return error.MutateFailed;
+            if (!s.setCaseNotes(cid, before.slice(), unixNowMs())) return error.MutateFailed;
         }
 
         // ui_state round-trip through the JSON path.

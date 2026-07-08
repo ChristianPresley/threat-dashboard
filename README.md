@@ -43,7 +43,7 @@ Useful flags:
 | F2 | HUNT | Event Search · Timeline · Process Tree · Network · IOC List · Log · Jobs |
 | F3 | DETECT | Detection Rules · ATT&CK Matrix · YARA Rules · Rule Tuning · Alert Queue · Log |
 | F4 | INTEL | Intel Feeds · IOC List · IOC Enrichment · Threat Actors · Cases · Log |
-| F5 | OPS | Sensor Health · Ingestion Stats · Jobs · Alert Queue · Log |
+| F5 | OPS | Sensor Health · Ingestion Stats · Data Pipelines · Jobs · Audit Trail · Alert Queue · Log |
 
 ## Detection engineering & threat intel
 
@@ -57,6 +57,46 @@ Useful flags:
   pivots to contacted indicators. Deterministic mock data by default;
   the same shapes fill from live VirusTotal/urlscan lookups via the
   threat-intel MCP server.
+
+## Data pipelines (dbt-style ELT)
+
+`PIP` (OPS) manages data processing pipelines end to end: register
+**sources** (PostgreSQL, MySQL, MSSQL, S3, Kafka, syslog, REST APIs, CSV
+exports — with connection-state probes), chain **transform models**
+following dbt conventions (`stg_*` staging views → `int_*` incremental
+models → `mart_*` tables, with dedup/filter/enrich/join/aggregate/mask
+step kinds and per-model materializations), and land the result in a
+**sink** (PostgreSQL, Elasticsearch, ClickHouse, S3 Parquet, or a Kafka
+topic). Each pipeline carries a **dbt-style test suite** (`not_null`,
+`unique`, `accepted_values`, `relationships`, source `freshness`) whose
+pass/fail results and failing-row counts surface next to the run
+history (rows in → out, rejected rows, duration). A builder section
+creates new pipelines from the registered sources; runs execute as
+async jobs and mutations mirror to PostgreSQL through the same Store
+write hook as everything else.
+
+Pipelines run themselves: a **scheduler** auto-queues due runs (per the
+pipeline's cadence), each pipeline carries a **watermark** (newest data
+landed in the sink) whose lag drives the freshness tests, and rejected
+rows spill into a **dead-letter queue** with per-row samples an analyst
+can replay or drop. Sink health (last landing, rows/24h, watermark lag)
+shows per pipeline.
+
+## Jobs, audit, and SLA metrics
+
+- **Job queue** (`JOB`, most workspaces): async work is a real queue —
+  N concurrent slots, queued/running/done/failed/canceled states, FIFO
+  promotion, cancel with cleanup (a canceled run/sync/enrichment never
+  strands half-open state), and a bounded terminal history. Feed syncs
+  run per-feed or fleet-wide; the retention sweep prunes old run
+  history and resolved dead letters.
+- **Audit Trail** (`AUD`, OPS): chain of custody — every analyst and
+  system action (acks, rule toggles, case moves, pipeline operations)
+  recorded at the Store mutation choke point with who · what · when.
+  The record lives outside the swappable Store state, so PostgreSQL
+  snapshot refreshes never erase it.
+- **Triage SLAs** (`PST`): alerts carry ack/resolve timestamps; the
+  posture summary shows real MTTA and MTTR computed from them.
 
 ## AI assistant
 
@@ -104,6 +144,15 @@ threat-dashboard --pg postgres://postgres:pass@localhost:5432/postgres
 Schema lives in `src/data/schema.sql` (applied idempotently on connect).
 If the database is unreachable the app degrades to the mock world with a
 critical banner — the UI never dies with the DB.
+
+After the boot load, a **background worker** owns the database
+connection (`src/data/pg_worker.zig`): panel mutations queue to it
+instead of blocking the render thread, and every 5 s it loads a fresh
+snapshot the render thread swaps in — external writes (ingestion, other
+analysts) appear without a restart. A mutation-sequence guard drops any
+snapshot that raced a panel write, so a refresh can never revert an
+action you just took. If the connection drops, the worker reconnects
+with backoff and reloads database truth.
 
 ## Layout persistence
 

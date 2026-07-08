@@ -264,6 +264,10 @@ pub const Alert = struct {
     case_id: ?u16 = null,
     event_ids: [ALERT_EVENT_CAP]u64 = @splat(0),
     event_count: u8 = 0,
+    /// Triage SLA timestamps (0 = not yet): first ack, final resolution.
+    /// MTTA/MTTR in PST derive from these.
+    acked_ms: i64 = 0,
+    resolved_ms: i64 = 0,
 };
 
 pub const DetectionRule = struct {
@@ -577,6 +581,292 @@ pub const UrlScanSubmission = struct {
     err: FixedStr(32) = .{},
 };
 
+// ── Data pipelines (dbt-style ELT: sources → models → sinks) ─────────────
+
+pub const SourceKind = enum(u8) {
+    postgres,
+    mysql,
+    mssql,
+    s3_bucket,
+    kafka,
+    syslog,
+    rest_api,
+    csv_file,
+
+    pub fn label(self: SourceKind) [:0]const u8 {
+        return switch (self) {
+            .postgres => "POSTGRES",
+            .mysql => "MYSQL",
+            .mssql => "MSSQL",
+            .s3_bucket => "S3",
+            .kafka => "KAFKA",
+            .syslog => "SYSLOG",
+            .rest_api => "API",
+            .csv_file => "CSV",
+        };
+    }
+};
+
+pub const ConnState = enum(u8) {
+    ok,
+    degraded,
+    err,
+
+    pub fn label(self: ConnState) [:0]const u8 {
+        return switch (self) {
+            .ok => "OK",
+            .degraded => "DEGRADED",
+            .err => "UNREACHABLE",
+        };
+    }
+};
+
+/// A selectable ingest source: a database, bucket, topic, or feed the
+/// pipelines read from. `dsn` is display-safe (never carries secrets).
+pub const DataSource = struct {
+    id: u16,
+    name: FixedStr(48) = .{},
+    kind: SourceKind,
+    dsn: FixedStr(96) = .{},
+    state: ConnState = .ok,
+    last_test_ms: i64 = 0,
+    latency_ms: f32 = 0,
+    /// Discoverable tables / topics / objects behind the source.
+    tables: u16 = 0,
+};
+
+pub const SinkKind = enum(u8) {
+    postgres,
+    elasticsearch,
+    s3_parquet,
+    clickhouse,
+    kafka_topic,
+
+    pub fn label(self: SinkKind) [:0]const u8 {
+        return switch (self) {
+            .postgres => "POSTGRES",
+            .elasticsearch => "ELASTIC",
+            .s3_parquet => "S3 PARQUET",
+            .clickhouse => "CLICKHOUSE",
+            .kafka_topic => "KAFKA",
+        };
+    }
+};
+
+/// dbt materialization strategy for one model.
+pub const Materialization = enum(u8) {
+    view,
+    table,
+    incremental,
+    snapshot,
+
+    pub fn label(self: Materialization) [:0]const u8 {
+        return switch (self) {
+            .view => "view",
+            .table => "table",
+            .incremental => "incremental",
+            .snapshot => "snapshot",
+        };
+    }
+};
+
+pub const StepKind = enum(u8) {
+    staging,
+    dedup,
+    filter,
+    enrich,
+    join,
+    aggregate,
+    mask,
+
+    pub fn label(self: StepKind) [:0]const u8 {
+        return switch (self) {
+            .staging => "STAGE",
+            .dedup => "DEDUP",
+            .filter => "FILTER",
+            .enrich => "ENRICH",
+            .join => "JOIN",
+            .aggregate => "AGG",
+            .mask => "MASK",
+        };
+    }
+};
+
+pub const PIPELINE_STEP_CAP = 6;
+
+/// One model in a pipeline's DAG: a named transform with a materialization
+/// (dbt convention: stg_* → int_* → mart_*).
+pub const PipelineStep = struct {
+    kind: StepKind = .staging,
+    model: FixedStr(48) = .{},
+    materialization: Materialization = .view,
+};
+
+pub const DbtTestKind = enum(u8) {
+    not_null,
+    unique,
+    accepted_values,
+    relationships,
+    freshness,
+
+    pub fn label(self: DbtTestKind) [:0]const u8 {
+        return switch (self) {
+            .not_null => "not_null",
+            .unique => "unique",
+            .accepted_values => "accepted_values",
+            .relationships => "relationships",
+            .freshness => "freshness",
+        };
+    }
+};
+
+pub const PIPELINE_TEST_CAP = 6;
+
+/// A dbt-style data test attached to a pipeline: schema tests over a
+/// model.column target plus source freshness.
+pub const PipelineTest = struct {
+    kind: DbtTestKind = .not_null,
+    target: FixedStr(48) = .{},
+    status: GateResult = .pass,
+    /// Failing rows on the last run (0 when passing).
+    failures: u32 = 0,
+};
+
+pub const PipelineStatus = enum(u8) {
+    active,
+    paused,
+    err,
+    draft,
+
+    pub fn label(self: PipelineStatus) [:0]const u8 {
+        return switch (self) {
+            .active => "ACTIVE",
+            .paused => "PAUSED",
+            .err => "ERROR",
+            .draft => "DRAFT",
+        };
+    }
+};
+
+/// A data processing pipeline: one source, an ordered model DAG, one sink,
+/// a schedule, and its dbt-style test suite.
+pub const Pipeline = struct {
+    id: u16,
+    code: FixedStr(8) = .{}, // "P-0001"
+    name: FixedStr(64) = .{},
+    /// DataSource.id this pipeline reads from.
+    source: u16,
+    sink: SinkKind = .postgres,
+    /// Sink target: schema.table / index / bucket prefix / topic.
+    target: FixedStr(64) = .{},
+    /// Run cadence in minutes; 0 = manual only.
+    schedule_min: u16 = 15,
+    status: PipelineStatus = .active,
+    steps: [PIPELINE_STEP_CAP]PipelineStep = @splat(PipelineStep{}),
+    step_count: u8 = 0,
+    tests: [PIPELINE_TEST_CAP]PipelineTest = @splat(PipelineTest{}),
+    test_count: u8 = 0,
+    last_run_ms: i64 = 0,
+    /// High-water mark: newest source data successfully landed in the sink.
+    /// Lag = now − watermark; freshness tests key off it.
+    watermark_ms: i64 = 0,
+    owner: FixedStr(24) = .{},
+
+    pub fn testCounts(self: *const Pipeline) struct { pass: u8, fail: u8 } {
+        var pass: u8 = 0;
+        var fail: u8 = 0;
+        for (self.tests[0..self.test_count]) |*ts| {
+            if (ts.status == .pass) pass += 1 else fail += 1;
+        }
+        return .{ .pass = pass, .fail = fail };
+    }
+
+    pub fn testFailures(self: *const Pipeline) u32 {
+        var n: u32 = 0;
+        for (self.tests[0..self.test_count]) |*ts| n += ts.failures;
+        return n;
+    }
+};
+
+pub const RunStatus = enum(u8) {
+    running,
+    success,
+    failed,
+    partial,
+
+    pub fn label(self: RunStatus) [:0]const u8 {
+        return switch (self) {
+            .running => "RUNNING",
+            .success => "SUCCESS",
+            .failed => "FAILED",
+            .partial => "PARTIAL",
+        };
+    }
+};
+
+/// One pipeline execution: rows in/out/rejected + test tallies. Lifecycle
+/// mirrors the url-scan pattern: add as `.running`, finalize via update.
+pub const PipelineRun = struct {
+    id: u32,
+    pipeline: u16,
+    started_ms: i64 = 0,
+    duration_ms: i64 = 0,
+    rows_in: u64 = 0,
+    rows_out: u64 = 0,
+    rows_rejected: u64 = 0,
+    status: RunStatus = .running,
+    tests_passed: u8 = 0,
+    tests_failed: u8 = 0,
+    /// This run's high-water mark; the pipeline takes the max.
+    watermark_ms: i64 = 0,
+    err: FixedStr(64) = .{},
+};
+
+pub const DlqState = enum(u8) {
+    open,
+    replayed,
+    dropped,
+
+    pub fn label(self: DlqState) [:0]const u8 {
+        return switch (self) {
+            .open => "OPEN",
+            .replayed => "REPLAYED",
+            .dropped => "DROPPED",
+        };
+    }
+};
+
+/// A dead-letter record: one rejected-row sample from a pipeline run,
+/// with the dbt test that rejected it. Analysts replay (re-run after a
+/// fix) or drop them; the retention sweep prunes resolved ones.
+pub const DeadLetter = struct {
+    id: u32,
+    pipeline: u16,
+    run_id: u32,
+    ts_ms: i64 = 0,
+    /// Which test rejected the row.
+    kind: DbtTestKind = .not_null,
+    target: FixedStr(48) = .{},
+    /// Defanged/truncated sample of the offending row.
+    sample: FixedStr(96) = .{},
+    state: DlqState = .open,
+};
+
+// ── Audit trail (chain of custody) ───────────────────────────────────────
+
+/// One analyst/system action recorded at the Store mutation choke point.
+/// Kept OUTSIDE the Store's swappable state (the Dashboard owns the list)
+/// so PG snapshot refreshes can't erase the record.
+pub const AuditEntry = struct {
+    id: u32,
+    ts_ms: i64 = 0,
+    actor: FixedStr(24) = .{},
+    /// Mutation tag, e.g. "alert_status".
+    action: FixedStr(28) = .{},
+    /// Compact human target, e.g. "alert #142 → ACKED".
+    target: FixedStr(64) = .{},
+};
+
 /// Defang an indicator for display OPSEC: "https://x.y/z" → "hxxps://x[.]y/z",
 /// "1.2.3.4" → "1[.]2[.]3[.]4". Hashes/emails pass through untouched (emails
 /// keep their dots — matching how analysts share them is out of scope here;
@@ -657,6 +947,17 @@ test "defang neutralizes urls, domains, ips" {
     try std.testing.expectEqualStrings("evil[.]example[.]com", defang(&buf, .domain, "evil.example.com"));
     try std.testing.expectEqualStrings("203[.]0[.]113[.]9", defang(&buf, .ip, "203.0.113.9"));
     try std.testing.expectEqualStrings("abc123", defang(&buf, .hash_sha256, "abc123"));
+}
+
+test "pipeline test tallies" {
+    var p = Pipeline{ .id = 1, .source = 0 };
+    p.tests[0] = .{ .kind = .not_null, .target = FixedStr(48).from("stg_events.host") };
+    p.tests[1] = .{ .kind = .accepted_values, .target = FixedStr(48).from("stg_iocs.type"), .status = .fail, .failures = 12 };
+    p.test_count = 2;
+    const tc = p.testCounts();
+    try std.testing.expectEqual(@as(u8, 1), tc.pass);
+    try std.testing.expectEqual(@as(u8, 1), tc.fail);
+    try std.testing.expectEqual(@as(u32, 12), p.testFailures());
 }
 
 test "fixed string truncates + round-trips" {

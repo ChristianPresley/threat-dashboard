@@ -1,5 +1,6 @@
 //! In-memory world state read by every panel and written by a provider
-//! (the mock generator today; the Postgres worker in a later phase).
+//! (the mock generator, or the Postgres background worker in
+//! pg_worker.zig which swaps in whole snapshots via `adoptFrom`).
 //! Panels never query a backend directly — they read Store snapshots and
 //! mutate through the small action API here, so swapping the provider
 //! never touches panel code.
@@ -9,11 +10,13 @@ const domain = @import("domain");
 
 pub const mock = @import("mock.zig");
 pub const pg = @import("pg.zig");
+pub const pg_worker = @import("pg_worker.zig");
+pub const jobs = @import("jobs.zig");
 
 /// Mutations panels perform through the Store — mirrored to the active
 /// provider via `write_hook` so a backing database stays in sync.
 pub const Mutation = union(enum) {
-    alert_status: struct { id: u32, status: domain.AlertStatus },
+    alert_status: struct { id: u32, status: domain.AlertStatus, acked_ms: i64 = 0, resolved_ms: i64 = 0 },
     rule_status: struct { id: u16, status: domain.RuleStatus },
     case_status: struct { id: u16, status: domain.CaseStatus, now_ms: i64 },
     case_assign: struct { alert_id: u32, case_id: u16, now_ms: i64 },
@@ -23,6 +26,17 @@ pub const Mutation = union(enum) {
     enrichment_upsert: struct { e: domain.IocEnrichment },
     urlscan_submit: struct { id: u32, ioc_id: u32, now_ms: i64 },
     urlscan_update: struct { id: u32, state: domain.ScanState, now_ms: i64 },
+    case_notes: struct { id: u16, notes: domain.FixedStr(480), now_ms: i64 },
+    source_tested: struct { id: u16, state: domain.ConnState, latency_ms: f32, now_ms: i64 },
+    pipeline_status: struct { id: u16, status: domain.PipelineStatus },
+    /// Carries the full row so the PG hook can insert in one statement.
+    pipeline_add: struct { p: domain.Pipeline },
+    pipeline_run_add: struct { run: domain.PipelineRun },
+    pipeline_run_update: struct { run: domain.PipelineRun },
+    /// Test suite rewrite after a run (statuses + failure counts).
+    pipeline_tests: struct { id: u16, tests: [domain.PIPELINE_TEST_CAP]domain.PipelineTest, test_count: u8 },
+    dead_letter_add: struct { dl: domain.DeadLetter },
+    dead_letter_state: struct { id: u32, state: domain.DlqState },
 };
 
 pub const WriteHook = struct {
@@ -46,6 +60,10 @@ pub const Store = struct {
     yara: std.ArrayList(domain.YaraRule) = .empty,
     enrichments: std.ArrayList(domain.IocEnrichment) = .empty,
     urlscans: std.ArrayList(domain.UrlScanSubmission) = .empty,
+    sources: std.ArrayList(domain.DataSource) = .empty,
+    pipelines: std.ArrayList(domain.Pipeline) = .empty,
+    pipeline_runs: std.ArrayList(domain.PipelineRun) = .empty,
+    dead_letters: std.ArrayList(domain.DeadLetter) = .empty,
 
     /// Bumped on every mutation — panels use it to invalidate cached
     /// filter/sort scratch state.
@@ -53,6 +71,10 @@ pub const Store = struct {
 
     /// Installed by the active provider (PG); null under the mock.
     write_hook: ?WriteHook = null,
+    /// Audit-trail tap: sees every mutation BEFORE the provider hook. The
+    /// Dashboard installs it and owns the entries — never part of the
+    /// swappable Store state.
+    audit_hook: ?WriteHook = null,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -72,6 +94,10 @@ pub const Store = struct {
         self.yara.deinit(self.allocator);
         self.enrichments.deinit(self.allocator);
         self.urlscans.deinit(self.allocator);
+        self.sources.deinit(self.allocator);
+        self.pipelines.deinit(self.allocator);
+        self.pipeline_runs.deinit(self.allocator);
+        self.dead_letters.deinit(self.allocator);
     }
 
     pub fn clear(self: *Store) void {
@@ -88,6 +114,10 @@ pub const Store = struct {
         self.yara.clearRetainingCapacity();
         self.enrichments.clearRetainingCapacity();
         self.urlscans.clearRetainingCapacity();
+        self.sources.clearRetainingCapacity();
+        self.pipelines.clearRetainingCapacity();
+        self.pipeline_runs.clearRetainingCapacity();
+        self.dead_letters.clearRetainingCapacity();
         self.generation +%= 1;
     }
 
@@ -95,7 +125,24 @@ pub const Store = struct {
         self.generation +%= 1;
     }
 
+    /// Snapshot swap: take `other`'s contents wholesale (render thread;
+    /// `other` is a fresh world the PG worker loaded off-thread). Keeps
+    /// this store's write_hook and keeps `generation` monotonic so panel
+    /// caches invalidate. `other` is left empty and safe to destroy.
+    pub fn adoptFrom(self: *Store, other: *Store) void {
+        const hook = self.write_hook;
+        const ahook = self.audit_hook;
+        const gen = self.generation;
+        self.deinit();
+        self.* = other.*;
+        self.write_hook = hook;
+        self.audit_hook = ahook;
+        self.generation = gen +% 1;
+        other.* = Store.init(other.allocator);
+    }
+
     fn notify(self: *Store, m: Mutation) void {
+        if (self.audit_hook) |h| h.f(h.ctx, m);
         if (self.write_hook) |h| h.f(h.ctx, m);
     }
 
@@ -178,6 +225,30 @@ pub const Store = struct {
         while (i > 0) {
             i -= 1;
             if (self.urlscans.items[i].ioc_id == ioc_id) return &self.urlscans.items[i];
+        }
+        return null;
+    }
+
+    pub fn sourceById(self: *Store, id: u16) ?*domain.DataSource {
+        for (self.sources.items) |*src| {
+            if (src.id == id) return src;
+        }
+        return null;
+    }
+
+    pub fn pipelineById(self: *Store, id: u16) ?*domain.Pipeline {
+        for (self.pipelines.items) |*p| {
+            if (p.id == id) return p;
+        }
+        return null;
+    }
+
+    /// Latest run for a pipeline (runs append in start order — scan back).
+    pub fn lastRunFor(self: *Store, pipeline_id: u16) ?*domain.PipelineRun {
+        var i = self.pipeline_runs.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.pipeline_runs.items[i].pipeline == pipeline_id) return &self.pipeline_runs.items[i];
         }
         return null;
     }
@@ -291,14 +362,88 @@ pub const Store = struct {
         return .{ .done = done, .pending = pending, .err = err };
     }
 
+    /// Pipeline counts indexed by PipelineStatus (active/paused/err/draft).
+    pub fn pipelineStatusCounts(self: *const Store) [4]u32 {
+        var out: [4]u32 = @splat(0);
+        for (self.pipelines.items) |*p| out[@intFromEnum(p.status)] += 1;
+        return out;
+    }
+
+    pub fn sourceStateCounts(self: *const Store) [3]u32 {
+        var out: [3]u32 = @splat(0);
+        for (self.sources.items) |*src| out[@intFromEnum(src.state)] += 1;
+        return out;
+    }
+
+    /// dbt test suite tallies across every pipeline.
+    pub fn pipelineTestCounts(self: *const Store) struct { pass: u32, fail: u32 } {
+        var pass: u32 = 0;
+        var fail: u32 = 0;
+        for (self.pipelines.items) |*p| {
+            const tc = p.testCounts();
+            pass += tc.pass;
+            fail += tc.fail;
+        }
+        return .{ .pass = pass, .fail = fail };
+    }
+
+    /// Rows landed in sinks by runs that STARTED after `since_ms`.
+    pub fn rowsIngestedSince(self: *const Store, since_ms: i64) u64 {
+        var n: u64 = 0;
+        for (self.pipeline_runs.items) |*r| {
+            if (r.started_ms >= since_ms and r.status != .running) n += r.rows_out;
+        }
+        return n;
+    }
+
     // ── Mutations (panel actions) ────────────────────────────────────────
 
-    pub fn setAlertStatus(self: *Store, id: u32, status: domain.AlertStatus) bool {
+    /// Status change with SLA stamps: first ack sets acked_ms, a terminal
+    /// close sets resolved_ms (and backfills acked_ms) — MTTA/MTTR feed.
+    pub fn setAlertStatus(self: *Store, id: u32, status: domain.AlertStatus, now_ms: i64) bool {
         const a = self.alertById(id) orelse return false;
         a.status = status;
+        switch (status) {
+            .acked, .investigating => {
+                if (a.acked_ms == 0) a.acked_ms = now_ms;
+            },
+            .resolved, .false_positive, .suppressed => {
+                if (a.acked_ms == 0) a.acked_ms = now_ms;
+                if (a.resolved_ms == 0) a.resolved_ms = now_ms;
+            },
+            .new => {}, // reopen keeps historical stamps
+        }
         self.touch();
-        self.notify(.{ .alert_status = .{ .id = id, .status = status } });
+        self.notify(.{ .alert_status = .{
+            .id = id,
+            .status = status,
+            .acked_ms = a.acked_ms,
+            .resolved_ms = a.resolved_ms,
+        } });
         return true;
+    }
+
+    /// Mean time-to-acknowledge / time-to-resolve over stamped alerts (ms;
+    /// null when nothing is stamped yet).
+    pub fn triageMeans(self: *const Store) struct { mtta_ms: ?i64, mttr_ms: ?i64 } {
+        var acked_sum: i64 = 0;
+        var acked_n: i64 = 0;
+        var res_sum: i64 = 0;
+        var res_n: i64 = 0;
+        for (self.alerts.items) |*a| {
+            if (a.acked_ms > a.ts_ms) {
+                acked_sum += a.acked_ms - a.ts_ms;
+                acked_n += 1;
+            }
+            if (a.resolved_ms > a.ts_ms) {
+                res_sum += a.resolved_ms - a.ts_ms;
+                res_n += 1;
+            }
+        }
+        return .{
+            .mtta_ms = if (acked_n > 0) @divFloor(acked_sum, acked_n) else null,
+            .mttr_ms = if (res_n > 0) @divFloor(res_sum, res_n) else null,
+        };
     }
 
     /// Attach an alert to a case (and mirror case_id on the alert).
@@ -395,6 +540,176 @@ pub const Store = struct {
         }
         return false;
     }
+
+    pub fn setCaseNotes(self: *Store, id: u16, notes: []const u8, now_ms: i64) bool {
+        const c = self.caseById(id) orelse return false;
+        c.notes = domain.FixedStr(480).from(notes);
+        c.updated_ms = now_ms;
+        self.touch();
+        self.notify(.{ .case_notes = .{ .id = id, .notes = c.notes, .now_ms = now_ms } });
+        return true;
+    }
+
+    /// Record a connection-test result for a source.
+    pub fn recordSourceTest(self: *Store, id: u16, state: domain.ConnState, latency_ms: f32, now_ms: i64) bool {
+        const src = self.sourceById(id) orelse return false;
+        src.state = state;
+        src.latency_ms = latency_ms;
+        src.last_test_ms = now_ms;
+        self.touch();
+        self.notify(.{ .source_tested = .{ .id = id, .state = state, .latency_ms = latency_ms, .now_ms = now_ms } });
+        return true;
+    }
+
+    pub fn setPipelineStatus(self: *Store, id: u16, status: domain.PipelineStatus) bool {
+        const p = self.pipelineById(id) orelse return false;
+        p.status = status;
+        self.touch();
+        self.notify(.{ .pipeline_status = .{ .id = id, .status = status } });
+        return true;
+    }
+
+    /// Register a builder-created pipeline; assigns the next free id and
+    /// code. Returns the id, or null when the source is dangling / OOM.
+    pub fn addPipeline(self: *Store, proto: domain.Pipeline) ?u16 {
+        if (self.sourceById(proto.source) == null) return null;
+        var next: u16 = 1;
+        for (self.pipelines.items) |*p| {
+            if (p.id >= next) next = p.id + 1;
+        }
+        var p = proto;
+        p.id = next;
+        p.code = domain.FixedStr(8).fromFmt("P-{d:0>4}", .{next});
+        self.pipelines.append(self.allocator, p) catch return null;
+        self.touch();
+        self.notify(.{ .pipeline_add = .{ .p = p } });
+        return next;
+    }
+
+    /// Start a run (status .running unless the caller pre-finalized it);
+    /// assigns the next free run id and stamps the pipeline's last_run_ms.
+    pub fn addPipelineRun(self: *Store, proto: domain.PipelineRun) ?u32 {
+        const p = self.pipelineById(proto.pipeline) orelse return null;
+        var next: u32 = 1;
+        for (self.pipeline_runs.items) |*r| {
+            if (r.id >= next) next = r.id + 1;
+        }
+        var run = proto;
+        run.id = next;
+        self.pipeline_runs.append(self.allocator, run) catch return null;
+        p.last_run_ms = @max(p.last_run_ms, run.started_ms);
+        self.touch();
+        self.notify(.{ .pipeline_run_add = .{ .run = run } });
+        return next;
+    }
+
+    /// Finalize a run in place (rows, duration, status, test tallies).
+    /// Successful/partial runs advance the pipeline's watermark.
+    pub fn updatePipelineRun(self: *Store, run: domain.PipelineRun) bool {
+        for (self.pipeline_runs.items) |*r| {
+            if (r.id != run.id) continue;
+            r.* = run;
+            if (run.status == .success or run.status == .partial) {
+                if (self.pipelineById(run.pipeline)) |p| {
+                    p.watermark_ms = @max(p.watermark_ms, run.watermark_ms);
+                }
+            }
+            self.touch();
+            self.notify(.{ .pipeline_run_update = .{ .run = run } });
+            return true;
+        }
+        return false;
+    }
+
+    /// Append a dead-letter record; assigns the next free id.
+    pub fn addDeadLetter(self: *Store, proto: domain.DeadLetter) ?u32 {
+        if (self.pipelineById(proto.pipeline) == null) return null;
+        var next: u32 = 1;
+        for (self.dead_letters.items) |*dl| {
+            if (dl.id >= next) next = dl.id + 1;
+        }
+        var dl = proto;
+        dl.id = next;
+        self.dead_letters.append(self.allocator, dl) catch return null;
+        self.touch();
+        self.notify(.{ .dead_letter_add = .{ .dl = dl } });
+        return next;
+    }
+
+    pub fn setDeadLetterState(self: *Store, id: u32, state: domain.DlqState) bool {
+        for (self.dead_letters.items) |*dl| {
+            if (dl.id != id) continue;
+            dl.state = state;
+            self.touch();
+            self.notify(.{ .dead_letter_state = .{ .id = id, .state = state } });
+            return true;
+        }
+        return false;
+    }
+
+    pub fn openDeadLetterCount(self: *const Store, pipeline_id: u16) u32 {
+        var n: u32 = 0;
+        for (self.dead_letters.items) |*dl| {
+            if (dl.pipeline == pipeline_id and dl.state == .open) n += 1;
+        }
+        return n;
+    }
+
+    // ── Retention (mock-mode housekeeping; NOT mirrored — under PG the
+    //    snapshot refresh owns the row set) ────────────────────────────────
+
+    /// Drop the oldest completed runs beyond `keep` per pipeline. Returns
+    /// how many were removed.
+    pub fn prunePipelineRuns(self: *Store, keep: u32) u32 {
+        var removed: u32 = 0;
+        for (self.pipelines.items) |*p| {
+            var n: u32 = 0;
+            for (self.pipeline_runs.items) |*r| {
+                if (r.pipeline == p.id and r.status != .running) n += 1;
+            }
+            // Runs append in start order — remove from the front.
+            var i: usize = 0;
+            while (n > keep and i < self.pipeline_runs.items.len) {
+                const r = &self.pipeline_runs.items[i];
+                if (r.pipeline == p.id and r.status != .running) {
+                    _ = self.pipeline_runs.orderedRemove(i);
+                    n -= 1;
+                    removed += 1;
+                    continue;
+                }
+                i += 1;
+            }
+        }
+        if (removed > 0) self.touch();
+        return removed;
+    }
+
+    /// Drop replayed/dropped dead letters older than `before_ms`.
+    pub fn pruneDeadLetters(self: *Store, before_ms: i64) u32 {
+        var removed: u32 = 0;
+        var i: usize = 0;
+        while (i < self.dead_letters.items.len) {
+            const dl = &self.dead_letters.items[i];
+            if (dl.state != .open and dl.ts_ms < before_ms) {
+                _ = self.dead_letters.orderedRemove(i);
+                removed += 1;
+                continue;
+            }
+            i += 1;
+        }
+        if (removed > 0) self.touch();
+        return removed;
+    }
+
+    /// Rewrite a pipeline's dbt test results after a run.
+    pub fn setPipelineTests(self: *Store, id: u16, tests: [domain.PIPELINE_TEST_CAP]domain.PipelineTest, test_count: u8) bool {
+        const p = self.pipelineById(id) orelse return false;
+        p.tests = tests;
+        p.test_count = @min(test_count, domain.PIPELINE_TEST_CAP);
+        self.touch();
+        self.notify(.{ .pipeline_tests = .{ .id = id, .tests = p.tests, .test_count = p.test_count } });
+        return true;
+    }
 };
 
 test "store mutations + aggregates" {
@@ -411,6 +726,17 @@ test "store mutations + aggregates" {
 
     const by_sev = s.openAlertCountBySeverity();
     try std.testing.expectEqual(@as(u32, 1), by_sev[@intFromEnum(domain.Severity.high)]);
+
+    // Triage SLA stamps: ack sets acked_ms once; resolve backfills.
+    try std.testing.expect(s.setAlertStatus(1, .acked, 60_000));
+    try std.testing.expectEqual(@as(i64, 60_000), s.alertById(1).?.acked_ms);
+    try std.testing.expect(s.setAlertStatus(1, .resolved, 120_000));
+    try std.testing.expectEqual(@as(i64, 60_000), s.alertById(1).?.acked_ms); // unchanged
+    try std.testing.expectEqual(@as(i64, 120_000), s.alertById(1).?.resolved_ms);
+    const means = s.triageMeans();
+    try std.testing.expectEqual(@as(?i64, 60_000), means.mtta_ms);
+    try std.testing.expectEqual(@as(?i64, 120_000), means.mttr_ms);
+    try std.testing.expect(s.setAlertStatus(1, .new, 130_000)); // reopen for the case-assign flow below
 
     try std.testing.expect(s.assignAlertToCase(1, 3, 42));
     try std.testing.expectEqual(@as(u8, 1), s.cases.items[0].alert_count);
@@ -439,6 +765,121 @@ test "yara + enrichment + urlscan round-trips" {
     const scan_id = s.submitUrlScan(9, 100).?;
     try std.testing.expect(s.setUrlScanState(scan_id, .done, 200));
     try std.testing.expectEqual(@as(i64, 200), s.urlScanForIoc(9).?.completed_ms);
+}
+
+test "pipeline + source round-trips" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+
+    try s.sources.append(s.allocator, .{ .id = 1, .kind = .kafka, .name = domain.FixedStr(48).from("events bus") });
+    try std.testing.expect(s.recordSourceTest(1, .degraded, 240, 100));
+    try std.testing.expectEqual(domain.ConnState.degraded, s.sourceById(1).?.state);
+
+    // Builder path: dangling source rejected, live source accepted.
+    try std.testing.expectEqual(@as(?u16, null), s.addPipeline(.{ .id = 0, .source = 99 }));
+    var proto = domain.Pipeline{ .id = 0, .source = 1, .name = domain.FixedStr(64).from("edr_events_ingest") };
+    proto.steps[0] = .{ .kind = .staging, .model = domain.FixedStr(48).from("stg_edr_events") };
+    proto.step_count = 1;
+    const pid = s.addPipeline(proto).?;
+    try std.testing.expectEqualStrings("P-0001", s.pipelineById(pid).?.code.slice());
+
+    // Run lifecycle: add running → finalize.
+    const rid = s.addPipelineRun(.{ .id = 0, .pipeline = pid, .started_ms = 500 }).?;
+    try std.testing.expectEqual(@as(i64, 500), s.pipelineById(pid).?.last_run_ms);
+    var run = s.lastRunFor(pid).?.*;
+    run.status = .success;
+    run.rows_in = 1000;
+    run.rows_out = 990;
+    run.duration_ms = 4200;
+    try std.testing.expect(s.updatePipelineRun(run));
+    try std.testing.expectEqual(domain.RunStatus.success, s.lastRunFor(pid).?.status);
+    try std.testing.expectEqual(@as(u64, 990), s.rowsIngestedSince(0));
+    try std.testing.expectEqual(@as(u32, rid), s.lastRunFor(pid).?.id);
+
+    try std.testing.expect(s.setPipelineStatus(pid, .paused));
+    try std.testing.expectEqual(@as(u32, 1), s.pipelineStatusCounts()[@intFromEnum(domain.PipelineStatus.paused)]);
+
+    var tests: [domain.PIPELINE_TEST_CAP]domain.PipelineTest = @splat(domain.PipelineTest{});
+    tests[0] = .{ .kind = .unique, .target = domain.FixedStr(48).from("stg_edr_events.event_id"), .status = .fail, .failures = 3 };
+    try std.testing.expect(s.setPipelineTests(pid, tests, 1));
+    try std.testing.expectEqual(@as(u32, 1), s.pipelineTestCounts().fail);
+}
+
+test "adoptFrom swaps contents, keeps hook + monotonic generation" {
+    const gpa = std.testing.allocator;
+    const Hook = struct {
+        var hits: usize = 0;
+        fn f(_: *anyopaque, _: Mutation) void {
+            hits += 1;
+        }
+    };
+
+    var live = Store.init(gpa);
+    defer live.deinit();
+    try live.alerts.append(gpa, .{ .id = 1, .ts_ms = 0, .rule = 0, .severity = .low });
+    var dummy: u8 = 0;
+    live.write_hook = .{ .ctx = &dummy, .f = Hook.f };
+    live.touch();
+    live.touch();
+    const gen_before = live.generation;
+
+    var snap = Store.init(gpa);
+    defer snap.deinit(); // empty after adoption — must be a safe no-op
+    try snap.alerts.append(gpa, .{ .id = 2, .ts_ms = 5, .rule = 0, .severity = .high });
+    try snap.alerts.append(gpa, .{ .id = 3, .ts_ms = 6, .rule = 0, .severity = .high });
+
+    live.adoptFrom(&snap);
+    try std.testing.expectEqual(@as(usize, 2), live.alerts.items.len);
+    try std.testing.expectEqual(@as(usize, 0), snap.alerts.items.len);
+    try std.testing.expectEqual(gen_before +% 1, live.generation);
+    // Hook survived the swap and still fires on mutation.
+    try std.testing.expect(live.setAlertStatus(2, .acked, 42));
+    try std.testing.expectEqual(@as(usize, 1), Hook.hits);
+}
+
+test "dead letters + watermark + retention" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    try s.sources.append(s.allocator, .{ .id = 1, .kind = .kafka });
+    const pid = s.addPipeline(.{ .id = 0, .source = 1, .name = domain.FixedStr(64).from("wm_test") }).?;
+
+    // Watermark advances only on success/partial.
+    _ = s.addPipelineRun(.{ .id = 0, .pipeline = pid, .started_ms = 100 }).?;
+    var run = s.lastRunFor(pid).?.*;
+    run.status = .failed;
+    run.watermark_ms = 500;
+    try std.testing.expect(s.updatePipelineRun(run));
+    try std.testing.expectEqual(@as(i64, 0), s.pipelineById(pid).?.watermark_ms);
+    run.status = .success;
+    try std.testing.expect(s.updatePipelineRun(run));
+    try std.testing.expectEqual(@as(i64, 500), s.pipelineById(pid).?.watermark_ms);
+
+    // DLQ lifecycle + counts.
+    try std.testing.expectEqual(@as(?u32, null), s.addDeadLetter(.{ .id = 0, .pipeline = 99, .run_id = 1 }));
+    const dl_id = s.addDeadLetter(.{ .id = 0, .pipeline = pid, .run_id = run.id, .ts_ms = 10, .kind = .unique }).?;
+    try std.testing.expectEqual(@as(u32, 1), s.openDeadLetterCount(pid));
+    try std.testing.expect(s.setDeadLetterState(dl_id, .dropped));
+    try std.testing.expectEqual(@as(u32, 0), s.openDeadLetterCount(pid));
+
+    // Retention: resolved dead letters + old completed runs prune.
+    try std.testing.expectEqual(@as(u32, 1), s.pruneDeadLetters(100));
+    var k: u32 = 0;
+    while (k < 5) : (k += 1) {
+        _ = s.addPipelineRun(.{ .id = 0, .pipeline = pid, .started_ms = 200 + k }).?;
+        var rr = s.lastRunFor(pid).?.*;
+        rr.status = .success;
+        _ = s.updatePipelineRun(rr);
+    }
+    try std.testing.expectEqual(@as(u32, 4), s.prunePipelineRuns(2));
+}
+
+test "case notes round-trip" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    try s.cases.append(s.allocator, .{ .id = 3 });
+    try std.testing.expect(s.setCaseNotes(3, "containment done; resetting creds", 42));
+    try std.testing.expectEqualStrings("containment done; resetting creds", s.caseById(3).?.notes.slice());
+    try std.testing.expectEqual(@as(i64, 42), s.caseById(3).?.updated_ms);
 }
 
 test {
