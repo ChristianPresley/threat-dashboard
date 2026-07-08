@@ -2,6 +2,7 @@ const std = @import("std");
 const zgui = @import("zgui");
 const ui = @import("ui");
 const data = @import("data");
+const ai = @import("ai");
 const dashboard_mod = @import("dashboard");
 const Dashboard = dashboard_mod.Dashboard;
 const render = @import("render");
@@ -313,6 +314,15 @@ pub fn main(init: std.process.Init) !void {
 
     // Restore {workspace, filters, seed} from <state-dir>/ui_state.json.
     dashboard.loadUiState();
+
+    // AI assistant: config from environment (secrets are never persisted).
+    // The worker thread is spawned lazily on the first message, so this is
+    // a no-op cost until the analyst actually uses the assistant.
+    dashboard.configureAssistant(io, .{
+        .api_key = init.environ_map.get("ANTHROPIC_API_KEY"),
+        .model = init.environ_map.get("TD_AI_MODEL") orelse "claude-sonnet-5",
+        .mcp_cmd = init.environ_map.get("TD_MCP_CMD"),
+    });
 
     // PostgreSQL provider: replace the mock world with database truth and
     // mirror panel mutations back. Connect failure degrades to the mock

@@ -13,6 +13,7 @@ const zgui = @import("zgui");
 const ui = @import("ui");
 const domain = @import("domain");
 const data = @import("data");
+const ai = @import("ai");
 
 pub const attack = domain.attack;
 const panels_mod = @import("panels/panels.zig");
@@ -56,6 +57,7 @@ pub const panels = [_]Panel{
     .{ .code = "HELP", .name = "Directory", .group = "Ops" },
     .{ .code = "YAR", .name = "YARA Rules", .group = "Detect" },
     .{ .code = "ENR", .name = "IOC Enrichment", .group = "Intel" },
+    .{ .code = "AI", .name = "AI Assistant", .group = "Intel" },
 };
 
 pub const PANEL_PST: usize = 0;
@@ -79,6 +81,7 @@ pub const PANEL_SET: usize = 17;
 pub const PANEL_HELP: usize = 18;
 pub const PANEL_YAR: usize = 19;
 pub const PANEL_ENR: usize = 20;
+pub const PANEL_AI: usize = 21;
 
 /// Workspace membership: only members of the ACTIVE workspace are
 /// submitted (plus force-opens). SET and HELP are in no preset — they
@@ -339,6 +342,7 @@ const commands = [_]ui.registry.Command{
     .{ .code = "JOB", .name = "Jobs", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_JOB), .desc = "Focus Jobs (async work: phase, progress, cancel)" },
     .{ .code = "SET", .name = "Settings", .kind = .panel, .menu_group = "Panels", .key_hint = "Ctrl+,", .run = makePanelRun(PANEL_SET), .desc = "Focus Settings (appearance \u{00B7} mock seed \u{00B7} persistence paths)" },
     .{ .code = "HELP", .name = "Directory", .kind = .panel, .menu_group = "Panels", .key_hint = "?", .run = makePanelRun(PANEL_HELP), .desc = "Focus the HELP directory (codes \u{00B7} keyboard map \u{00B7} command grammar)" },
+    .{ .code = "AI", .name = "AI Assistant", .kind = .panel, .menu_group = "Panels", .key_hint = "Ctrl+Shift+A", .run = makePanelRun(PANEL_AI), .desc = "Focus the AI Assistant (Claude chat with read-only dashboard + threat-intel tools)" },
     // -- Workspaces --
     .{ .code = "TRIAGE", .name = "Triage workspace", .kind = .panel, .menu_group = "Workspaces", .key_hint = "F1", .run = makeWorkspaceRun(.triage), .desc = "Switch to TRIAGE (alert queue \u{00B7} cases \u{00B7} posture \u{00B7} timeline)" },
     .{ .code = "HUNT", .name = "Hunt workspace", .kind = .panel, .menu_group = "Workspaces", .key_hint = "F2", .run = makeWorkspaceRun(.hunt), .desc = "Switch to HUNT (event search \u{00B7} timeline \u{00B7} process tree \u{00B7} network)" },
@@ -459,6 +463,50 @@ pub const MockJob = struct {
     running: bool = false,
 };
 
+// ===== AI assistant UI state =============================================
+
+pub const ChatItem = struct {
+    kind: enum { user, assistant, tool_call, tool_result, err },
+    text: []u8, // owned
+    meta: [64]u8 = @splat(0),
+    meta_len: u8 = 0,
+    is_error: bool = false,
+    expanded: bool = false,
+
+    pub fn metaSlice(self: *const ChatItem) []const u8 {
+        return self.meta[0..self.meta_len];
+    }
+};
+
+pub const AssistantUi = struct {
+    cfg: ai.Config = .{},
+    worker: ?*ai.worker.Worker = null,
+    io: ?std.Io = null,
+    mcp_argv_buf: [16][]const u8 = undefined,
+
+    transcript: std.ArrayList(ChatItem) = .empty,
+    input_buf: [4096:0]u8 = std.mem.zeroes([4096:0]u8),
+    busy: bool = false,
+    status: [96]u8 = @splat(0),
+    status_len: u8 = 0,
+    mcp_state: ai.worker.McpState = .off,
+    last_in_tokens: u64 = 0,
+    last_out_tokens: u64 = 0,
+    attach_alert: bool = false,
+    attach_ioc: bool = false,
+    scroll_to_bottom: bool = false,
+
+    pub fn statusSlice(self: *const AssistantUi) []const u8 {
+        return self.status[0..self.status_len];
+    }
+
+    fn setStatus(self: *AssistantUi, s: []const u8) void {
+        const n = @min(s.len, self.status.len);
+        @memcpy(self.status[0..n], s[0..n]);
+        self.status_len = @intCast(n);
+    }
+};
+
 // ===== The Dashboard =====================================================
 
 pub const Dashboard = struct {
@@ -556,6 +604,9 @@ pub const Dashboard = struct {
         .{ .name = "yara ci" },
     },
 
+    // -- AI assistant --
+    assistant: AssistantUi = .{},
+
     pub const JOB_ENRICH: usize = 2;
     pub const JOB_YARA_CI: usize = 4;
 
@@ -582,7 +633,126 @@ pub const Dashboard = struct {
     }
 
     pub fn deinit(self: *Dashboard) void {
+        if (self.assistant.worker) |w| w.shutdown();
+        for (self.assistant.transcript.items) |*it| self.allocator.free(it.text);
+        self.assistant.transcript.deinit(self.allocator);
         self.store.deinit();
+    }
+
+    /// Wire the AI assistant from env-sourced config (GUI path only). The
+    /// worker thread is NOT spawned here — that happens lazily on first send.
+    pub fn configureAssistant(self: *Dashboard, io: std.Io, cfg: ai.Config) void {
+        self.assistant.cfg = cfg;
+        self.assistant.io = io;
+        if (!cfg.configured()) return;
+        const argv = ai.resolveMcpArgv(cfg, &self.assistant.mcp_argv_buf);
+        self.assistant.worker = ai.worker.Worker.create(self.allocator, io, .{
+            .api_key = cfg.api_key.?,
+            .model = cfg.model,
+            .mcp_argv = argv,
+            .system_prompt = ai.SYSTEM_PROMPT,
+        }) catch null;
+    }
+
+    fn appendChat(self: *Dashboard, kind: anytype, text: []const u8, meta: []const u8, is_error: bool) void {
+        const owned = self.allocator.dupe(u8, text) catch return;
+        var item: ChatItem = .{ .kind = kind, .text = owned, .is_error = is_error };
+        const mn = @min(meta.len, item.meta.len);
+        @memcpy(item.meta[0..mn], meta[0..mn]);
+        item.meta_len = @intCast(mn);
+        self.assistant.transcript.append(self.allocator, item) catch {
+            self.allocator.free(owned);
+            return;
+        };
+        self.assistant.scroll_to_bottom = true;
+    }
+
+    /// Send the assistant a message, serializing any attached context.
+    pub fn assistantSend(self: *Dashboard, text: []const u8) void {
+        const w = self.assistant.worker orelse return;
+        self.appendChat(.user, text, "", false);
+        // Build attached-context JSON from current selections, if requested.
+        var ctx_buf: std.Io.Writer.Allocating = .init(self.allocator);
+        defer ctx_buf.deinit();
+        var has_ctx = false;
+        if (self.assistant.attach_alert) {
+            if (self.alq_sel) |aid| {
+                var qb: [48]u8 = undefined;
+                const q = std.fmt.bufPrint(&qb, "{{\"id\":{d}}}", .{aid}) catch "{}";
+                if (ai.tools.execute(self.allocator, &self.store, "get_alert_detail", q)) |j| {
+                    defer self.allocator.free(j);
+                    ctx_buf.writer.print("<attached_alert>{s}</attached_alert>", .{j}) catch {};
+                    has_ctx = true;
+                } else |_| {}
+            }
+        }
+        if (self.assistant.attach_ioc) {
+            if (self.enr_sel) |iid| {
+                if (self.store.iocById(iid)) |ic| {
+                    ctx_buf.writer.print("<attached_ioc>type={s} value={s} confidence={d}</attached_ioc>", .{
+                        ic.type.label(), ic.value.slice(), ic.confidence,
+                    }) catch {};
+                    has_ctx = true;
+                }
+            }
+        }
+        w.send(text, if (has_ctx) ctx_buf.written() else null);
+        self.assistant.busy = true;
+        self.assistant.setStatus("thinking");
+    }
+
+    /// Drain worker → UI events once per frame (the only place worker output
+    /// touches the transcript / Store).
+    fn drainAssistant(self: *Dashboard) void {
+        const w = self.assistant.worker orelse return;
+        var batch: std.ArrayList(ai.worker.WorkerToUi) = .empty;
+        defer batch.deinit(self.allocator);
+        w.drain(&batch);
+        for (batch.items) |ev| {
+            switch (ev) {
+                .status => |s| {
+                    self.assistant.setStatus(s);
+                    self.allocator.free(s);
+                },
+                .assistant_text => |txt| {
+                    self.appendChat(.assistant, txt, "", false);
+                    self.allocator.free(txt);
+                },
+                .tool_call => |tc| {
+                    self.appendChat(.tool_call, tc.input_preview, tc.name, false);
+                    self.allocator.free(tc.name);
+                    self.allocator.free(tc.input_preview);
+                },
+                .tool_done => |td| {
+                    self.appendChat(.tool_result, td.result_preview, td.name, td.is_error);
+                    self.allocator.free(td.name);
+                    self.allocator.free(td.result_preview);
+                },
+                .tool_query => |q| {
+                    // Execute the native tool against the Store, reply.
+                    if (ai.tools.execute(self.allocator, &self.store, q.name, q.input_json)) |res| {
+                        w.replyToolQuery(q.id, res, false);
+                        self.allocator.free(res);
+                    } else |err| {
+                        w.replyToolQuery(q.id, @errorName(err), true);
+                    }
+                    self.allocator.free(q.name);
+                    self.allocator.free(q.input_json);
+                },
+                .turn_done => |t| {
+                    self.assistant.last_in_tokens = t.input_tokens;
+                    self.assistant.last_out_tokens = t.output_tokens;
+                },
+                .mcp_state => |ms| self.assistant.mcp_state = ms,
+                .err => |m| {
+                    self.appendChat(.err, m, "error", true);
+                    ui.events.post(.warn, "ai", "{s}", .{m});
+                    self.allocator.free(m);
+                    self.assistant.busy = false;
+                },
+                .idle => self.assistant.busy = false,
+            }
+        }
     }
 
     pub fn setStateDir(self: *Dashboard, dir: []const u8) void {
@@ -649,15 +819,17 @@ pub const Dashboard = struct {
                 nth += 1;
             }
         }
-        // Float SET + HELP once, late in the OPS hold, so they get coverage.
+        // Float SET + HELP + AI once, late in the OPS hold, for coverage.
         if (ws == .ops and hold_pos == VALIDATE_HOLD - 14) {
             self.panel_force_open[PANEL_SET] = true;
             self.panel_force_open[PANEL_HELP] = true;
-            self.panel_focus_request = PANEL_HELP;
+            self.panel_force_open[PANEL_AI] = true;
+            self.panel_focus_request = PANEL_AI;
         }
         if (ws == .ops and hold_pos == VALIDATE_HOLD - 2) {
             self.panel_force_open[PANEL_SET] = false;
             self.panel_force_open[PANEL_HELP] = false;
+            self.panel_force_open[PANEL_AI] = false;
         }
         self.validate_cycle -= 1;
     }
@@ -692,6 +864,7 @@ pub const Dashboard = struct {
         // Suppressed when a real provider owns the Store.
         if (self.mock_ticking) self.gen.tick(&self.store, unixNowMs());
         self.tickJobs();
+        self.drainAssistant();
 
         self.tickValidateHarness();
         self.handleGlobalKeys();
@@ -759,6 +932,9 @@ pub const Dashboard = struct {
 
         // Ctrl+, opens SET.
         if (ctrl and !shift and zgui.isKeyPressed(.comma, false)) self.focusPanel(PANEL_SET);
+
+        // Ctrl+Shift+A opens the AI assistant.
+        if (ctrl and shift and zgui.isKeyPressed(.a, false)) self.focusPanel(PANEL_AI);
 
         // Ctrl+K (always) or `/` (outside text inputs) focuses the command
         // line. `/` also routes to the focused panel's filter box when that
@@ -1701,6 +1877,10 @@ pub const Dashboard = struct {
         if (!self.applyUiStateData("{\"schema_version\":1,\"workspace\":\"hunt\",\"seed\":42}"))
             return error.UiStateRoundTrip;
         ui.layout.switchTo(.triage);
+
+        // AI subsystem offline self-check (pure encode/decode + native tools;
+        // no network, no threads).
+        try ai.selfTest(self.allocator, &self.store);
 
         std.log.info("selftest: world {d} events / {d} alerts / {d} rules — data paths OK", .{
             s.events.items.len, s.alerts.items.len, s.rules.items.len,

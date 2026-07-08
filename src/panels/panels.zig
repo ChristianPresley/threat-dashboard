@@ -27,6 +27,7 @@ pub fn render(d: *Dashboard, idx: usize) void {
         dash.PANEL_HELP => @import("help.zig").render(d),
         dash.PANEL_YAR => @import("yar.zig").render(d),
         dash.PANEL_ENR => @import("enr.zig").render(d),
+        dash.PANEL_AI => @import("ai.zig").render(d),
         else => {},
     }
 }

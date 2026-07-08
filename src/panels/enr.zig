@@ -35,6 +35,10 @@ pub fn render(d: *Dashboard) void {
     const s = &d.store;
 
     // ── Header: selected IOC (defanged) + breadcrumb back ────────────────
+    // Default to the first enriched indicator so the panel is useful on open.
+    if (d.enr_sel == null and s.enrichments.items.len > 0) {
+        d.enr_sel = s.enrichments.items[0].ioc_id;
+    }
     const sel = d.enr_sel orelse {
         zgui.textColored(t.text.lo, "No IOC selected.", .{});
         zgui.spacing();
