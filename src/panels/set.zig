@@ -47,8 +47,26 @@ pub fn render(d: *Dashboard) void {
         }
     }
 
+    if (zgui.collapsingHeader("AI assistant", .{ .default_open = true })) {
+        // Read-only status — secrets come from the environment and are
+        // never shown or persisted.
+        const cfg = &d.assistant.cfg;
+        if (cfg.configured()) {
+            zgui.textColored(t.sev.ok, "ANTHROPIC_API_KEY: set", .{});
+            zgui.textColored(t.text.mid, "model: {s}", .{cfg.model});
+            zgui.textColored(t.text.mid, "threat-intel MCP: {s} ({s})", .{
+                cfg.mcp_cmd orelse "threatintel-mcp --transport stdio",
+                @tagName(d.assistant.mcp_state),
+            });
+            zgui.textColored(t.text.lo, "open with Ctrl+Shift+A \u{00B7} tools are read-only \u{00B7} intel output stays defanged", .{});
+        } else {
+            zgui.textColored(t.text.lo, "ANTHROPIC_API_KEY: missing \u{2014} set it and restart to enable the AI panel", .{});
+            zgui.textColored(t.text.lo, "optional: TD_AI_MODEL \u{00B7} TD_MCP_CMD \u{00B7} VT_API_KEY \u{00B7} URLSCAN_API_KEY", .{});
+        }
+    }
+
     if (zgui.collapsingHeader("About", .{})) {
         zgui.textColored(t.text.mid, "threat-dashboard \u{00B7} Zig + Vulkan + ImGui docking", .{});
-        zgui.textColored(t.text.lo, "F1\u{2026}F5 workspaces \u{00B7} Ctrl+K command line \u{00B7} ? directory", .{});
+        zgui.textColored(t.text.lo, "F1\u{2026}F5 workspaces \u{00B7} Ctrl+K command line \u{00B7} ? directory \u{00B7} Ctrl+Shift+A assistant", .{});
     }
 }

@@ -117,3 +117,65 @@ create table if not exists cases (
   alert_ids text not null, -- csv of alert ids
   notes text not null
 );
+
+create table if not exists yara_rules (
+  id smallint primary key,
+  code text not null,
+  name text not null,
+  status smallint not null,
+  severity smallint not null,
+  technique smallint not null,
+  author text not null,
+  date_ms bigint not null,
+  description text not null,
+  reference text not null,
+  version smallint not null,
+  strings_excerpt text not null,
+  condition text not null,
+  gate_compile smallint not null,
+  gate_meta smallint not null,
+  gate_tp smallint not null,
+  fp_count int not null,
+  scan_ms real not null,
+  budget_ms real not null,
+  last_ci_ms bigint not null
+);
+
+create table if not exists ioc_enrichment (
+  ioc_id int primary key,
+  status smallint not null,
+  source smallint not null,
+  fetched_ms bigint not null,
+  err text not null,
+  verdict smallint not null,
+  det_malicious int not null,
+  det_suspicious int not null,
+  det_harmless int not null,
+  det_undetected int not null,
+  reputation int not null,
+  threat_label text not null,
+  first_seen_ms bigint not null,
+  last_seen_ms bigint not null,
+  registrar text not null,
+  creation_ms bigint not null,
+  categories text not null,
+  asn bigint not null,
+  as_owner text not null,
+  country text not null,
+  network text not null,
+  scan_score smallint not null,
+  brands text not null,
+  page_domain text not null,
+  page_ip text not null,
+  tls_issuer text not null,
+  pivot_ids text not null -- csv of ioc ids
+);
+
+create table if not exists urlscan_scans (
+  id int primary key,
+  ioc_id int not null,
+  state smallint not null,
+  submitted_ms bigint not null,
+  completed_ms bigint not null,
+  err text not null
+);

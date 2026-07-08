@@ -56,6 +56,22 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // -- Network wrapper (HTTPS over std.http.Client) --
+    const net_mod = b.createModule(.{
+        .root_source_file = b.path("src/net/http.zig"),
+    });
+
+    // -- AI assistant subsystem (Anthropic Messages API + MCP client +
+    // native tool executor + worker thread; off the render thread) --
+    const ai_mod = b.createModule(.{
+        .root_source_file = b.path("src/ai/ai.zig"),
+        .imports = &.{
+            .{ .name = "net", .module = net_mod },
+            .{ .name = "domain", .module = domain_mod },
+            .{ .name = "data", .module = data_mod },
+        },
+    });
+
     // -- Dashboard orchestrator (panel registry, workspaces, dock presets,
     // hotkeys, per-panel renderers) --
     const dashboard_mod = b.createModule(.{
@@ -65,6 +81,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ui", .module = ui_mod },
             .{ .name = "domain", .module = domain_mod },
             .{ .name = "data", .module = data_mod },
+            .{ .name = "ai", .module = ai_mod },
         },
     });
 
@@ -83,6 +100,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "dashboard", .module = dashboard_mod },
                 .{ .name = "domain", .module = domain_mod },
                 .{ .name = "data", .module = data_mod },
+                .{ .name = "ai", .module = ai_mod },
             },
         }),
     });
@@ -174,8 +192,23 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const test_ai = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ai/ai.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "net", .module = net_mod },
+                .{ .name = "domain", .module = domain_mod },
+                .{ .name = "data", .module = data_mod },
+            },
+        }),
+    });
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(test_ui).step);
     test_step.dependOn(&b.addRunArtifact(test_domain).step);
     test_step.dependOn(&b.addRunArtifact(test_data).step);
+    test_step.dependOn(&b.addRunArtifact(test_ai).step);
 }

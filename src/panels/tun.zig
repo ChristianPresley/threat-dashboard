@@ -23,10 +23,12 @@ pub fn render(d: *Dashboard) void {
         }
     }.less);
 
-    // What-if: suppress rules whose FP rate exceeds the threshold.
-    zgui.textColored(t.text.mid, "what-if: suppress rules with FP rate above", .{});
+    // What-if: suppress rules whose FP rate exceeds the threshold. The
+    // label + slider sit on one line; the impact reads on the next so the
+    // whole control fits the narrow tuning rail without clipping.
+    zgui.textColored(t.text.mid, "what-if \u{00B7} mute FP rate >", .{});
     zgui.sameLine(.{ .spacing = 8 });
-    zgui.setNextItemWidth(160);
+    zgui.setNextItemWidth(-1);
     _ = zgui.sliderFloat("##tun_thresh", .{ .v = &d.tun_threshold, .min = 0.05, .max = 0.95 });
     {
         var cut_fires: u64 = 0;
@@ -38,8 +40,7 @@ pub fn render(d: *Dashboard) void {
                 cut_rules += 1;
             }
         }
-        zgui.sameLine(.{ .spacing = 12 });
-        zgui.textColored(t.text.mid, "\u{2192} {d} rules muted, alert volume \u{2212}{d} / week", .{ cut_rules, cut_fires });
+        zgui.textColored(t.text.mid, "\u{2192} {d} rules muted \u{00B7} \u{2212}{d} alerts / week", .{ cut_rules, cut_fires });
     }
     zgui.separator();
 
@@ -47,11 +48,13 @@ pub fn render(d: *Dashboard) void {
     n = @min(n, 20);
     const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };
     if (zgui.beginTable("##tun_table", .{ .column = 5, .flags = flags })) {
-        zgui.tableSetupColumn("Code", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 62 });
+        // Value lives INSIDE each bar (overlay) so the bar columns stay
+        // compact and the rule Name keeps real width in the narrow rail.
+        zgui.tableSetupColumn("Code", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 60 });
         zgui.tableSetupColumn("Name", .{ .flags = .{ .width_stretch = true } });
-        zgui.tableSetupColumn("Fires", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 140 });
-        zgui.tableSetupColumn("FP rate", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 140 });
-        zgui.tableSetupColumn("Verdict", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 90 });
+        zgui.tableSetupColumn("Fires", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 74 });
+        zgui.tableSetupColumn("FP rate", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 74 });
+        zgui.tableSetupColumn("Verdict", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 78 });
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
@@ -73,18 +76,18 @@ pub fn render(d: *Dashboard) void {
             _ = zgui.tableNextColumn();
             zgui.textUnformattedColored(t.text.hi, r.name.slice());
             _ = zgui.tableNextColumn();
+            var fbuf: [12]u8 = undefined;
+            const fires_lbl = std.fmt.bufPrintZ(&fbuf, "{d}", .{r.fires_7d}) catch "";
             zgui.pushStyleColor4f(.{ .idx = .plot_histogram, .c = t.accent });
-            zgui.progressBar(.{ .fraction = @as(f32, @floatFromInt(r.fires_7d)) / max_fires, .w = 130, .h = 12, .overlay = "" });
+            zgui.progressBar(.{ .fraction = @as(f32, @floatFromInt(r.fires_7d)) / max_fires, .w = -1, .h = 14, .overlay = fires_lbl });
             zgui.popStyleColor(.{ .count = 1 });
-            zgui.sameLine(.{ .spacing = 4 });
-            zgui.textColored(t.text.mid, "{d}", .{r.fires_7d});
             _ = zgui.tableNextColumn();
             const fp = r.fpRate();
+            var pbuf: [12]u8 = undefined;
+            const fp_lbl = std.fmt.bufPrintZ(&pbuf, "{d:.0}%", .{fp * 100}) catch "";
             zgui.pushStyleColor4f(.{ .idx = .plot_histogram, .c = if (fp > d.tun_threshold) t.sev.warn else t.sev.ok });
-            zgui.progressBar(.{ .fraction = fp, .w = 130, .h = 12, .overlay = "" });
+            zgui.progressBar(.{ .fraction = fp, .w = -1, .h = 14, .overlay = fp_lbl });
             zgui.popStyleColor(.{ .count = 1 });
-            zgui.sameLine(.{ .spacing = 4 });
-            zgui.textColored(t.text.mid, "{d:.0}%", .{fp * 100});
             _ = zgui.tableNextColumn();
             if (fp > d.tun_threshold) {
                 zgui.textColored(t.sev.warn, "would mute", .{});

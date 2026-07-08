@@ -17,6 +17,12 @@ pub const Mutation = union(enum) {
     rule_status: struct { id: u16, status: domain.RuleStatus },
     case_status: struct { id: u16, status: domain.CaseStatus, now_ms: i64 },
     case_assign: struct { alert_id: u32, case_id: u16, now_ms: i64 },
+    yara_status: struct { id: u16, status: domain.YaraStatus },
+    yara_ci: struct { id: u16, gates: domain.YaraGates },
+    /// Carries the full row so the PG hook can upsert in one statement.
+    enrichment_upsert: struct { e: domain.IocEnrichment },
+    urlscan_submit: struct { id: u32, ioc_id: u32, now_ms: i64 },
+    urlscan_update: struct { id: u32, state: domain.ScanState, now_ms: i64 },
 };
 
 pub const WriteHook = struct {
@@ -37,6 +43,9 @@ pub const Store = struct {
     events: std.ArrayList(domain.Event) = .empty,
     alerts: std.ArrayList(domain.Alert) = .empty,
     cases: std.ArrayList(domain.Case) = .empty,
+    yara: std.ArrayList(domain.YaraRule) = .empty,
+    enrichments: std.ArrayList(domain.IocEnrichment) = .empty,
+    urlscans: std.ArrayList(domain.UrlScanSubmission) = .empty,
 
     /// Bumped on every mutation — panels use it to invalidate cached
     /// filter/sort scratch state.
@@ -60,6 +69,9 @@ pub const Store = struct {
         self.events.deinit(self.allocator);
         self.alerts.deinit(self.allocator);
         self.cases.deinit(self.allocator);
+        self.yara.deinit(self.allocator);
+        self.enrichments.deinit(self.allocator);
+        self.urlscans.deinit(self.allocator);
     }
 
     pub fn clear(self: *Store) void {
@@ -73,6 +85,9 @@ pub const Store = struct {
         self.events.clearRetainingCapacity();
         self.alerts.clearRetainingCapacity();
         self.cases.clearRetainingCapacity();
+        self.yara.clearRetainingCapacity();
+        self.enrichments.clearRetainingCapacity();
+        self.urlscans.clearRetainingCapacity();
         self.generation +%= 1;
     }
 
@@ -130,6 +145,43 @@ pub const Store = struct {
         return null;
     }
 
+    pub fn yaraById(self: *Store, id: u16) ?*domain.YaraRule {
+        for (self.yara.items) |*y| {
+            if (y.id == id) return y;
+        }
+        return null;
+    }
+
+    pub fn iocById(self: *Store, id: u32) ?*domain.Ioc {
+        // IOCs are appended in id order — binary search.
+        const items = self.iocs.items;
+        var lo: usize = 0;
+        var hi: usize = items.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (items[mid].id == id) return &items[mid];
+            if (items[mid].id < id) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+
+    pub fn enrichmentForIoc(self: *Store, ioc_id: u32) ?*domain.IocEnrichment {
+        for (self.enrichments.items) |*e| {
+            if (e.ioc_id == ioc_id) return e;
+        }
+        return null;
+    }
+
+    pub fn urlScanForIoc(self: *Store, ioc_id: u32) ?*domain.UrlScanSubmission {
+        // Latest submission wins — scan back to front.
+        var i = self.urlscans.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.urlscans.items[i].ioc_id == ioc_id) return &self.urlscans.items[i];
+        }
+        return null;
+    }
+
     // ── Aggregates (PST / footer) ────────────────────────────────────────
 
     pub fn openAlertCountBySeverity(self: *const Store) [5]u32 {
@@ -180,6 +232,65 @@ pub const Store = struct {
         return n;
     }
 
+    /// YARA coverage for a technique: 0 = none, 1 = draft/deprecated only,
+    /// 2 = active rule exists.
+    pub fn yaraCoverageForTechnique(self: *const Store, tid: domain.attack.TechniqueId) u8 {
+        var best: u8 = 0;
+        for (self.yara.items) |*y| {
+            if (y.technique != tid) continue;
+            if (y.status == .active) return 2;
+            best = @max(best, 1);
+        }
+        return best;
+    }
+
+    /// Grade histogram indexed A=0 … F=4.
+    pub fn yaraGradeHistogram(self: *const Store) [5]u32 {
+        var out: [5]u32 = @splat(0);
+        for (self.yara.items) |*y| {
+            out[switch (y.grade()) {
+                'A' => 0,
+                'B' => 1,
+                'C' => 2,
+                'D' => 3,
+                else => 4,
+            }] += 1;
+        }
+        return out;
+    }
+
+    pub fn yaraSeverityDistribution(self: *const Store) [5]u32 {
+        var out: [5]u32 = @splat(0);
+        for (self.yara.items) |*y| {
+            out[@intFromEnum(y.severity)] += 1;
+        }
+        return out;
+    }
+
+    pub fn yaraGatePassCounts(self: *const Store) struct { pass: u32, fail: u32 } {
+        var pass: u32 = 0;
+        var fail: u32 = 0;
+        for (self.yara.items) |*y| {
+            if (y.gates.allPass()) pass += 1 else fail += 1;
+        }
+        return .{ .pass = pass, .fail = fail };
+    }
+
+    pub fn enrichedCounts(self: *const Store) struct { done: u32, pending: u32, err: u32 } {
+        var done: u32 = 0;
+        var pending: u32 = 0;
+        var err: u32 = 0;
+        for (self.enrichments.items) |*e| {
+            switch (e.status) {
+                .done => done += 1,
+                .pending => pending += 1,
+                .err => err += 1,
+                .none => {},
+            }
+        }
+        return .{ .done = done, .pending = pending, .err = err };
+    }
+
     // ── Mutations (panel actions) ────────────────────────────────────────
 
     pub fn setAlertStatus(self: *Store, id: u32, status: domain.AlertStatus) bool {
@@ -225,6 +336,65 @@ pub const Store = struct {
         self.notify(.{ .case_status = .{ .id = id, .status = status, .now_ms = now_ms } });
         return true;
     }
+
+    pub fn setYaraStatus(self: *Store, id: u16, status: domain.YaraStatus) bool {
+        const y = self.yaraById(id) orelse return false;
+        y.status = status;
+        self.touch();
+        self.notify(.{ .yara_status = .{ .id = id, .status = status } });
+        return true;
+    }
+
+    /// Record a CI run's gate results for one rule.
+    pub fn recordYaraCi(self: *Store, id: u16, gates: domain.YaraGates) bool {
+        const y = self.yaraById(id) orelse return false;
+        y.gates = gates;
+        self.touch();
+        self.notify(.{ .yara_ci = .{ .id = id, .gates = gates } });
+        return true;
+    }
+
+    /// Insert or replace the enrichment row for `e.ioc_id`. This is the
+    /// entry point any async source (mock job today, live MCP later) uses.
+    pub fn upsertEnrichment(self: *Store, e: domain.IocEnrichment) bool {
+        if (self.enrichmentForIoc(e.ioc_id)) |existing| {
+            existing.* = e;
+        } else {
+            self.enrichments.append(self.allocator, e) catch return false;
+        }
+        self.touch();
+        self.notify(.{ .enrichment_upsert = .{ .e = e } });
+        return true;
+    }
+
+    /// Create a url-scan submission for a url-type IOC; returns its id.
+    pub fn submitUrlScan(self: *Store, ioc_id: u32, now_ms: i64) ?u32 {
+        var next: u32 = 1;
+        for (self.urlscans.items) |*u| {
+            if (u.id >= next) next = u.id + 1;
+        }
+        self.urlscans.append(self.allocator, .{
+            .id = next,
+            .ioc_id = ioc_id,
+            .state = .pending,
+            .submitted_ms = now_ms,
+        }) catch return null;
+        self.touch();
+        self.notify(.{ .urlscan_submit = .{ .id = next, .ioc_id = ioc_id, .now_ms = now_ms } });
+        return next;
+    }
+
+    pub fn setUrlScanState(self: *Store, id: u32, state: domain.ScanState, now_ms: i64) bool {
+        for (self.urlscans.items) |*u| {
+            if (u.id != id) continue;
+            u.state = state;
+            if (state == .done or state == .err) u.completed_ms = now_ms;
+            self.touch();
+            self.notify(.{ .urlscan_update = .{ .id = id, .state = state, .now_ms = now_ms } });
+            return true;
+        }
+        return false;
+    }
 };
 
 test "store mutations + aggregates" {
@@ -245,6 +415,30 @@ test "store mutations + aggregates" {
     try std.testing.expect(s.assignAlertToCase(1, 3, 42));
     try std.testing.expectEqual(@as(u8, 1), s.cases.items[0].alert_count);
     try std.testing.expectEqual(domain.AlertStatus.investigating, s.alerts.items[0].status);
+}
+
+test "yara + enrichment + urlscan round-trips" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+
+    try s.yara.append(s.allocator, .{ .id = 1, .technique = 0, .status = .draft });
+    try std.testing.expectEqual(@as(u8, 1), s.yaraCoverageForTechnique(0));
+    try std.testing.expect(s.setYaraStatus(1, .active));
+    try std.testing.expectEqual(@as(u8, 2), s.yaraCoverageForTechnique(0));
+    try std.testing.expect(s.recordYaraCi(1, .{ .tp = .fail, .scan_ms = 12 }));
+    try std.testing.expectEqual(domain.GateResult.fail, s.yara.items[0].gates.tp);
+    try std.testing.expectEqual(@as(u32, 1), s.yaraGatePassCounts().fail);
+
+    try s.iocs.append(s.allocator, .{ .id = 9, .type = .url });
+    try std.testing.expect(s.upsertEnrichment(.{ .ioc_id = 9, .status = .pending }));
+    try std.testing.expectEqual(@as(u32, 1), s.enrichedCounts().pending);
+    try std.testing.expect(s.upsertEnrichment(.{ .ioc_id = 9, .status = .done, .verdict = .malicious }));
+    try std.testing.expectEqual(@as(usize, 1), s.enrichments.items.len); // replaced, not appended
+    try std.testing.expectEqual(domain.Verdict.malicious, s.enrichmentForIoc(9).?.verdict);
+
+    const scan_id = s.submitUrlScan(9, 100).?;
+    try std.testing.expect(s.setUrlScanState(scan_id, .done, 200));
+    try std.testing.expectEqual(@as(i64, 200), s.urlScanForIoc(9).?.completed_ms);
 }
 
 test {
