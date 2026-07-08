@@ -148,6 +148,173 @@ const yara_defs = [_]struct {
     .{ .name = "Ransomware_Note_Template", .tid = "T1486", .sev = .critical, .description = "Ransom-note skeleton: encryption claim + payment channel + deadline threat", .reference = "https://attack.mitre.org/techniques/T1486/", .strings_excerpt = "$enc = /files (have been|are) encrypted/ nocase\n$tor = /[a-z2-7]{56}\\.onion/\n$btc = /\\b(bitcoin|monero|btc|xmr)\\b/ nocase", .condition = "$enc and ($tor or $btc)", .scan_ms = 44.0 },
 };
 
+/// Ingest source blueprints (PIP panel): the databases/buckets/topics an
+/// analyst can point a pipeline at. One degraded + one unreachable story.
+const source_defs = [_]struct {
+    name: []const u8,
+    kind: domain.SourceKind,
+    dsn: []const u8,
+    tables: u16,
+    state: domain.ConnState = .ok,
+    latency_ms: f32,
+}{
+    .{ .name = "SOC PostgreSQL", .kind = .postgres, .dsn = "postgres://soc@db01:5432/threats", .tables = 14, .latency_ms = 2.4 },
+    .{ .name = "EDR telemetry lake", .kind = .s3_bucket, .dsn = "s3://edr-telemetry/raw/", .tables = 96, .latency_ms = 88 },
+    .{ .name = "Events bus", .kind = .kafka, .dsn = "kafka://broker01:9092", .tables = 12, .latency_ms = 6 },
+    .{ .name = "Perimeter syslog", .kind = .syslog, .dsn = "udp://fw-perimeter-01:514", .tables = 4, .state = .degraded, .latency_ms = 130 },
+    .{ .name = "MISP intel API", .kind = .rest_api, .dsn = "https://misp.internal/attributes", .tables = 22, .latency_ms = 210 },
+    .{ .name = "Legacy case archive", .kind = .mssql, .dsn = "mssql://arch01:1433/soc_archive", .tables = 31, .state = .err, .latency_ms = 0 },
+    .{ .name = "HR asset export", .kind = .csv_file, .dsn = "\\\\fs01\\exports\\assets.csv", .tables = 1, .latency_ms = 15 },
+};
+
+const PipeStepDef = struct {
+    kind: domain.StepKind,
+    model: []const u8,
+    mat: domain.Materialization = .view,
+};
+
+const PipeTestDef = struct {
+    kind: domain.DbtTestKind,
+    target: []const u8,
+    fail: u32 = 0, // failing rows; > 0 flips the test to FAIL
+};
+
+/// Pipeline blueprints (dbt-style ELT). Scripted stories: one
+/// accepted_values failure feeding a PARTIAL run, one unreachable source
+/// with stale freshness + failed runs, one paused mart, one manual draft.
+const pipeline_defs = [_]struct {
+    name: []const u8,
+    source: u16, // index into source_defs
+    sink: domain.SinkKind,
+    target: []const u8,
+    schedule_min: u16,
+    status: domain.PipelineStatus = .active,
+    owner: []const u8,
+    steps: []const PipeStepDef,
+    tests: []const PipeTestDef,
+    /// Run-history depth; scale of rows per run.
+    runs: u8 = 6,
+    base_rows: u64 = 10_000,
+    /// Story flags: newest run PARTIAL (test failures) / every run FAILED.
+    partial_last: bool = false,
+    runs_fail: bool = false,
+}{
+    .{
+        .name = "edr_events_ingest",
+        .source = 2,
+        .sink = .postgres,
+        .target = "soc.events",
+        .schedule_min = 5,
+        .owner = "cpresley",
+        .steps = &.{
+            .{ .kind = .staging, .model = "stg_edr_events" },
+            .{ .kind = .dedup, .model = "int_events_deduped", .mat = .incremental },
+        },
+        .tests = &.{
+            .{ .kind = .not_null, .target = "stg_edr_events.host" },
+            .{ .kind = .unique, .target = "int_events_deduped.event_id" },
+            .{ .kind = .freshness, .target = "stg_edr_events" },
+        },
+        .runs = 8,
+        .base_rows = 120_000,
+    },
+    .{
+        .name = "ioc_feed_merge",
+        .source = 4,
+        .sink = .postgres,
+        .target = "soc.iocs",
+        .schedule_min = 30,
+        .owner = "nblake",
+        .steps = &.{
+            .{ .kind = .staging, .model = "stg_misp_iocs" },
+            .{ .kind = .dedup, .model = "int_iocs_deduped", .mat = .table },
+            .{ .kind = .enrich, .model = "int_iocs_scored", .mat = .incremental },
+        },
+        .tests = &.{
+            .{ .kind = .not_null, .target = "stg_misp_iocs.value" },
+            .{ .kind = .accepted_values, .target = "stg_misp_iocs.type", .fail = 12 },
+            .{ .kind = .relationships, .target = "int_iocs_scored.feed_id" },
+        },
+        .base_rows = 8_000,
+        .partial_last = true,
+    },
+    .{
+        .name = "sensor_uptime_rollup",
+        .source = 0,
+        .sink = .clickhouse,
+        .target = "metrics.sensor_uptime_daily",
+        .schedule_min = 60,
+        .owner = "rvance",
+        .steps = &.{
+            .{ .kind = .staging, .model = "stg_sensor_health" },
+            .{ .kind = .aggregate, .model = "mart_sensor_uptime_daily", .mat = .table },
+        },
+        .tests = &.{
+            .{ .kind = .not_null, .target = "mart_sensor_uptime_daily.sensor_id" },
+            .{ .kind = .freshness, .target = "stg_sensor_health" },
+        },
+        .base_rows = 900,
+    },
+    .{
+        .name = "case_archive_sync",
+        .source = 5,
+        .sink = .s3_parquet,
+        .target = "s3://soc-archive/cases/",
+        .schedule_min = 360,
+        .status = .err,
+        .owner = "cpresley",
+        .steps = &.{
+            .{ .kind = .staging, .model = "stg_archive_cases" },
+            .{ .kind = .mask, .model = "int_cases_masked", .mat = .table },
+        },
+        .tests = &.{
+            .{ .kind = .freshness, .target = "stg_archive_cases", .fail = 1 },
+            .{ .kind = .not_null, .target = "int_cases_masked.case_id" },
+        },
+        .runs = 3,
+        .base_rows = 2_400,
+        .runs_fail = true,
+    },
+    .{
+        .name = "alert_metrics_mart",
+        .source = 0,
+        .sink = .elasticsearch,
+        .target = "soc-alert-metrics",
+        .schedule_min = 120,
+        .status = .paused,
+        .owner = "nblake",
+        .steps = &.{
+            .{ .kind = .staging, .model = "stg_alerts" },
+            .{ .kind = .mask, .model = "int_alerts_masked" },
+            .{ .kind = .aggregate, .model = "mart_alert_daily", .mat = .incremental },
+        },
+        .tests = &.{
+            .{ .kind = .not_null, .target = "mart_alert_daily.day" },
+            .{ .kind = .unique, .target = "mart_alert_daily.day_rule" },
+        },
+        .runs = 4,
+        .base_rows = 5_200,
+    },
+    .{
+        .name = "phish_url_export",
+        .source = 0,
+        .sink = .kafka_topic,
+        .target = "phish-urls",
+        .schedule_min = 0, // manual
+        .status = .draft,
+        .owner = "rvance",
+        .steps = &.{
+            .{ .kind = .staging, .model = "stg_iocs" },
+            .{ .kind = .filter, .model = "int_urls_flagged" },
+        },
+        .tests = &.{
+            .{ .kind = .not_null, .target = "int_urls_flagged.url" },
+        },
+        .runs = 0,
+        .base_rows = 300,
+    },
+};
+
 /// One stage of a scripted incident chain.
 const ChainStage = struct {
     kind: domain.EventKind,
@@ -460,6 +627,9 @@ pub const Generator = struct {
         try self.buildEnrichment(store);
         try self.buildUrlScans(store);
 
+        // Data pipelines (also appended last — RNG stream untouched above).
+        try self.buildPipelines(store);
+
         store.touch();
     }
 
@@ -667,7 +837,13 @@ pub const Generator = struct {
             // Most FP noise is already triaged — realistic queue shape.
             const roll = r.intRangeAtMost(u8, 0, 9);
             a.status = if (roll < 5) .false_positive else if (roll < 7) .resolved else .new;
-            if (a.status != .new) a.assignee = domain.FixedStr(24).from(analyst_pool[r.intRangeAtMost(usize, 0, 2)]);
+            if (a.status != .new) {
+                a.assignee = domain.FixedStr(24).from(analyst_pool[r.intRangeAtMost(usize, 0, 2)]);
+                // SLA stamps: id-derived (no RNG draws) so MTTA/MTTR have
+                // a believable spread — ack in 3–27 min, close in +15–194.
+                a.acked_ms = a.ts_ms + @as(i64, @intCast(a.id % 25 + 3)) * std.time.ms_per_min;
+                a.resolved_ms = a.acked_ms + @as(i64, @intCast(a.id % 180 + 15)) * std.time.ms_per_min;
+            }
             try store.alerts.append(alloc, a);
         }
 
@@ -707,7 +883,10 @@ pub const Generator = struct {
                     if (a.technique.? != tid) continue;
                     if (c.alert_count >= domain.CASE_ALERT_CAP) break;
                     a.case_id = c.id;
-                    if (a.status == .new) a.status = .investigating;
+                    if (a.status == .new) {
+                        a.status = .investigating;
+                        a.acked_ms = a.ts_ms + @as(i64, @intCast(a.id % 20 + 2)) * std.time.ms_per_min;
+                    }
                     if (a.assignee.len == 0) a.assignee = c.assignee;
                     c.alert_ids[c.alert_count] = a.id;
                     c.alert_count += 1;
@@ -956,6 +1135,152 @@ pub const Generator = struct {
         }
     }
 
+    fn buildPipelines(self: *Generator, store: *Store) !void {
+        const alloc = store.allocator;
+
+        for (source_defs, 0..) |sd, i| {
+            const r = self.rand();
+            try store.sources.append(alloc, .{
+                .id = @intCast(i + 1),
+                .name = domain.FixedStr(48).from(sd.name),
+                .kind = sd.kind,
+                .dsn = domain.FixedStr(96).from(sd.dsn),
+                .state = sd.state,
+                .last_test_ms = if (sd.state == .err)
+                    self.base_ms - 27 * std.time.ms_per_hour
+                else
+                    self.base_ms - @as(i64, r.intRangeAtMost(u32, 1, 55)) * std.time.ms_per_min,
+                .latency_ms = sd.latency_ms,
+                .tables = sd.tables,
+            });
+        }
+
+        var next_run_id: u32 = 1;
+        for (pipeline_defs, 0..) |pd, i| {
+            var p: domain.Pipeline = .{
+                .id = @intCast(i + 1),
+                .code = domain.FixedStr(8).fromFmt("P-{d:0>4}", .{i + 1}),
+                .name = domain.FixedStr(64).from(pd.name),
+                .source = pd.source + 1, // defs index → DataSource.id
+                .sink = pd.sink,
+                .target = domain.FixedStr(64).from(pd.target),
+                .schedule_min = pd.schedule_min,
+                .status = pd.status,
+                .owner = domain.FixedStr(24).from(pd.owner),
+            };
+            for (pd.steps) |st| {
+                p.steps[p.step_count] = .{
+                    .kind = st.kind,
+                    .model = domain.FixedStr(48).from(st.model),
+                    .materialization = st.mat,
+                };
+                p.step_count += 1;
+            }
+            for (pd.tests) |ts| {
+                p.tests[p.test_count] = .{
+                    .kind = ts.kind,
+                    .target = domain.FixedStr(48).from(ts.target),
+                    .status = if (ts.fail > 0) .fail else .pass,
+                    .failures = ts.fail,
+                };
+                p.test_count += 1;
+            }
+
+            // Run history: `runs` completions spaced one schedule apart,
+            // newest just inside the window.
+            const tc = p.testCounts();
+            const gap_ms: i64 = @max(@as(i64, pd.schedule_min), 5) * std.time.ms_per_min;
+            var k: u8 = 0;
+            while (k < pd.runs) : (k += 1) {
+                const r = self.rand();
+                const age: i64 = @as(i64, pd.runs - k) * gap_ms;
+                const started = self.base_ms - age - @as(i64, r.intRangeAtMost(u32, 0, 60_000));
+                const newest = k == pd.runs - 1;
+                var run: domain.PipelineRun = .{
+                    .id = next_run_id,
+                    .pipeline = p.id,
+                    .started_ms = started,
+                    .duration_ms = @as(i64, r.intRangeAtMost(u32, 2_000, 40_000)),
+                    .status = .success,
+                    .tests_passed = tc.pass,
+                    .tests_failed = tc.fail,
+                };
+                next_run_id += 1;
+                if (pd.runs_fail) {
+                    run.status = .failed;
+                    run.err = domain.FixedStr(64).fromFmt("connect timeout: {s}", .{source_defs[pd.source].dsn});
+                } else {
+                    const jitter = r.intRangeAtMost(u64, 0, pd.base_rows / 5);
+                    run.rows_in = pd.base_rows + jitter;
+                    run.rows_out = run.rows_in;
+                    run.watermark_ms = started;
+                    p.watermark_ms = @max(p.watermark_ms, started);
+                    if (newest and pd.partial_last) {
+                        run.status = .partial;
+                        run.rows_rejected = p.testFailures();
+                        run.rows_out = run.rows_in - run.rows_rejected;
+                        // Rejected-row samples land in the dead-letter queue.
+                        for (p.tests[0..p.test_count]) |*ts| {
+                            if (ts.status != .fail or ts.kind == .freshness) continue;
+                            var dk: u32 = 0;
+                            while (dk < @min(ts.failures, 4)) : (dk += 1) {
+                                try store.dead_letters.append(alloc, .{
+                                    .id = @intCast(store.dead_letters.items.len + 1),
+                                    .pipeline = p.id,
+                                    .run_id = run.id,
+                                    .ts_ms = started,
+                                    .kind = ts.kind,
+                                    .target = ts.target,
+                                    .sample = domain.FixedStr(96).fromFmt("attr #{d}: type=ipv6 not in accepted set", .{48200 + dk}),
+                                });
+                            }
+                        }
+                    }
+                }
+                p.last_run_ms = @max(p.last_run_ms, started);
+                try store.pipeline_runs.append(alloc, run);
+            }
+            try store.pipelines.append(alloc, p);
+        }
+    }
+
+    /// Finalize a runtime "Run now" execution as a *pure function* of the
+    /// pipeline (FNV of its name seeds a local PRNG — same trick as
+    /// enrichmentFor, so a manual run never perturbs world determinism).
+    /// Failing tests make the run PARTIAL; an unreachable source fails it.
+    pub fn pipelineRunResult(store: *Store, run: domain.PipelineRun, now_ms: i64) domain.PipelineRun {
+        var out = run;
+        out.duration_ms = @max(1000, now_ms - run.started_ms);
+        const p = store.pipelineById(run.pipeline) orelse {
+            out.status = .failed;
+            out.err = domain.FixedStr(64).from("pipeline vanished");
+            return out;
+        };
+        if (store.sourceById(p.source)) |src| {
+            if (src.state == .err) {
+                out.status = .failed;
+                out.err = domain.FixedStr(64).fromFmt("connect timeout: {s}", .{src.dsn.slice()});
+                return out;
+            }
+        }
+        const hash = std.hash.Fnv1a_64.hash(p.name.slice());
+        var local = std.Random.DefaultPrng.init(hash);
+        const r = local.random();
+        const base: u64 = 500 + hash % 100_000;
+        out.rows_in = base + r.intRangeAtMost(u64, 0, base / 5);
+        out.rows_rejected = p.testFailures();
+        out.rows_out = out.rows_in -| out.rows_rejected;
+        const tc = p.testCounts();
+        out.tests_passed = tc.pass;
+        out.tests_failed = tc.fail;
+        out.status = if (tc.fail > 0) .partial else .success;
+        // Data ingested through "now" — the caller's watermark bump.
+        // (Time-dependent like enrichmentFor's fetched_ms; the row shape
+        // itself stays a pure function of the pipeline.)
+        out.watermark_ms = now_ms;
+        return out;
+    }
+
     /// Live trickle: expected ~0.35 events/s (diurnal-weighted), the odd
     /// alert, sensor eps jitter. Call once per frame with wall-clock ms.
     pub fn tick(self: *Generator, store: *Store, now_ms: i64) void {
@@ -1057,6 +1382,28 @@ pub const Generator = struct {
             step.mix(&h, std.mem.asBytes(&u.id));
             step.mix(&h, &.{@intFromEnum(u.state)});
         }
+        for (store.sources.items) |*src| {
+            step.mix(&h, src.name.slice());
+            step.mix(&h, &.{ @intFromEnum(src.kind), @intFromEnum(src.state) });
+        }
+        for (store.pipelines.items) |*p| {
+            step.mix(&h, p.name.slice());
+            step.mix(&h, &.{ @intFromEnum(p.status), p.step_count, p.test_count });
+            for (p.tests[0..p.test_count]) |*ts| {
+                step.mix(&h, ts.target.slice());
+                step.mix(&h, std.mem.asBytes(&ts.failures));
+            }
+        }
+        for (store.pipeline_runs.items) |*r| {
+            step.mix(&h, std.mem.asBytes(&r.id));
+            step.mix(&h, std.mem.asBytes(&r.rows_out));
+            step.mix(&h, &.{@intFromEnum(r.status)});
+        }
+        for (store.dead_letters.items) |*dl| {
+            step.mix(&h, std.mem.asBytes(&dl.id));
+            step.mix(&h, dl.sample.slice());
+            step.mix(&h, &.{ @intFromEnum(dl.kind), @intFromEnum(dl.state) });
+        }
         return h;
     }
 };
@@ -1138,6 +1485,52 @@ test "world shape sane" {
         if (u.state == .pending) pending += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), pending);
+
+    // Pipelines: all blueprints landed; scripted stories hold; every run
+    // and source reference resolves.
+    try std.testing.expectEqual(source_defs.len, s.sources.items.len);
+    try std.testing.expectEqual(pipeline_defs.len, s.pipelines.items.len);
+    var failing_tests: u32 = 0;
+    var err_pipes: u32 = 0;
+    for (s.pipelines.items) |*p| {
+        try std.testing.expect(s.sourceById(p.source) != null);
+        try std.testing.expect(p.step_count > 0);
+        failing_tests += p.testCounts().fail;
+        if (p.status == .err) err_pipes += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 2), failing_tests); // accepted_values + freshness stories
+    try std.testing.expectEqual(@as(u32, 1), err_pipes);
+    try std.testing.expect(s.pipeline_runs.items.len > 10);
+    var partial: u32 = 0;
+    var failed: u32 = 0;
+    for (s.pipeline_runs.items) |*r| {
+        try std.testing.expect(s.pipelineById(r.pipeline) != null);
+        switch (r.status) {
+            .partial => partial += 1,
+            .failed => failed += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 1), partial);
+    try std.testing.expectEqual(@as(u32, 3), failed);
+
+    // Dead-letter story: the accepted_values failure spilled samples
+    // (capped at 4), all referencing live pipelines/runs.
+    try std.testing.expectEqual(@as(usize, 4), s.dead_letters.items.len);
+    for (s.dead_letters.items) |*dl| {
+        try std.testing.expect(s.pipelineById(dl.pipeline) != null);
+        try std.testing.expectEqual(domain.DlqState.open, dl.state);
+    }
+
+    // Watermarks: healthy pipelines carry one; the unreachable-source
+    // pipeline never advanced (its freshness-fail story).
+    for (s.pipelines.items) |*p| {
+        if (p.status == .err) {
+            try std.testing.expectEqual(@as(i64, 0), p.watermark_ms);
+        } else if (p.status == .active) {
+            try std.testing.expect(p.watermark_ms > 0);
+        }
+    }
 }
 
 test "enrichmentFor is a pure function of the IOC" {

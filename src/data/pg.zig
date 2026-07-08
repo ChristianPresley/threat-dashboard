@@ -1,11 +1,13 @@
 //! PostgreSQL provider: a second writer for the same in-memory Store the
 //! panels read — swapping mock ⇄ PG never touches panel code.
 //!
-//! v1 shape (deliberately synchronous): connect + migrate + full load at
-//! boot; panel mutations flush through Store's write hook as immediate
-//! UPDATEs on the render thread (single-digit ms on a local/LAN server).
-//! A background worker with snapshot swaps (the trading LiveFeed pattern)
-//! is the planned upgrade once real ingestion volume exists.
+//! v2 shape: boot still connects + migrates + full-loads synchronously
+//! (fast fail ⇒ degrade to the mock world with a banner), then the boot
+//! connection closes and pg_worker.zig takes over — a background thread
+//! owns its own connection, applies queued panel mutations via `apply`,
+//! and periodically `load`s fresh snapshot Stores the render thread swaps
+//! in (the trading LiveFeed pattern). Nothing here touches the network on
+//! the render thread after boot.
 
 const std = @import("std");
 const pg = @import("pg");
@@ -192,7 +194,7 @@ pub const Provider = struct {
             }
         }
         {
-            var res = try self.pool.query("select id, ts_ms, rule, severity, status, technique, title, entity, assignee, case_id, event_ids from alerts order by ts_ms asc", .{});
+            var res = try self.pool.query("select id, ts_ms, rule, severity, status, technique, title, entity, assignee, case_id, event_ids, acked_ms, resolved_ms from alerts order by ts_ms asc", .{});
             defer res.deinit();
             while (try res.next()) |row| {
                 var a: domain.Alert = .{
@@ -206,6 +208,8 @@ pub const Provider = struct {
                     .entity = domain.FixedStr(64).from(try row.get([]const u8, 7)),
                     .assignee = domain.FixedStr(24).from(try row.get([]const u8, 8)),
                     .case_id = if (try row.get(?i16, 9)) |c| @intCast(c) else null,
+                    .acked_ms = try row.get(i64, 11),
+                    .resolved_ms = try row.get(i64, 12),
                 };
                 var it = std.mem.splitScalar(u8, try row.get([]const u8, 10), ',');
                 while (it.next()) |tok| {
@@ -324,6 +328,80 @@ pub const Provider = struct {
                 });
             }
         }
+        {
+            var res = try self.pool.query("select id, name, kind, dsn, state, last_test_ms, latency_ms, tables from data_sources order by id", .{});
+            defer res.deinit();
+            while (try res.next()) |row| {
+                try s.sources.append(alloc, .{
+                    .id = @intCast(try row.get(i16, 0)),
+                    .name = domain.FixedStr(48).from(try row.get([]const u8, 1)),
+                    .kind = @enumFromInt(@as(u8, @intCast(try row.get(i16, 2)))),
+                    .dsn = domain.FixedStr(96).from(try row.get([]const u8, 3)),
+                    .state = @enumFromInt(@as(u8, @intCast(try row.get(i16, 4)))),
+                    .last_test_ms = try row.get(i64, 5),
+                    .latency_ms = try row.get(f32, 6),
+                    .tables = @intCast(try row.get(i32, 7)),
+                });
+            }
+        }
+        {
+            var res = try self.pool.query("select id, code, name, source, sink, target, schedule_min, status, steps, tests, last_run_ms, owner, watermark_ms from pipelines order by id", .{});
+            defer res.deinit();
+            while (try res.next()) |row| {
+                var p: domain.Pipeline = .{
+                    .id = @intCast(try row.get(i16, 0)),
+                    .code = domain.FixedStr(8).from(try row.get([]const u8, 1)),
+                    .name = domain.FixedStr(64).from(try row.get([]const u8, 2)),
+                    .source = @intCast(try row.get(i16, 3)),
+                    .sink = @enumFromInt(@as(u8, @intCast(try row.get(i16, 4)))),
+                    .target = domain.FixedStr(64).from(try row.get([]const u8, 5)),
+                    .schedule_min = @intCast(try row.get(i32, 6)),
+                    .status = @enumFromInt(@as(u8, @intCast(try row.get(i16, 7)))),
+                    .last_run_ms = try row.get(i64, 10),
+                    .owner = domain.FixedStr(24).from(try row.get([]const u8, 11)),
+                    .watermark_ms = try row.get(i64, 12),
+                };
+                parseSteps(&p, try row.get([]const u8, 8));
+                parseTests(&p, try row.get([]const u8, 9));
+                try s.pipelines.append(alloc, p);
+            }
+        }
+        {
+            var res = try self.pool.query("select id, pipeline, started_ms, duration_ms, rows_in, rows_out, rows_rejected, status, tests_passed, tests_failed, err, watermark_ms from pipeline_runs order by started_ms asc", .{});
+            defer res.deinit();
+            while (try res.next()) |row| {
+                try s.pipeline_runs.append(alloc, .{
+                    .id = @intCast(try row.get(i32, 0)),
+                    .pipeline = @intCast(try row.get(i16, 1)),
+                    .started_ms = try row.get(i64, 2),
+                    .duration_ms = try row.get(i64, 3),
+                    .rows_in = @intCast(try row.get(i64, 4)),
+                    .rows_out = @intCast(try row.get(i64, 5)),
+                    .rows_rejected = @intCast(try row.get(i64, 6)),
+                    .status = @enumFromInt(@as(u8, @intCast(try row.get(i16, 7)))),
+                    .tests_passed = @intCast(try row.get(i16, 8)),
+                    .tests_failed = @intCast(try row.get(i16, 9)),
+                    .err = domain.FixedStr(64).from(try row.get([]const u8, 10)),
+                    .watermark_ms = try row.get(i64, 11),
+                });
+            }
+        }
+        {
+            var res = try self.pool.query("select id, pipeline, run_id, ts_ms, kind, target, sample, state from dead_letters order by id", .{});
+            defer res.deinit();
+            while (try res.next()) |row| {
+                try s.dead_letters.append(alloc, .{
+                    .id = @intCast(try row.get(i32, 0)),
+                    .pipeline = @intCast(try row.get(i16, 1)),
+                    .run_id = @intCast(try row.get(i32, 2)),
+                    .ts_ms = try row.get(i64, 3),
+                    .kind = @enumFromInt(@as(u8, @intCast(try row.get(i16, 4)))),
+                    .target = domain.FixedStr(48).from(try row.get([]const u8, 5)),
+                    .sample = domain.FixedStr(96).from(try row.get([]const u8, 6)),
+                    .state = @enumFromInt(@as(u8, @intCast(try row.get(i16, 7)))),
+                });
+            }
+        }
         s.touch();
         log.info("load: {d} events / {d} alerts / {d} rules / {d} iocs / {d} cases / {d} yara / {d} enrich", .{
             s.events.items.len, s.alerts.items.len, s.rules.items.len, s.iocs.items.len, s.cases.items.len,
@@ -331,58 +409,103 @@ pub const Provider = struct {
         });
     }
 
-    // ── Mutation hook: Store writes → immediate UPDATEs ──────────────────
+    // ── Mutations: Store writes → UPDATEs (worker thread) ────────────────
 
-    pub fn installHook(self: *Provider, s: *Store) void {
-        s.write_hook = .{ .ctx = self, .f = onMutation };
-    }
-
-    fn onMutation(ctx: *anyopaque, m: store_mod.Mutation) void {
-        const self: *Provider = @ptrCast(@alignCast(ctx));
-        const result = switch (m) {
-            .alert_status => |v| self.pool.exec(
-                "update alerts set status = $1 where id = $2",
-                .{ @as(i16, @intFromEnum(v.status)), @as(i32, @intCast(v.id)) },
+    /// Apply one queued panel mutation. Called by pg_worker's thread; on
+    /// error the caller forces an early snapshot so the UI converges back
+    /// to DB truth.
+    pub fn apply(self: *Provider, m: store_mod.Mutation) anyerror!void {
+        _ = switch (m) {
+            .alert_status => |v| try self.pool.exec(
+                "update alerts set status = $1, acked_ms = $2, resolved_ms = $3 where id = $4",
+                .{ @as(i16, @intFromEnum(v.status)), v.acked_ms, v.resolved_ms, @as(i32, @intCast(v.id)) },
             ),
-            .rule_status => |v| self.pool.exec(
+            .rule_status => |v| try self.pool.exec(
                 "update rules set status = $1 where id = $2",
                 .{ @as(i16, @intFromEnum(v.status)), @as(i16, @intCast(v.id)) },
             ),
-            .case_status => |v| self.pool.exec(
+            .case_status => |v| try self.pool.exec(
                 "update cases set status = $1, updated_ms = $2 where id = $3",
                 .{ @as(i16, @intFromEnum(v.status)), v.now_ms, @as(i16, @intCast(v.id)) },
             ),
             .case_assign => |v| blk: {
-                _ = self.pool.exec(
+                _ = try self.pool.exec(
                     "update alerts set case_id = $1 where id = $2",
                     .{ @as(i16, @intCast(v.case_id)), @as(i32, @intCast(v.alert_id)) },
-                ) catch |err| break :blk @as(anyerror!?i64, err);
-                break :blk self.pool.exec(
+                );
+                break :blk try self.pool.exec(
                     "update cases set alert_ids = trim(both ',' from alert_ids || ',' || $1), updated_ms = $2 where id = $3",
                     .{ v.alert_id, v.now_ms, @as(i16, @intCast(v.case_id)) },
                 );
             },
-            .yara_status => |v| self.pool.exec(
+            .yara_status => |v| try self.pool.exec(
                 "update yara_rules set status = $1 where id = $2",
                 .{ @as(i16, @intFromEnum(v.status)), @as(i16, @intCast(v.id)) },
             ),
-            .yara_ci => |v| self.pool.exec(
+            .yara_ci => |v| try self.pool.exec(
                 "update yara_rules set gate_compile=$1, gate_meta=$2, gate_tp=$3, fp_count=$4, scan_ms=$5, budget_ms=$6, last_ci_ms=$7 where id=$8",
                 .{ @as(i16, @intFromEnum(v.gates.compile)), @as(i16, @intFromEnum(v.gates.meta)), @as(i16, @intFromEnum(v.gates.tp)), @as(i32, @intCast(v.gates.fp_count)), v.gates.scan_ms, v.gates.budget_ms, v.gates.last_ci_ms, @as(i16, @intCast(v.id)) },
             ),
-            .enrichment_upsert => |v| self.upsertEnrichmentRow(&v.e),
-            .urlscan_submit => |v| self.pool.exec(
+            .enrichment_upsert => |v| try self.upsertEnrichmentRow(&v.e),
+            .urlscan_submit => |v| try self.pool.exec(
                 "insert into urlscan_scans (id, ioc_id, state, submitted_ms, completed_ms, err) values ($1,$2,$3,$4,0,'') on conflict (id) do nothing",
                 .{ @as(i32, @intCast(v.id)), @as(i32, @intCast(v.ioc_id)), @as(i16, @intFromEnum(domain.ScanState.pending)), v.now_ms },
             ),
-            .urlscan_update => |v| self.pool.exec(
+            .urlscan_update => |v| try self.pool.exec(
                 "update urlscan_scans set state=$1, completed_ms=$2 where id=$3",
                 .{ @as(i16, @intFromEnum(v.state)), v.now_ms, @as(i32, @intCast(v.id)) },
             ),
+            .case_notes => |v| try self.pool.exec(
+                "update cases set notes=$1, updated_ms=$2 where id=$3",
+                .{ v.notes.slice(), v.now_ms, @as(i16, @intCast(v.id)) },
+            ),
+            .source_tested => |v| try self.pool.exec(
+                "update data_sources set state=$1, latency_ms=$2, last_test_ms=$3 where id=$4",
+                .{ @as(i16, @intFromEnum(v.state)), v.latency_ms, v.now_ms, @as(i16, @intCast(v.id)) },
+            ),
+            .pipeline_status => |v| try self.pool.exec(
+                "update pipelines set status=$1 where id=$2",
+                .{ @as(i16, @intFromEnum(v.status)), @as(i16, @intCast(v.id)) },
+            ),
+            .pipeline_add => |v| try self.insertPipelineRow(&v.p),
+            .pipeline_run_add => |v| try self.insertPipelineRunRow(&v.run),
+            .pipeline_run_update => |v| blk: {
+                _ = try self.pool.exec(
+                    "update pipeline_runs set duration_ms=$1, rows_in=$2, rows_out=$3, rows_rejected=$4, status=$5, tests_passed=$6, tests_failed=$7, err=$8, watermark_ms=$9 where id=$10",
+                    .{ v.run.duration_ms, @as(i64, @intCast(v.run.rows_in)), @as(i64, @intCast(v.run.rows_out)), @as(i64, @intCast(v.run.rows_rejected)), @as(i16, @intFromEnum(v.run.status)), @as(i16, @intCast(v.run.tests_passed)), @as(i16, @intCast(v.run.tests_failed)), v.run.err.slice(), v.run.watermark_ms, @as(i32, @intCast(v.run.id)) },
+                );
+                break :blk try self.pool.exec(
+                    "update pipelines set last_run_ms = greatest(last_run_ms, $1), watermark_ms = greatest(watermark_ms, $2) where id = $3",
+                    .{ v.run.started_ms, v.run.watermark_ms, @as(i16, @intCast(v.run.pipeline)) },
+                );
+            },
+            .pipeline_tests => |v| blk: {
+                var tbuf: [512]u8 = undefined;
+                break :blk try self.pool.exec(
+                    "update pipelines set tests=$1 where id=$2",
+                    .{ testsCsv(&tbuf, v.tests[0..v.test_count]), @as(i16, @intCast(v.id)) },
+                );
+            },
+            .dead_letter_add => |v| try self.insertDeadLetterRow(&v.dl),
+            .dead_letter_state => |v| try self.pool.exec(
+                "update dead_letters set state=$1 where id=$2",
+                .{ @as(i16, @intFromEnum(v.state)), @as(i32, @intCast(v.id)) },
+            ),
         };
-        _ = result catch |err| {
-            log.err("mutation write failed: {s} — DB is now behind the UI (reload from SET)", .{@errorName(err)});
-        };
+    }
+
+    fn insertPipelineRunRow(self: *Provider, r: *const domain.PipelineRun) anyerror!?i64 {
+        return self.pool.exec(
+            "insert into pipeline_runs (id, pipeline, started_ms, duration_ms, rows_in, rows_out, rows_rejected, status, tests_passed, tests_failed, err, watermark_ms) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) on conflict (id) do nothing",
+            .{ @as(i32, @intCast(r.id)), @as(i16, @intCast(r.pipeline)), r.started_ms, r.duration_ms, @as(i64, @intCast(r.rows_in)), @as(i64, @intCast(r.rows_out)), @as(i64, @intCast(r.rows_rejected)), @as(i16, @intFromEnum(r.status)), @as(i16, @intCast(r.tests_passed)), @as(i16, @intCast(r.tests_failed)), r.err.slice(), r.watermark_ms },
+        );
+    }
+
+    fn insertDeadLetterRow(self: *Provider, dl: *const domain.DeadLetter) anyerror!?i64 {
+        return self.pool.exec(
+            "insert into dead_letters (id, pipeline, run_id, ts_ms, kind, target, sample, state) values ($1,$2,$3,$4,$5,$6,$7,$8) on conflict (id) do nothing",
+            .{ @as(i32, @intCast(dl.id)), @as(i16, @intCast(dl.pipeline)), @as(i32, @intCast(dl.run_id)), dl.ts_ms, @as(i16, @intFromEnum(dl.kind)), dl.target.slice(), dl.sample.slice(), @as(i16, @intFromEnum(dl.state)) },
+        );
     }
 
     /// Upsert one enrichment row (insert-or-replace by ioc_id). Shared by
@@ -414,6 +537,8 @@ pub const Provider = struct {
     /// Wipe + bulk-insert a world (the `pgload` dev subcommand).
     pub fn upload(self: *Provider, s: *const Store) !void {
         const wipe = [_][]const u8{
+            "delete from dead_letters",
+            "delete from pipeline_runs", "delete from pipelines", "delete from data_sources",
             "delete from urlscan_scans", "delete from ioc_enrichment", "delete from yara_rules",
             "delete from cases", "delete from alerts",  "delete from events",
             "delete from actors", "delete from iocs",   "delete from rules",
@@ -484,7 +609,7 @@ pub const Provider = struct {
             var csv_buf: [200]u8 = undefined;
             const csv = idCsv(u64, &csv_buf, a.event_ids[0..a.event_count]);
             _ = try self.pool.exec(
-                "insert into alerts (id, ts_ms, rule, severity, status, technique, title, entity, assignee, case_id, event_ids) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                "insert into alerts (id, ts_ms, rule, severity, status, technique, title, entity, assignee, case_id, event_ids, acked_ms, resolved_ms) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
                 .{
                     @as(i32, @intCast(a.id)),
                     a.ts_ms,
@@ -497,6 +622,8 @@ pub const Provider = struct {
                     a.assignee.slice(),
                     if (a.case_id) |c| @as(?i16, @intCast(c)) else null,
                     csv,
+                    a.acked_ms,
+                    a.resolved_ms,
                 },
             );
         }
@@ -523,10 +650,42 @@ pub const Provider = struct {
                 .{ @as(i32, @intCast(u.id)), @as(i32, @intCast(u.ioc_id)), @as(i16, @intFromEnum(u.state)), u.submitted_ms, u.completed_ms, u.err.slice() },
             );
         }
-        log.info("upload: {d} events / {d} alerts / {d} rules / {d} iocs / {d} cases / {d} yara / {d} enrich", .{
+        for (s.sources.items) |*src| {
+            _ = try self.pool.exec(
+                "insert into data_sources (id, name, kind, dsn, state, last_test_ms, latency_ms, tables) values ($1,$2,$3,$4,$5,$6,$7,$8)",
+                .{ @as(i16, @intCast(src.id)), src.name.slice(), @as(i16, @intFromEnum(src.kind)), src.dsn.slice(), @as(i16, @intFromEnum(src.state)), src.last_test_ms, src.latency_ms, @as(i32, @intCast(src.tables)) },
+            );
+        }
+        for (s.pipelines.items) |*p| {
+            _ = try self.insertPipelineRow(p);
+        }
+        for (s.pipeline_runs.items) |*r| {
+            _ = try self.insertPipelineRunRow(r);
+        }
+        for (s.dead_letters.items) |*dl| {
+            _ = try self.insertDeadLetterRow(dl);
+        }
+        log.info("upload: {d} events / {d} alerts / {d} rules / {d} iocs / {d} cases / {d} yara / {d} enrich / {d} pipelines / {d} runs", .{
             s.events.items.len, s.alerts.items.len, s.rules.items.len, s.iocs.items.len, s.cases.items.len,
-            s.yara.items.len,   s.enrichments.items.len,
+            s.yara.items.len,   s.enrichments.items.len, s.pipelines.items.len, s.pipeline_runs.items.len,
         });
+    }
+
+    /// Insert one pipeline row (steps/tests serialized). Shared by the
+    /// pipeline_add mutation hook and the bulk upload.
+    fn insertPipelineRow(self: *Provider, p: *const domain.Pipeline) anyerror!?i64 {
+        var sbuf: [512]u8 = undefined;
+        var tbuf: [512]u8 = undefined;
+        return self.pool.exec(
+            "insert into pipelines (id, code, name, source, sink, target, schedule_min, status, steps, tests, last_run_ms, owner, watermark_ms) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) on conflict (id) do nothing",
+            .{
+                @as(i16, @intCast(p.id)),         p.code.slice(),                     p.name.slice(),
+                @as(i16, @intCast(p.source)),     @as(i16, @intFromEnum(p.sink)),     p.target.slice(),
+                @as(i32, @intCast(p.schedule_min)), @as(i16, @intFromEnum(p.status)), stepsCsv(&sbuf, p.steps[0..p.step_count]),
+                testsCsv(&tbuf, p.tests[0..p.test_count]), p.last_run_ms,             p.owner.slice(),
+                p.watermark_ms,
+            },
+        );
     }
 
     fn techniqueCsv(buf: []u8, ids: []const domain.attack.TechniqueId) []const u8 {
@@ -546,4 +705,94 @@ pub const Provider = struct {
         }
         return buf[0..len];
     }
+
+    // ── Pipeline step/test serialization ─────────────────────────────────
+    // Steps: "kind,materialization,model|…"  Tests: "kind,status,failures,
+    // target|…". Models/targets are identifiers by construction — never
+    // contain ',' or '|'.
+
+    fn stepsCsv(buf: []u8, steps: []const domain.PipelineStep) []const u8 {
+        var len: usize = 0;
+        for (steps, 0..) |*st, i| {
+            const chunk = std.fmt.bufPrint(buf[len..], "{s}{d},{d},{s}", .{
+                if (i > 0) "|" else "", @intFromEnum(st.kind), @intFromEnum(st.materialization), st.model.slice(),
+            }) catch break;
+            len += chunk.len;
+        }
+        return buf[0..len];
+    }
+
+    fn testsCsv(buf: []u8, tests: []const domain.PipelineTest) []const u8 {
+        var len: usize = 0;
+        for (tests, 0..) |*ts, i| {
+            const chunk = std.fmt.bufPrint(buf[len..], "{s}{d},{d},{d},{s}", .{
+                if (i > 0) "|" else "", @intFromEnum(ts.kind), @intFromEnum(ts.status), ts.failures, ts.target.slice(),
+            }) catch break;
+            len += chunk.len;
+        }
+        return buf[0..len];
+    }
+
+    fn parseSteps(p: *domain.Pipeline, text: []const u8) void {
+        var it = std.mem.splitScalar(u8, text, '|');
+        while (it.next()) |entry| {
+            if (entry.len == 0 or p.step_count >= domain.PIPELINE_STEP_CAP) continue;
+            var f = std.mem.splitScalar(u8, entry, ',');
+            const kind = std.fmt.parseInt(u8, f.next() orelse continue, 10) catch continue;
+            const mat = std.fmt.parseInt(u8, f.next() orelse continue, 10) catch continue;
+            const model = f.next() orelse continue;
+            if (kind > @intFromEnum(domain.StepKind.mask) or mat > @intFromEnum(domain.Materialization.snapshot)) continue;
+            p.steps[p.step_count] = .{
+                .kind = @enumFromInt(kind),
+                .materialization = @enumFromInt(mat),
+                .model = domain.FixedStr(48).from(model),
+            };
+            p.step_count += 1;
+        }
+    }
+
+    fn parseTests(p: *domain.Pipeline, text: []const u8) void {
+        var it = std.mem.splitScalar(u8, text, '|');
+        while (it.next()) |entry| {
+            if (entry.len == 0 or p.test_count >= domain.PIPELINE_TEST_CAP) continue;
+            var f = std.mem.splitScalar(u8, entry, ',');
+            const kind = std.fmt.parseInt(u8, f.next() orelse continue, 10) catch continue;
+            const status = std.fmt.parseInt(u8, f.next() orelse continue, 10) catch continue;
+            const failures = std.fmt.parseInt(u32, f.next() orelse continue, 10) catch continue;
+            const target = f.next() orelse continue;
+            if (kind > @intFromEnum(domain.DbtTestKind.freshness) or status > @intFromEnum(domain.GateResult.fail)) continue;
+            p.tests[p.test_count] = .{
+                .kind = @enumFromInt(kind),
+                .status = @enumFromInt(status),
+                .failures = failures,
+                .target = domain.FixedStr(48).from(target),
+            };
+            p.test_count += 1;
+        }
+    }
 };
+
+test "pipeline steps/tests serialization round-trips" {
+    var p: domain.Pipeline = .{ .id = 1, .source = 1 };
+    p.steps[0] = .{ .kind = .staging, .model = domain.FixedStr(48).from("stg_edr_events"), .materialization = .view };
+    p.steps[1] = .{ .kind = .dedup, .model = domain.FixedStr(48).from("int_events_deduped"), .materialization = .incremental };
+    p.step_count = 2;
+    p.tests[0] = .{ .kind = .accepted_values, .target = domain.FixedStr(48).from("stg_misp_iocs.type"), .status = .fail, .failures = 12 };
+    p.test_count = 1;
+
+    var sbuf: [512]u8 = undefined;
+    var tbuf: [512]u8 = undefined;
+    const steps_text = Provider.stepsCsv(&sbuf, p.steps[0..p.step_count]);
+    const tests_text = Provider.testsCsv(&tbuf, p.tests[0..p.test_count]);
+
+    var q: domain.Pipeline = .{ .id = 1, .source = 1 };
+    Provider.parseSteps(&q, steps_text);
+    Provider.parseTests(&q, tests_text);
+    try std.testing.expectEqual(@as(u8, 2), q.step_count);
+    try std.testing.expectEqualStrings("int_events_deduped", q.steps[1].model.slice());
+    try std.testing.expectEqual(domain.Materialization.incremental, q.steps[1].materialization);
+    try std.testing.expectEqual(@as(u8, 1), q.test_count);
+    try std.testing.expectEqual(domain.GateResult.fail, q.tests[0].status);
+    try std.testing.expectEqual(@as(u32, 12), q.tests[0].failures);
+    try std.testing.expectEqualStrings("stg_misp_iocs.type", q.tests[0].target.slice());
+}

@@ -145,8 +145,27 @@ pub fn render(d: *Dashboard) void {
         }
     }
 
-    // Notes (read-only view of the mock notes; live editing is a later phase).
+    // Notes: read view + in-place editing (persisted through the Store
+    // write hook, so a PG backend stays in sync).
     zgui.spacing();
     zgui.textColored(t.text.mid, "notes:", .{});
-    dash.textWrappedColored(t.text.hi, "{s}", .{c.notes.slice()});
+    if (d.cas_notes_edit != null and d.cas_notes_edit.? == c.id) {
+        const w = zgui.getContentRegionAvail()[0];
+        _ = zgui.inputTextMultiline("##cas_notes_edit", .{ .buf = &d.cas_notes_buf, .w = w, .h = 74 });
+        if (zgui.smallButton("Save##casnotes")) {
+            _ = s.setCaseNotes(c.id, std.mem.sliceTo(&d.cas_notes_buf, 0), dash.unixNowMs());
+            ui.events.post(.ok, "cases", "case #{d} notes updated", .{c.id});
+            d.cas_notes_edit = null;
+        }
+        zgui.sameLine(.{ .spacing = 6 });
+        if (zgui.smallButton("Cancel##casnotes")) d.cas_notes_edit = null;
+    } else {
+        dash.textWrappedColored(t.text.hi, "{s}", .{c.notes.slice()});
+        if (zgui.smallButton("Edit notes##casnotes")) {
+            @memset(&d.cas_notes_buf, 0);
+            const n = @min(c.notes.len, d.cas_notes_buf.len - 1);
+            @memcpy(d.cas_notes_buf[0..n], c.notes.slice()[0..n]);
+            d.cas_notes_edit = c.id;
+        }
+    }
 }

@@ -89,8 +89,17 @@ pub fn render(d: *Dashboard) void {
             return;
         },
         .pending => {
-            const p = d.jobs[Dashboard.JOB_ENRICH].progress;
-            zgui.textColored(t.sev.warn, "{s} enrichment pending\u{2026} {d:.0}%", .{ ui.fonts.fa.arrows_rotate, p * 100 });
+            if (d.jobs.active(.ioc_enrichment, 0)) |job| {
+                zgui.textColored(t.sev.warn, "{s} enrichment {s}\u{2026} {d:.0}%", .{
+                    ui.fonts.fa.arrows_rotate, if (job.state == .queued) "queued" else "pending", job.progress * 100,
+                });
+            } else {
+                // No job carries this pending row (canceled/stalled) —
+                // offer recovery instead of a forever-spinner.
+                zgui.textColored(t.sev.warn, "enrichment stalled \u{2014} no job in flight", .{});
+                zgui.sameLine(.{ .spacing = 10 });
+                if (zgui.smallButton("Retry##enrstall")) d.requestEnrichment(&.{sel});
+            }
             return;
         },
         .err => {
@@ -203,7 +212,7 @@ pub fn render(d: *Dashboard) void {
             } else {
                 if (zgui.smallButton("Submit to urlscan##enr")) {
                     _ = s.submitUrlScan(sel, dash.unixNowMs());
-                    d.startJob(Dashboard.JOB_ENRICH);
+                    _ = d.jobs.enqueue(.ioc_enrichment, 0, "urlscan", dash.unixNowMs());
                     ui.events.post(.info, "urlscan", "submission queued (unlisted)", .{});
                 }
             }

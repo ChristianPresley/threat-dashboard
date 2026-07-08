@@ -179,3 +179,68 @@ create table if not exists urlscan_scans (
   completed_ms bigint not null,
   err text not null
 );
+
+create table if not exists data_sources (
+  id smallint primary key,
+  name text not null,
+  kind smallint not null,
+  dsn text not null,
+  state smallint not null,
+  last_test_ms bigint not null,
+  latency_ms real not null,
+  tables int not null
+);
+
+create table if not exists pipelines (
+  id smallint primary key,
+  code text not null,
+  name text not null,
+  source smallint not null,
+  sink smallint not null,
+  target text not null,
+  schedule_min int not null,
+  status smallint not null,
+  steps text not null, -- pipe-separated kind,materialization,model triples
+  tests text not null, -- pipe-separated kind,status,failures,target quads
+  last_run_ms bigint not null,
+  owner text not null
+);
+
+create table if not exists pipeline_runs (
+  id int primary key,
+  pipeline smallint not null,
+  started_ms bigint not null,
+  duration_ms bigint not null,
+  rows_in bigint not null,
+  rows_out bigint not null,
+  rows_rejected bigint not null,
+  status smallint not null,
+  tests_passed smallint not null,
+  tests_failed smallint not null,
+  err text not null
+);
+
+create index if not exists pipeline_runs_pipe_idx on pipeline_runs (pipeline, started_ms);
+
+-- Watermark columns arrived after the tables (idempotent add for existing DBs)
+alter table pipelines add column if not exists watermark_ms bigint not null default 0;
+
+alter table pipeline_runs add column if not exists watermark_ms bigint not null default 0;
+
+create table if not exists dead_letters (
+  id int primary key,
+  pipeline smallint not null,
+  run_id int not null,
+  ts_ms bigint not null,
+  kind smallint not null,
+  target text not null,
+  sample text not null,
+  state smallint not null
+);
+
+create index if not exists dead_letters_pipe_idx on dead_letters (pipeline, state);
+
+-- Triage SLA stamps arrived after the alerts table (idempotent add)
+alter table alerts add column if not exists acked_ms bigint not null default 0;
+
+alter table alerts add column if not exists resolved_ms bigint not null default 0;

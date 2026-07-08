@@ -442,36 +442,48 @@ pub fn main(init: std.process.Init) !void {
         .mcp_cmd = init.environ_map.get("TD_MCP_CMD"),
     });
 
-    // PostgreSQL provider: replace the mock world with database truth and
-    // mirror panel mutations back. Connect failure degrades to the mock
-    // world with a critical banner — the UI must stay alive.
-    var pg_provider: ?data.pg.Provider = null;
-    defer if (pg_provider) |*p| p.deinit();
+    // PostgreSQL provider: replace the mock world with database truth.
+    // Boot is synchronous (connect + migrate + full load — fast fail
+    // degrades to the mock world with a critical banner), then the boot
+    // connection closes and a background worker owns the DB from there:
+    // panel mutations queue to it and it periodically loads fresh
+    // snapshots the render thread swaps in (Dashboard.drainPg).
+    var pg_worker: ?*data.pg_worker.Worker = null;
+    defer if (pg_worker) |w| {
+        dashboard.store.write_hook = null;
+        dashboard.pg_worker = null;
+        w.shutdown();
+    };
     if (pg_uri) |uri| {
         if (data.pg.Provider.connect(io, allocator, uri)) |prov| {
-            pg_provider = prov;
-            const p = &pg_provider.?;
+            var boot = prov;
             const ok = blk: {
-                p.migrate() catch |err| {
+                boot.migrate() catch |err| {
                     ui.events.post(.crit, "db", "PG migrate failed: {s} — running on the mock world", .{@errorName(err)});
                     break :blk false;
                 };
-                p.load(&dashboard.store) catch |err| {
+                boot.load(&dashboard.store) catch |err| {
                     ui.events.post(.crit, "db", "PG load failed: {s} — running on the mock world", .{@errorName(err)});
                     break :blk false;
                 };
                 break :blk true;
             };
+            boot.deinit();
             if (ok) {
-                p.installHook(&dashboard.store);
-                dashboard.mock_ticking = false;
-                dashboard.provider_label = "postgresql";
-                ui.events.post(.ok, "db", "PostgreSQL world loaded: {d} events \u{00B7} {d} alerts", .{
-                    dashboard.store.events.items.len, dashboard.store.alerts.items.len,
-                });
+                if (data.pg_worker.Worker.create(allocator, io, uri)) |w| {
+                    pg_worker = w;
+                    w.installHook(&dashboard.store);
+                    dashboard.pg_worker = w;
+                    dashboard.mock_ticking = false;
+                    dashboard.provider_label = "postgresql";
+                    ui.events.post(.ok, "db", "PostgreSQL world loaded: {d} events \u{00B7} {d} alerts", .{
+                        dashboard.store.events.items.len, dashboard.store.alerts.items.len,
+                    });
+                } else |err| {
+                    ui.events.post(.crit, "db", "PG worker spawn failed: {s} — running on the mock world", .{@errorName(err)});
+                    dashboard.regenerateWorld(seed);
+                }
             } else {
-                p.deinit();
-                pg_provider = null;
                 dashboard.regenerateWorld(seed);
             }
         } else |err| {

@@ -1,5 +1,7 @@
 //! FEED · Intel Feeds: sync status per feed (staleness-aged), IOC counts,
-//! and a mock "Sync now" that drives the JOB panel's feed-sync job.
+//! per-feed + fleet-wide sync driving queued feed-sync jobs. Completion
+//! side effects live in Dashboard.onJobComplete (a canceled sync reverts
+//! instead of masquerading as success).
 
 const std = @import("std");
 const zgui = @import("zgui");
@@ -24,23 +26,16 @@ pub fn render(d: *Dashboard) void {
     zgui.textColored(t.text.lo, "{d} feeds \u{00B7} {d} IOCs", .{ s.feeds.items.len, s.iocs.items.len });
     zgui.sameLine(.{ .spacing = 10 });
     if (zgui.smallButton("Sync all##feed")) {
-        d.startJob(0); // feed sync job
-        for (s.feeds.items) |*f| {
-            if (f.status != .err) f.status = .syncing;
-        }
-    }
-    // Feed-sync job completion flips syncing feeds back to ok.
-    if (!d.jobs[0].running) {
-        for (s.feeds.items) |*f| {
-            if (f.status == .syncing) {
-                f.status = .ok;
-                f.last_sync_ms = dash.unixNowMs();
-            }
+        if (d.jobs.enqueue(.feed_sync, 0, "all feeds", dash.unixNowMs()) != null) {
+            for (s.feeds.items) |*f| f.status = .syncing;
+            s.touch();
+        } else {
+            ui.events.post(.warn, "feeds", "a fleet sync is already queued/running", .{});
         }
     }
 
     const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };
-    if (zgui.beginTable("##feed_table", .{ .column = 4, .flags = flags })) {
+    if (zgui.beginTable("##feed_table", .{ .column = 5, .flags = flags })) {
         // Feed stretches: the name is the payload. The source URL is dropped
         // from the table (it's boilerplate flavor) so names stay whole in the
         // narrow INTEL column; it's still available on hover.
@@ -51,6 +46,7 @@ pub fn render(d: *Dashboard) void {
         zgui.tableSetupColumn("Feed", .{ .flags = .{ .width_stretch = true } });
         zgui.tableSetupColumn("IOCs", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 50 });
         zgui.tableSetupColumn("Sync", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 60 });
+        zgui.tableSetupColumn("##act", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 42 });
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
@@ -80,6 +76,20 @@ pub fn render(d: *Dashboard) void {
             // Stale > 4h reads as a warning.
             const col = if (age_s > 4 * 3600 and f.status != .syncing) t.sev.warn else t.text.lo;
             zgui.textColored(col, "{s}", .{ui.fmt.age(&ab, age_s)});
+
+            _ = zgui.tableNextColumn();
+            if (f.status == .syncing) {
+                zgui.textColored(t.sev.info, "{s}", .{ui.fonts.fa.arrows_rotate});
+            } else {
+                var bb: [24]u8 = undefined;
+                const bl = std.fmt.bufPrintZ(&bb, "Sync##feed{d}", .{f.id}) catch "Sync";
+                if (zgui.smallButton(bl)) {
+                    if (d.jobs.enqueue(.feed_sync, @as(u32, f.id) + 1, f.name.slice(), dash.unixNowMs()) != null) {
+                        f.status = .syncing;
+                        s.touch();
+                    }
+                }
+            }
         }
         zgui.endTable();
     }
