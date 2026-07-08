@@ -17,12 +17,19 @@ pub const NativeTool = struct {
     input_schema: [:0]const u8,
 };
 
+/// Dashboard-owned state (not in the Store) some tools read: the job queue
+/// and the audit trail. Empty slices when the caller has none (selftest).
+pub const Extras = struct {
+    jobs: []const data.jobs.Job = &.{},
+    audit: []const domain.AuditEntry = &.{},
+};
+
 const obj_empty = "{\"type\":\"object\",\"properties\":{}}";
 
 pub const native_tools = [_]NativeTool{
     .{
         .name = "get_alerts",
-        .description = "List detection alerts from the dashboard. Filter by status (open|all) and minimum severity. Returns id, severity, status, technique, title, entity, timestamp.",
+        .description = "List detection alerts from the dashboard. Filter by status (open|all) and minimum severity. Returns id, severity, status, technique, title, entity, ts_ms (unix milliseconds).",
         .input_schema =
         \\{"type":"object","properties":{"status":{"type":"string","enum":["open","all"],"description":"open = new/acked/investigating only"},"min_severity":{"type":"string","enum":["info","low","medium","high","critical"]},"limit":{"type":"integer","description":"max rows, default 25, hard max 100"}}}
         ,
@@ -55,14 +62,14 @@ pub const native_tools = [_]NativeTool{
     },
     .{
         .name = "get_yara_rules",
-        .description = "List YARA rules with CI gate health (compile/metadata/true-positive/false-positive/perf) and quality grade. Filter by technique or failures_only.",
+        .description = "List YARA rules with CI gate health (compile/metadata/true-positive/false-positive/perf) and quality grade. Filter by technique or failures_only. Set include_content=true to also get status, author, description, strings excerpt and condition for rule review.",
         .input_schema =
-        \\{"type":"object","properties":{"technique":{"type":"string"},"failures_only":{"type":"boolean"}}}
+        \\{"type":"object","properties":{"technique":{"type":"string"},"failures_only":{"type":"boolean"},"include_content":{"type":"boolean"}}}
         ,
     },
     .{
         .name = "search_events",
-        .description = "Search telemetry events by a text substring over process/cmdline/dst_ip. Optionally filter by kind (process|network|auth|file|dns|registry|script). Returns timestamp, kind, host, process, cmdline.",
+        .description = "Search telemetry events by a text substring over process/cmdline/dst_ip. Optionally filter by kind (process|network|auth|file|dns|registry|script). Returns ts_ms (unix milliseconds), kind, host, process, cmdline.",
         .input_schema =
         \\{"type":"object","properties":{"query":{"type":"string"},"kind":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}
         ,
@@ -79,13 +86,52 @@ pub const native_tools = [_]NativeTool{
         .description = "Sensor fleet health: per sensor host, kind, status (ok/degraded/down), events-per-second, lag.",
         .input_schema = obj_empty,
     },
+    .{
+        .name = "get_enrichment",
+        .description = "Full enrichment detail for one IOC by exact value: verdict, detection ratio, reputation, threat label, hosting (ASN/owner/country/network), whois (registrar/creation), url-scan score, and pivot IOCs it contacted.",
+        .input_schema =
+        \\{"type":"object","properties":{"value":{"type":"string","description":"exact IOC value as returned by get_iocs"}},"required":["value"]}
+        ,
+    },
+    .{
+        .name = "get_pipelines",
+        .description = "List data pipelines (dbt-style ELT): code, name, source, sink, target, schedule, status, watermark lag, latest run result, test pass/fail tallies, open dead letters.",
+        .input_schema = obj_empty,
+    },
+    .{
+        .name = "get_data_sources",
+        .description = "List registered data sources: kind, name, connection state (ok/degraded/unreachable), latency, table count.",
+        .input_schema = obj_empty,
+    },
+    .{
+        .name = "get_feeds",
+        .description = "List threat-intel feeds: name, sync status (ok/syncing/error), IOC count, last-sync timestamp (unix milliseconds).",
+        .input_schema = obj_empty,
+    },
+    .{
+        .name = "get_threat_actors",
+        .description = "List tracked threat actors: name, aliases, motivation, ATT&CK techniques, analyst notes.",
+        .input_schema = obj_empty,
+    },
+    .{
+        .name = "get_jobs",
+        .description = "The async job queue: kind, state (queued/running/done/failed/canceled), progress, detail, error. Newest first, capped at 20.",
+        .input_schema = obj_empty,
+    },
+    .{
+        .name = "get_audit_trail",
+        .description = "Recent audit-trail entries (chain of custody): who did what to which object, newest first. Optional limit (default 25, max 100).",
+        .input_schema =
+        \\{"type":"object","properties":{"limit":{"type":"integer"}}}
+        ,
+    },
 };
 
 pub const ExecuteError = error{ UnknownTool, OutOfMemory } || std.Io.Writer.Error;
 
 /// RENDER THREAD ONLY. Read-only Store access; returns compact JSON owned
 /// by `gpa`. Unknown tool names return `error.UnknownTool`.
-pub fn execute(gpa: Allocator, store: *data.Store, name: []const u8, input_json: []const u8) ExecuteError![]u8 {
+pub fn execute(gpa: Allocator, store: *data.Store, extras: Extras, name: []const u8, input_json: []const u8) ExecuteError![]u8 {
     var parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, gpa, input_json, .{}) catch null;
     defer if (parsed) |*p| p.deinit();
     const args: ?std.json.Value = if (parsed) |p| p.value else null;
@@ -112,6 +158,20 @@ pub fn execute(gpa: Allocator, store: *data.Store, name: []const u8, input_json:
         try getAttackCoverage(w, store, args);
     } else if (std.mem.eql(u8, name, "get_sensor_health")) {
         try getSensorHealth(w, store);
+    } else if (std.mem.eql(u8, name, "get_enrichment")) {
+        try getEnrichment(w, store, args);
+    } else if (std.mem.eql(u8, name, "get_pipelines")) {
+        try getPipelines(w, store);
+    } else if (std.mem.eql(u8, name, "get_data_sources")) {
+        try getDataSources(w, store);
+    } else if (std.mem.eql(u8, name, "get_feeds")) {
+        try getFeeds(w, store);
+    } else if (std.mem.eql(u8, name, "get_threat_actors")) {
+        try getThreatActors(w, store);
+    } else if (std.mem.eql(u8, name, "get_jobs")) {
+        try getJobs(w, extras.jobs);
+    } else if (std.mem.eql(u8, name, "get_audit_trail")) {
+        try getAuditTrail(w, extras.audit, args);
     } else {
         aw.deinit();
         return error.UnknownTool;
@@ -198,7 +258,7 @@ fn getAlerts(w: *std.Io.Writer, s: *data.Store, args: ?std.json.Value) !void {
         if (open_only and !a.status.isOpen()) continue;
         if (@intFromEnum(a.severity) < min_sev) continue;
         if (n > 0) try w.writeByte(',');
-        try w.print("{{\"id\":{d},\"severity\":", .{a.id});
+        try w.print("{{\"id\":{d},\"ts_ms\":{d},\"severity\":", .{ a.id, a.ts_ms });
         try jstr(w, a.severity.label());
         try w.writeAll(",\"status\":");
         try jstr(w, a.status.label());
@@ -335,6 +395,7 @@ fn getRules(w: *std.Io.Writer, s: *data.Store, args: ?std.json.Value) !void {
 fn getYaraRules(w: *std.Io.Writer, s: *data.Store, args: ?std.json.Value) !void {
     const want_tech = argStr(args, "technique");
     const fails_only = argBool(args, "failures_only") orelse false;
+    const include_content = argBool(args, "include_content") orelse false;
     try w.writeAll("{\"yara_rules\":[");
     var n: usize = 0;
     for (s.yara.items) |*y| {
@@ -352,6 +413,18 @@ fn getYaraRules(w: *std.Io.Writer, s: *data.Store, args: ?std.json.Value) !void 
         try jstr(w, domain.attack.get(y.technique).id);
         try w.writeAll(",\"severity\":");
         try jstr(w, y.severity.label());
+        if (include_content) {
+            try w.writeAll(",\"status\":");
+            try jstr(w, y.status.label());
+            try w.writeAll(",\"author\":");
+            try jstr(w, y.author.slice());
+            try w.writeAll(",\"description\":");
+            try jstr(w, y.description.slice());
+            try w.writeAll(",\"strings\":");
+            try jstr(w, y.strings_excerpt.slice());
+            try w.writeAll(",\"condition\":");
+            try jstr(w, y.condition.slice());
+        }
         try w.print(",\"gates\":{{\"compile\":{},\"meta\":{},\"tp\":{},\"fp\":{d},\"scan_ms\":{d:.0},\"budget_ms\":{d:.0}}}}}", .{
             y.gates.compile == .pass, y.gates.meta == .pass, y.gates.tp == .pass,
             y.gates.fp_count,         y.gates.scan_ms,        y.gates.budget_ms,
@@ -382,7 +455,7 @@ fn searchEvents(w: *std.Io.Writer, s: *data.Store, args: ?std.json.Value) !void 
             std.ascii.indexOfIgnoreCase(e.dst_ip.slice(), q) != null;
         if (!hit) continue;
         if (n > 0) try w.writeByte(',');
-        try w.writeAll("{\"kind\":");
+        try w.print("{{\"ts_ms\":{d},\"kind\":", .{e.ts_ms});
         try jstr(w, e.kind.label());
         try w.writeAll(",\"host\":");
         try jstr(w, s.hostName(e.host));
@@ -435,6 +508,196 @@ fn getSensorHealth(w: *std.Io.Writer, s: *data.Store) !void {
         try w.print(",\"eps\":{d:.0},\"lag_s\":{d:.1}}}", .{ sn.eps, sn.lag_s });
     }
     try w.writeAll("]}");
+}
+
+fn getEnrichment(w: *std.Io.Writer, s: *data.Store, args: ?std.json.Value) !void {
+    const value = argStr(args, "value") orelse {
+        try w.writeAll("{\"error\":\"value required\"}");
+        return;
+    };
+    const ic = blk: {
+        for (s.iocs.items) |*ic| {
+            if (std.ascii.eqlIgnoreCase(ic.value.slice(), value)) break :blk ic;
+        }
+        try w.writeAll("{\"error\":\"ioc not found — use get_iocs to list values\"}");
+        return;
+    };
+    const e = s.enrichmentForIoc(ic.id) orelse {
+        try w.writeAll("{\"error\":\"not enriched yet — the analyst can queue enrichment from the IOC panel\"}");
+        return;
+    };
+    if (e.status != .done) {
+        try w.writeAll("{\"status\":");
+        try jstr(w, e.status.label());
+        try w.writeAll("}");
+        return;
+    }
+    try w.writeAll("{\"value\":");
+    try jstr(w, ic.value.slice());
+    try w.writeAll(",\"type\":");
+    try jstr(w, iocTypeTag(ic.type));
+    try w.writeAll(",\"verdict\":");
+    try jstr(w, e.verdict.label());
+    const ratio = e.detRatio();
+    try w.print(",\"detections\":\"{d}/{d}\",\"reputation\":{d}", .{ ratio.hit, ratio.total, e.reputation });
+    if (e.threat_label.len > 0) {
+        try w.writeAll(",\"threat_label\":");
+        try jstr(w, e.threat_label.slice());
+    }
+    try w.print(",\"asn\":{d},\"as_owner\":", .{e.asn});
+    try jstr(w, e.as_owner.slice());
+    try w.writeAll(",\"country\":");
+    try jstr(w, e.country.slice());
+    try w.writeAll(",\"network\":");
+    try jstr(w, e.network.slice());
+    try w.writeAll(",\"registrar\":");
+    try jstr(w, e.registrar.slice());
+    try w.print(",\"creation_ms\":{d},\"scan_score\":{d},\"first_seen_ms\":{d},\"last_seen_ms\":{d}", .{
+        e.creation_ms, e.scan_score, e.first_seen_ms, e.last_seen_ms,
+    });
+    try w.writeAll(",\"contacted_iocs\":[");
+    var first = true;
+    for (e.pivot_ids[0..e.pivot_count]) |pid| {
+        const pic = s.iocById(pid) orelse continue;
+        if (!first) try w.writeByte(',');
+        first = false;
+        try w.writeAll("{\"type\":");
+        try jstr(w, iocTypeTag(pic.type));
+        try w.writeAll(",\"value\":");
+        try jstr(w, pic.value.slice());
+        try w.print(",\"confidence\":{d}}}", .{pic.confidence});
+    }
+    try w.writeAll("]}");
+}
+
+fn getPipelines(w: *std.Io.Writer, s: *data.Store) !void {
+    try w.writeAll("{\"pipelines\":[");
+    for (s.pipelines.items, 0..) |*p, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"code\":");
+        try jstr(w, p.code.slice());
+        try w.writeAll(",\"name\":");
+        try jstr(w, p.name.slice());
+        if (s.sourceById(p.source)) |src| {
+            try w.writeAll(",\"source\":");
+            try jstr(w, src.name.slice());
+        }
+        try w.writeAll(",\"sink\":");
+        try jstr(w, p.sink.label());
+        try w.writeAll(",\"target\":");
+        try jstr(w, p.target.slice());
+        try w.writeAll(",\"status\":");
+        try jstr(w, p.status.label());
+        const tc = p.testCounts();
+        try w.print(",\"schedule_min\":{d},\"watermark_ms\":{d},\"tests_pass\":{d},\"tests_fail\":{d},\"open_dead_letters\":{d}", .{
+            p.schedule_min, p.watermark_ms, tc.pass, tc.fail, s.openDeadLetterCount(p.id),
+        });
+        if (s.lastRunFor(p.id)) |run| {
+            try w.writeAll(",\"last_run\":{\"status\":");
+            try jstr(w, run.status.label());
+            try w.print(",\"started_ms\":{d},\"rows_in\":{d},\"rows_out\":{d},\"rows_rejected\":{d}}}", .{
+                run.started_ms, run.rows_in, run.rows_out, run.rows_rejected,
+            });
+        }
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
+}
+
+fn getDataSources(w: *std.Io.Writer, s: *data.Store) !void {
+    try w.writeAll("{\"sources\":[");
+    for (s.sources.items, 0..) |*src, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"kind\":");
+        try jstr(w, src.kind.label());
+        try w.writeAll(",\"name\":");
+        try jstr(w, src.name.slice());
+        try w.writeAll(",\"state\":");
+        try jstr(w, src.state.label());
+        try w.print(",\"latency_ms\":{d:.0},\"tables\":{d}}}", .{ src.latency_ms, src.tables });
+    }
+    try w.writeAll("]}");
+}
+
+fn getFeeds(w: *std.Io.Writer, s: *data.Store) !void {
+    try w.writeAll("{\"feeds\":[");
+    for (s.feeds.items, 0..) |*f, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":");
+        try jstr(w, f.name.slice());
+        try w.writeAll(",\"status\":");
+        try jstr(w, f.status.label());
+        try w.print(",\"ioc_count\":{d},\"last_sync_ms\":{d}}}", .{ f.ioc_count, f.last_sync_ms });
+    }
+    try w.writeAll("]}");
+}
+
+fn getThreatActors(w: *std.Io.Writer, s: *data.Store) !void {
+    try w.writeAll("{\"actors\":[");
+    for (s.actors.items, 0..) |*a, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.writeAll("{\"name\":");
+        try jstr(w, a.name.slice());
+        try w.writeAll(",\"aliases\":");
+        try jstr(w, a.aliases.slice());
+        try w.writeAll(",\"motivation\":");
+        try jstr(w, a.motivation.label());
+        try w.writeAll(",\"techniques\":[");
+        for (a.techniques[0..a.technique_count], 0..) |tid, ti| {
+            if (ti > 0) try w.writeByte(',');
+            try jstr(w, domain.attack.get(tid).id);
+        }
+        try w.writeAll("],\"notes\":");
+        try jstr(w, a.notes.slice());
+        try w.writeByte('}');
+    }
+    try w.writeAll("]}");
+}
+
+fn getJobs(w: *std.Io.Writer, jobs: []const data.jobs.Job) !void {
+    try w.writeAll("{\"jobs\":[");
+    var n: usize = 0;
+    var i = jobs.len;
+    while (i > 0 and n < 20) {
+        i -= 1;
+        const j = &jobs[i];
+        if (n > 0) try w.writeByte(',');
+        try w.writeAll("{\"kind\":");
+        try jstr(w, j.kind.label());
+        try w.writeAll(",\"state\":");
+        try jstr(w, j.state.label());
+        try w.writeAll(",\"detail\":");
+        try jstr(w, j.detail.slice());
+        try w.print(",\"progress\":{d:.2}", .{j.progress});
+        if (j.err.len > 0) {
+            try w.writeAll(",\"error\":");
+            try jstr(w, j.err.slice());
+        }
+        try w.writeByte('}');
+        n += 1;
+    }
+    try w.print("],\"returned\":{d}}}", .{n});
+}
+
+fn getAuditTrail(w: *std.Io.Writer, audit: []const domain.AuditEntry, args: ?std.json.Value) !void {
+    const limit = limitOf(args);
+    try w.writeAll("{\"audit\":[");
+    var n: usize = 0;
+    var i = audit.len;
+    while (i > 0 and n < limit) {
+        i -= 1;
+        const e = &audit[i];
+        if (n > 0) try w.writeByte(',');
+        try w.print("{{\"ts_ms\":{d},\"actor\":", .{e.ts_ms});
+        try jstr(w, e.actor.slice());
+        try w.writeAll(",\"action\":");
+        try jstr(w, e.action.slice());
+        try w.writeAll(",\"target\":");
+        try jstr(w, e.target.slice());
+        try w.writeByte('}');
+        n += 1;
+    }
+    try w.print("],\"returned\":{d}}}", .{n});
 }
 
 fn iocTypeTag(ty: domain.IocType) []const u8 {
@@ -496,13 +759,26 @@ test "native tools emit valid json against the mock store" {
     var g = data.mock.Generator.init(42, 1_750_000_000_000);
     try g.build(&s);
 
+    // Extras carry a probe job + audit entry so those tools emit rows too.
+    const probe_jobs = [_]data.jobs.Job{.{ .id = 1, .kind = .yara_ci, .state = .done, .detail = domain.FixedStr(48).from("all rules") }};
+    const probe_audit = [_]domain.AuditEntry{.{ .id = 1, .ts_ms = 42, .actor = domain.FixedStr(24).from("cpresley"), .action = domain.FixedStr(28).from("alert_status"), .target = domain.FixedStr(64).from("alert #1 → ACKED") }};
+    const extras: Extras = .{ .jobs = &probe_jobs, .audit = &probe_audit };
     for (native_tools) |tool| {
-        const out = try execute(std.testing.allocator, &s, tool.name, "{}");
+        const out = try execute(std.testing.allocator, &s, extras, tool.name, "{}");
         defer std.testing.allocator.free(out);
         try std.testing.expect(out.len > 0);
         try std.testing.expect(std.json.validate(std.testing.allocator, out) catch false);
     }
-    try std.testing.expectError(error.UnknownTool, execute(std.testing.allocator, &s, "nope", "{}"));
+    // get_enrichment with a real value round-trips too.
+    if (s.enrichments.items.len > 0) {
+        const ic = s.iocById(s.enrichments.items[0].ioc_id).?;
+        var qb: [160]u8 = undefined;
+        const q = try std.fmt.bufPrint(&qb, "{{\"value\":\"{s}\"}}", .{ic.value.slice()});
+        const out = try execute(std.testing.allocator, &s, .{}, "get_enrichment", q);
+        defer std.testing.allocator.free(out);
+        try std.testing.expect(std.json.validate(std.testing.allocator, out) catch false);
+    }
+    try std.testing.expectError(error.UnknownTool, execute(std.testing.allocator, &s, .{}, "nope", "{}"));
 }
 
 test "get_iocs honors filters" {
@@ -511,7 +787,7 @@ test "get_iocs honors filters" {
     var g = data.mock.Generator.init(42, 1_750_000_000_000);
     try g.build(&s);
 
-    const out = try execute(std.testing.allocator, &s, "get_iocs", "{\"type\":\"ip\",\"limit\":5}");
+    const out = try execute(std.testing.allocator, &s, .{}, "get_iocs", "{\"type\":\"ip\",\"limit\":5}");
     defer std.testing.allocator.free(out);
     try std.testing.expect(std.json.validate(std.testing.allocator, out) catch false);
 }

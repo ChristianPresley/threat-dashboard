@@ -75,9 +75,14 @@ pub fn buildRequest(w: *std.Io.Writer, a: BuildArgs) !void {
         try w.writeByte('}');
     }
     for (a.mcp_tools) |mt| {
-        try w.writeAll(",{\"name\":");
+        // Skip names too long to prefix — advertising them unprefixed would
+        // mis-route the call back through the native-tool path.
         var nb: [64]u8 = undefined;
-        const prefixed = std.fmt.bufPrint(&nb, "ti_{s}", .{mt.name}) catch mt.name;
+        const prefixed = std.fmt.bufPrint(&nb, "ti_{s}", .{mt.name}) catch {
+            std.log.scoped(.ai).warn("MCP tool name too long, skipping: {s}", .{mt.name});
+            continue;
+        };
+        try w.writeAll(",{\"name\":");
         try jstr(w, prefixed);
         try w.writeAll(",\"description\":");
         try jstr(w, mt.description);

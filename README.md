@@ -33,6 +33,7 @@ Useful flags:
 | `--mcp-check` | Spawn the threat-intel MCP server, list its tools, exit |
 | `--validate` | Force-cycle every workspace/panel for a bounded run, then exit |
 | `--screenshot <dir>` | `--validate` + one PNG per workspace |
+| `--tour <dir>` | Scripted guided-tour capture (stills + GIF strips for the walkthrough) |
 | `--window WxH`, `--dpi-scale <f>`, `--mailbox`, `--demo` | See `--help` |
 
 ## Workspaces (F1–F5)
@@ -91,10 +92,12 @@ shows per pipeline.
   run per-feed or fleet-wide; the retention sweep prunes old run
   history and resolved dead letters.
 - **Audit Trail** (`AUD`, OPS): chain of custody — every analyst and
-  system action (acks, rule toggles, case moves, pipeline operations)
-  recorded at the Store mutation choke point with who · what · when.
-  The record lives outside the swappable Store state, so PostgreSQL
-  snapshot refreshes never erase it.
+  system action (acks, rule toggles, case moves, feed syncs, pipeline
+  operations) recorded at the Store mutation choke point with who ·
+  what · when. The record lives outside the swappable Store state, so
+  PostgreSQL snapshot refreshes never erase it — and under `--pg` it
+  mirrors to an `audit_log` table and reloads on boot, so it survives
+  restarts too.
 - **Triage SLAs** (`PST`): alerts carry ack/resolve timestamps; the
   posture summary shows real MTTA and MTTR computed from them.
 

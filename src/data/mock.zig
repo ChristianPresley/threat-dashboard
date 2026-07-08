@@ -1365,6 +1365,36 @@ pub const Generator = struct {
             step.mix(&h, a.entity.slice());
         }
         for (store.iocs.items) |*ic| step.mix(&h, ic.value.slice());
+        for (store.hosts.items) |*hn| step.mix(&h, hn.slice());
+        for (store.users.items) |*un| step.mix(&h, un.slice());
+        for (store.sensors.items) |*sn| {
+            step.mix(&h, sn.host.slice());
+            step.mix(&h, sn.version.slice());
+            step.mix(&h, &.{ @intFromEnum(sn.kind), @intFromEnum(sn.status) });
+        }
+        for (store.rules.items) |*r| {
+            step.mix(&h, r.name.slice());
+            step.mix(&h, r.query.slice());
+            step.mix(&h, std.mem.asBytes(&r.fires_7d));
+            step.mix(&h, std.mem.asBytes(&r.fp_7d));
+            step.mix(&h, &.{@intFromEnum(r.status)});
+        }
+        for (store.feeds.items) |*f| {
+            step.mix(&h, f.name.slice());
+            step.mix(&h, std.mem.asBytes(&f.ioc_count));
+            step.mix(&h, &.{@intFromEnum(f.status)});
+        }
+        for (store.actors.items) |*a| {
+            step.mix(&h, a.name.slice());
+            step.mix(&h, a.notes.slice());
+            step.mix(&h, std.mem.asBytes(&a.technique_count));
+        }
+        for (store.cases.items) |*c| {
+            step.mix(&h, c.title.slice());
+            step.mix(&h, c.notes.slice());
+            step.mix(&h, std.mem.asBytes(&c.alert_count));
+            step.mix(&h, &.{ @intFromEnum(c.severity), @intFromEnum(c.status) });
+        }
         for (store.yara.items) |*y| {
             step.mix(&h, y.name.slice());
             step.mix(&h, std.mem.asBytes(&y.gates.fp_count));

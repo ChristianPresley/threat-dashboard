@@ -25,8 +25,21 @@ pub const Mutation = union(enum) {
     /// Carries the full row so the PG hook can upsert in one statement.
     enrichment_upsert: struct { e: domain.IocEnrichment },
     urlscan_submit: struct { id: u32, ioc_id: u32, now_ms: i64 },
-    urlscan_update: struct { id: u32, state: domain.ScanState, now_ms: i64 },
+    urlscan_update: struct { id: u32, state: domain.ScanState, err: domain.FixedStr(32), now_ms: i64 },
     case_notes: struct { id: u16, notes: domain.FixedStr(480), now_ms: i64 },
+    /// Carries the full row so the PG hook can insert in one statement.
+    case_add: struct { c: domain.Case },
+    /// Case metadata edit (title / severity / assignee).
+    case_update: struct { id: u16, title: domain.FixedStr(96), severity: domain.Severity, assignee: domain.FixedStr(24), now_ms: i64 },
+    case_unassign: struct { alert_id: u32, case_id: u16, now_ms: i64 },
+    /// Feed sync lifecycle (syncing → ok/err) — carries the stamped
+    /// last_sync_ms so a snapshot refresh can never revert a sync result.
+    feed_status: struct { id: u16, status: domain.FeedStatus, last_sync_ms: i64 },
+    /// Analyst FP feedback on a rule (carries the new absolute count).
+    rule_fp: struct { id: u16, fp_7d: u32 },
+    /// Retention sweep parameters — the PG hook mirrors the local prune
+    /// with equivalent DELETEs so deletions survive snapshot refreshes.
+    retention_prune: struct { keep_runs: u32, dlq_before_ms: i64 },
     source_tested: struct { id: u16, state: domain.ConnState, latency_ms: f32, now_ms: i64 },
     pipeline_status: struct { id: u16, status: domain.PipelineStatus },
     /// Carries the full row so the PG hook can insert in one statement.
@@ -181,6 +194,13 @@ pub const Store = struct {
             const mid = lo + (hi - lo) / 2;
             if (items[mid].id == id) return &items[mid];
             if (items[mid].id < id) lo = mid + 1 else hi = mid;
+        }
+        return null;
+    }
+
+    pub fn feedById(self: *Store, id: u16) ?*domain.IntelFeed {
+        for (self.feeds.items) |*f| {
+            if (f.id == id) return f;
         }
         return null;
     }
@@ -465,6 +485,77 @@ pub const Store = struct {
         return true;
     }
 
+    /// Detach an alert from its case (reverse of assignAlertToCase). An
+    /// implicit `.investigating` flip reverts to `.new`; explicit statuses
+    /// stay put.
+    pub fn unassignAlertFromCase(self: *Store, alert_id: u32, now_ms: i64) bool {
+        const a = self.alertById(alert_id) orelse return false;
+        const cid = a.case_id orelse return false;
+        const c = self.caseById(cid) orelse return false;
+        var i: u8 = 0;
+        while (i < c.alert_count) : (i += 1) {
+            if (c.alert_ids[i] != alert_id) continue;
+            var j = i;
+            while (j + 1 < c.alert_count) : (j += 1) c.alert_ids[j] = c.alert_ids[j + 1];
+            c.alert_count -= 1;
+            break;
+        }
+        c.updated_ms = now_ms;
+        a.case_id = null;
+        if (a.status == .investigating) a.status = .new;
+        self.touch();
+        self.notify(.{ .case_unassign = .{ .alert_id = alert_id, .case_id = cid, .now_ms = now_ms } });
+        return true;
+    }
+
+    /// Open a new case; assigns the next free id. Returns the id (or null
+    /// on OOM).
+    pub fn addCase(self: *Store, proto: domain.Case) ?u16 {
+        var next: u16 = 1;
+        for (self.cases.items) |*c| {
+            if (c.id >= next) next = c.id + 1;
+        }
+        var c = proto;
+        c.id = next;
+        self.cases.append(self.allocator, c) catch return null;
+        self.touch();
+        self.notify(.{ .case_add = .{ .c = c } });
+        return next;
+    }
+
+    /// Edit case metadata (title / severity / assignee).
+    pub fn updateCaseMeta(self: *Store, id: u16, title: []const u8, severity: domain.Severity, assignee: []const u8, now_ms: i64) bool {
+        const c = self.caseById(id) orelse return false;
+        c.title = domain.FixedStr(96).from(title);
+        c.severity = severity;
+        c.assignee = domain.FixedStr(24).from(assignee);
+        c.updated_ms = now_ms;
+        self.touch();
+        self.notify(.{ .case_update = .{ .id = id, .title = c.title, .severity = severity, .assignee = c.assignee, .now_ms = now_ms } });
+        return true;
+    }
+
+    /// Feed sync lifecycle. `sync_ms` non-null stamps last_sync_ms (a
+    /// successful sync); null keeps the previous stamp (start / failure /
+    /// cancel-revert).
+    pub fn setFeedStatus(self: *Store, id: u16, status: domain.FeedStatus, sync_ms: ?i64) bool {
+        const f = self.feedById(id) orelse return false;
+        f.status = status;
+        if (sync_ms) |ms| f.last_sync_ms = ms;
+        self.touch();
+        self.notify(.{ .feed_status = .{ .id = id, .status = status, .last_sync_ms = f.last_sync_ms } });
+        return true;
+    }
+
+    /// Analyst FP feedback: bump a rule's 7-day false-positive count.
+    pub fn bumpRuleFp(self: *Store, id: u16) bool {
+        const r = self.ruleById(id) orelse return false;
+        r.fp_7d += 1;
+        self.touch();
+        self.notify(.{ .rule_fp = .{ .id = id, .fp_7d = r.fp_7d } });
+        return true;
+    }
+
     pub fn setRuleStatus(self: *Store, id: u16, status: domain.RuleStatus) bool {
         const r = self.ruleById(id) orelse return false;
         r.status = status;
@@ -529,13 +620,14 @@ pub const Store = struct {
         return next;
     }
 
-    pub fn setUrlScanState(self: *Store, id: u32, state: domain.ScanState, now_ms: i64) bool {
+    pub fn setUrlScanState(self: *Store, id: u32, state: domain.ScanState, err: []const u8, now_ms: i64) bool {
         for (self.urlscans.items) |*u| {
             if (u.id != id) continue;
             u.state = state;
+            u.err = domain.FixedStr(32).from(err);
             if (state == .done or state == .err) u.completed_ms = now_ms;
             self.touch();
-            self.notify(.{ .urlscan_update = .{ .id = id, .state = state, .now_ms = now_ms } });
+            self.notify(.{ .urlscan_update = .{ .id = id, .state = state, .err = u.err, .now_ms = now_ms } });
             return true;
         }
         return false;
@@ -655,8 +747,18 @@ pub const Store = struct {
         return n;
     }
 
-    // ── Retention (mock-mode housekeeping; NOT mirrored — under PG the
-    //    snapshot refresh owns the row set) ────────────────────────────────
+    /// Retention sweep: prune old runs + resolved dead letters locally and
+    /// notify ONCE so the PG hook mirrors the deletions (they survive
+    /// snapshot refreshes) and the sweep lands in the audit trail.
+    pub fn pruneRetention(self: *Store, keep_runs: u32, dlq_before_ms: i64) struct { runs: u32, dlq: u32 } {
+        const runs = self.prunePipelineRuns(keep_runs);
+        const dlq = self.pruneDeadLetters(dlq_before_ms);
+        self.notify(.{ .retention_prune = .{ .keep_runs = keep_runs, .dlq_before_ms = dlq_before_ms } });
+        return .{ .runs = runs, .dlq = dlq };
+    }
+
+    // ── Retention (row removal helpers; mirrored to PG only through
+    //    pruneRetention's single mutation) ───────────────────────────────────
 
     /// Drop the oldest completed runs beyond `keep` per pipeline. Returns
     /// how many were removed.
@@ -763,8 +865,42 @@ test "yara + enrichment + urlscan round-trips" {
     try std.testing.expectEqual(domain.Verdict.malicious, s.enrichmentForIoc(9).?.verdict);
 
     const scan_id = s.submitUrlScan(9, 100).?;
-    try std.testing.expect(s.setUrlScanState(scan_id, .done, 200));
+    try std.testing.expect(s.setUrlScanState(scan_id, .done, "", 200));
     try std.testing.expectEqual(@as(i64, 200), s.urlScanForIoc(9).?.completed_ms);
+    const scan2 = s.submitUrlScan(9, 300).?;
+    try std.testing.expect(s.setUrlScanState(scan2, .err, "canceled", 400));
+    try std.testing.expectEqualStrings("canceled", s.urlScanForIoc(9).?.err.slice());
+}
+
+test "case create / meta edit / unassign + feed status + rule fp" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+
+    try s.alerts.append(s.allocator, .{ .id = 5, .ts_ms = 0, .rule = 1, .severity = .high });
+    const cid = s.addCase(.{ .id = 0, .title = domain.FixedStr(96).from("Suspicious beaconing"), .severity = .high, .opened_ms = 10, .updated_ms = 10 }).?;
+    try std.testing.expect(s.assignAlertToCase(5, cid, 20));
+    try std.testing.expectEqual(domain.AlertStatus.investigating, s.alertById(5).?.status);
+
+    // Unassign reverts the implicit investigating flip and detaches both sides.
+    try std.testing.expect(s.unassignAlertFromCase(5, 30));
+    try std.testing.expectEqual(@as(?u16, null), s.alertById(5).?.case_id);
+    try std.testing.expectEqual(@as(u8, 0), s.caseById(cid).?.alert_count);
+    try std.testing.expectEqual(domain.AlertStatus.new, s.alertById(5).?.status);
+    try std.testing.expect(!s.unassignAlertFromCase(5, 31)); // no case anymore
+
+    try std.testing.expect(s.updateCaseMeta(cid, "Beaconing (contained)", .medium, "nblake", 40));
+    try std.testing.expectEqualStrings("Beaconing (contained)", s.caseById(cid).?.title.slice());
+    try std.testing.expectEqual(domain.Severity.medium, s.caseById(cid).?.severity);
+
+    try s.feeds.append(s.allocator, .{ .id = 2, .name = domain.FixedStr(48).from("AbuseCH"), .last_sync_ms = 100 });
+    try std.testing.expect(s.setFeedStatus(2, .syncing, null));
+    try std.testing.expectEqual(@as(i64, 100), s.feedById(2).?.last_sync_ms); // unchanged
+    try std.testing.expect(s.setFeedStatus(2, .ok, 500));
+    try std.testing.expectEqual(@as(i64, 500), s.feedById(2).?.last_sync_ms);
+
+    try s.rules.append(s.allocator, .{ .id = 9, .technique = 0, .fp_7d = 3 });
+    try std.testing.expect(s.bumpRuleFp(9));
+    try std.testing.expectEqual(@as(u32, 4), s.ruleById(9).?.fp_7d);
 }
 
 test "pipeline + source round-trips" {

@@ -18,7 +18,12 @@ pub fn render(d: *Dashboard) void {
             d.store.iocs.items.len,
         });
         if (zgui.smallButton("Regenerate with next seed##set")) {
-            d.regenerateWorld(d.seed +% 1);
+            // Same guard as the SEED command: never stomp a DB-owned Store.
+            if (d.mock_ticking) {
+                d.regenerateWorld(d.seed +% 1);
+            } else {
+                ui.events.post(.warn, "world", "regenerate is mock-only \u{2014} the Store is owned by {s}", .{d.provider_label});
+            }
         }
         zgui.sameLine(.{ .spacing = 8 });
         zgui.textColored(t.text.lo, "same seed \u{21D2} identical world (launch with --seed <n>)", .{});

@@ -42,6 +42,9 @@ fn sleepMs(io: std.Io, ms: i64) void {
 /// Render thread → worker.
 pub const ToWorker = union(enum) {
     mutation: Mutation,
+    /// Audit-trail entry to persist (chain of custody survives restarts).
+    /// Not part of the Store snapshot, so it doesn't bump mutation_seq.
+    audit: @import("domain").AuditEntry,
     shutdown,
 };
 
@@ -148,6 +151,11 @@ pub const Worker = struct {
         self.inbox.push(self.io, self.gpa, .{ .mutation = m }) catch {};
     }
 
+    /// Queue an audit entry for persistence (render thread).
+    pub fn queueAudit(self: *Worker, entry: @import("domain").AuditEntry) void {
+        self.inbox.push(self.io, self.gpa, .{ .audit = entry }) catch {};
+    }
+
     /// Drain the outbox into `out` (render thread, once per frame).
     pub fn drain(self: *Worker, out: *std.ArrayList(Event)) void {
         self.outbox.drainInto(self.io, self.gpa, out);
@@ -183,6 +191,12 @@ pub const Worker = struct {
                         // the unpersisted change until the next tick.
                         self.pushErr("PG write failed: {s} — refreshing from DB", .{@errorName(err)});
                         since_refresh = REFRESH_MS;
+                    },
+                    // Audit rows aren't in snapshots — a failed insert is
+                    // logged but never forces a refresh.
+                    .audit => |e| _ = provider.insertAuditRow(&e) catch |err| blk: {
+                        self.pushErr("audit persist failed: {s}", .{@errorName(err)});
+                        break :blk null;
                     },
                 };
                 if (since_refresh >= REFRESH_MS) {
@@ -237,7 +251,7 @@ pub const Worker = struct {
             if (self.stop.load(.seq_cst)) return false;
             while (self.inbox.tryPop(self.io)) |msg| switch (msg) {
                 .shutdown => return false,
-                .mutation => dropped += 1,
+                .mutation, .audit => dropped += 1,
             };
             sleepMs(self.io, POLL_MS);
         }

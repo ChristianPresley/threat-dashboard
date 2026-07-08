@@ -15,6 +15,9 @@ pub const JobKind = enum(u8) {
     retention_sweep,
     yara_ci,
     pipeline_run,
+    /// One urlscan submission (arg = scan id) — its own kind so canceling
+    /// an enrichment batch never kills url scans (and vice versa).
+    url_scan,
 
     pub fn label(self: JobKind) [:0]const u8 {
         return switch (self) {
@@ -24,6 +27,7 @@ pub const JobKind = enum(u8) {
             .retention_sweep => "retention sweep",
             .yara_ci => "yara ci",
             .pipeline_run => "pipeline run",
+            .url_scan => "url scan",
         };
     }
 
@@ -38,6 +42,7 @@ pub const JobKind = enum(u8) {
             .retention_sweep => 0.20,
             .yara_ci => 0.12,
             .pipeline_run => 0.12,
+            .url_scan => 0.15,
         };
     }
 };

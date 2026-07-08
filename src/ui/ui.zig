@@ -10,6 +10,7 @@ pub const demo = @import("demo.zig");
 pub const layout = @import("layout.zig");
 pub const registry = @import("registry.zig");
 pub const events = @import("events.zig");
+pub const table = @import("table.zig");
 pub const dbgate = @import("dbgate.zig");
 pub const flash = @import("flash.zig");
 pub const stale = @import("stale.zig");

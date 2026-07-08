@@ -186,6 +186,12 @@ fn onPost(e: *const Event) void {
     }
 }
 
+/// Drop all toasts immediately (validate harness: captures must show panel
+/// content, not the boot toast). Leaves the ring and crit banner intact.
+pub fn dismissToasts() void {
+    toasts = .{null} ** TOAST_CAP;
+}
+
 /// Drop expired toasts; call per frame.
 pub fn tickToasts() void {
     const now = confirm.nowMs();

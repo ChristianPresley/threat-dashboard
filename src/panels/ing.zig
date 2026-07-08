@@ -53,7 +53,7 @@ pub fn render(d: *Dashboard) void {
         zgui.plot.setupAxis(.x1, .{ .flags = .{ .no_tick_labels = true, .no_grid_lines = true } });
         zgui.plot.setupAxis(.y1, .{ .flags = .{ .auto_fit = true } });
         zgui.plot.setupAxisLimits(.x1, .{ .min = 0, .max = SAMPLES - 1 });
-        zgui.plot.setupLegend(.{ .north = true, .west = true }, .{});
+        zgui.plot.setupLegend(.{ .north = true }, .{ .horizontal = true, .outside = true });
         const kind_names = [_][:0]const u8{ "EDR", "FW", "IDS", "DNS", "PROXY", "CLOUD" };
         inline for (0..KINDS) |k| {
             // Rotate so the newest sample is rightmost.

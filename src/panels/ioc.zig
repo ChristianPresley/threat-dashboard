@@ -28,7 +28,7 @@ pub fn render(d: *Dashboard) void {
         zgui.setKeyboardFocusHere(0);
     }
     zgui.setNextItemWidth(200);
-    _ = zgui.inputTextWithHint("##ioc_filter", .{ .hint = "filter value (Ctrl+F)", .buf = &d.ioc_filter_buf });
+    _ = zgui.inputTextWithHint("##ioc_filter", .{ .hint = "filter (Ctrl+F)", .buf = &d.ioc_filter_buf });
 
     const filter = std.mem.sliceTo(&d.ioc_filter_buf, 0);
     var rows: [MAX_ROWS]u32 = undefined;
@@ -48,6 +48,10 @@ pub fn render(d: *Dashboard) void {
             if (n >= ids.len) break;
             ids[n] = s.iocs.items[rows[ri]].id;
             n += 1;
+        }
+        // The batch caps at 25 — say so instead of silently truncating.
+        if (m > ids.len) {
+            ui.events.post(.info, "enrich", "enriching the first {d} of {d} shown \u{2014} narrow the filter for the rest", .{ ids.len, m });
         }
         d.requestEnrichment(ids[0..n]);
     }
@@ -126,6 +130,17 @@ pub fn render(d: *Dashboard) void {
                 var ab: [16]u8 = undefined;
                 const age_s = @divFloor(dash.unixNowMs() - ic.last_seen_ms, 1000);
                 zgui.textColored(t.text.lo, "{s}", .{ui.fmt.age(&ab, age_s)});
+                if (zgui.isItemHovered(.{})) {
+                    if (zgui.beginTooltip()) {
+                        var fb: [20]u8 = undefined;
+                        var lb2: [20]u8 = undefined;
+                        zgui.textColored(t.text.mid, "first seen {s} \u{00B7} last seen {s}", .{
+                            ui.fmt.dateTime(&fb, @divFloor(ic.first_seen_ms, 1000)),
+                            ui.fmt.dateTime(&lb2, @divFloor(ic.last_seen_ms, 1000)),
+                        });
+                        zgui.endTooltip();
+                    }
+                }
                 _ = zgui.tableNextColumn();
                 zgui.textColored(if (ic.hits > 0) t.sev.crit else t.text.lo, "{d}", .{ic.hits});
             }

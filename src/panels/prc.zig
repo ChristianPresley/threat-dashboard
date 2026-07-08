@@ -105,7 +105,21 @@ fn drawNode(d: *Dashboard, id: u64, depth: usize) void {
     }
     zgui.sameLine(.{ .spacing = 10 });
     var cb: [16]u8 = undefined;
-    zgui.textColored(t.text.lo, "{s}", .{ui.fmt.clock(&cb, @divFloor(e.ts_ms, 1000))});
+    var ckb: [40]u8 = undefined;
+    const clock_lbl = std.fmt.bufPrintZ(&ckb, "{s}##prcevt{d}", .{ ui.fmt.clock(&cb, @divFloor(e.ts_ms, 1000)), id }) catch "t";
+    zgui.pushStyleColor4f(.{ .idx = .text, .c = t.text.lo });
+    // Reverse of EVT's "open in PRC": the timestamp clicks through to EVT.
+    if (zgui.selectable(clock_lbl, .{ .w = 44 })) {
+        d.evt_sel = id;
+        d.focusPanel(dash.PANEL_EVT);
+    }
+    zgui.popStyleColor(.{ .count = 1 });
+    if (zgui.isItemHovered(.{})) {
+        if (zgui.beginTooltip()) {
+            zgui.textColored(t.text.mid, "open this event in EVT", .{});
+            zgui.endTooltip();
+        }
+    }
 
     if (open) {
         dash.textWrappedColored(t.text.mid, "{s}", .{e.cmdline.slice()});

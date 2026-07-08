@@ -31,7 +31,7 @@ pub fn render(d: *Dashboard) void {
         zgui.setKeyboardFocusHere(0);
     }
     zgui.setNextItemWidth(200);
-    _ = zgui.inputTextWithHint("##rul_filter", .{ .hint = "filter name/code (Ctrl+F)", .buf = &d.rul_filter_buf });
+    _ = zgui.inputTextWithHint("##rul_filter", .{ .hint = "filter (Ctrl+F)", .buf = &d.rul_filter_buf });
     if (d.rul_technique_filter) |tid| {
         const tech = domain.attack.get(tid);
         zgui.sameLine(.{ .spacing = 10 });
@@ -41,7 +41,53 @@ pub fn render(d: *Dashboard) void {
     }
 
     const filter = std.mem.sliceTo(&d.rul_filter_buf, 0);
-    var shown: usize = 0;
+
+    // ── Visible rows (indices into rules.items) ─────────────────────────
+    var rows: [512]u16 = undefined;
+    var m: usize = 0;
+    for (s.rules.items, 0..) |*r, i| {
+        if (m >= rows.len) break;
+        if (filter.len > 0 and
+            std.ascii.indexOfIgnoreCase(r.name.slice(), filter) == null and
+            std.ascii.indexOfIgnoreCase(r.code.slice(), filter) == null) continue;
+        if (d.rul_technique_filter) |tid| {
+            if (r.technique != tid) continue;
+        }
+        rows[m] = @intCast(i);
+        m += 1;
+    }
+
+    // ── Keyboard: ↑↓ row selection, Enter toggles the detail pane ───────
+    {
+        var sel_pos: ?usize = null;
+        if (d.rul_sel) |sid| {
+            for (rows[0..m], 0..) |ri, p| {
+                if (s.rules.items[ri].id == sid) {
+                    sel_pos = p;
+                    break;
+                }
+            }
+        }
+        const win_focused = zgui.isWindowFocused(.{ .root_window = true, .child_windows = true });
+        if (win_focused and !zgui.io.getWantTextInput() and m > 0) {
+            if (zgui.isKeyPressed(.down_arrow, true)) {
+                const p = if (sel_pos) |p| @min(p + 1, m - 1) else 0;
+                d.rul_sel = s.rules.items[rows[p]].id;
+            }
+            if (zgui.isKeyPressed(.up_arrow, true)) {
+                const p = if (sel_pos) |p| p -| 1 else 0;
+                d.rul_sel = s.rules.items[rows[p]].id;
+            }
+            if (zgui.isKeyPressed(.enter, false)) {
+                d.rul_sel = if (d.rul_sel != null) null else s.rules.items[rows[0]].id;
+            }
+            // Esc disarms a pending disable confirm (never confirms).
+            if (zgui.isKeyPressed(.escape, false) and disable_pending != null) {
+                disable_pending = null;
+                disable_dwell.reset();
+            }
+        }
+    }
 
     const avail = zgui.getContentRegionAvail();
     const detail_h: f32 = if (d.rul_sel != null) 120 else 0;
@@ -59,14 +105,8 @@ pub fn render(d: *Dashboard) void {
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
-        for (s.rules.items) |*r| {
-            if (filter.len > 0 and
-                std.ascii.indexOfIgnoreCase(r.name.slice(), filter) == null and
-                std.ascii.indexOfIgnoreCase(r.code.slice(), filter) == null) continue;
-            if (d.rul_technique_filter) |tid| {
-                if (r.technique != tid) continue;
-            }
-            shown += 1;
+        for (rows[0..m]) |ri| {
+            const r = &s.rules.items[ri];
             zgui.tableNextRow(.{});
             const selected = d.rul_sel != null and d.rul_sel.? == r.id;
             if (selected) {
@@ -157,5 +197,12 @@ pub fn render(d: *Dashboard) void {
         }
     }
     zgui.sameLine(.{ .spacing = 14 });
-    zgui.textColored(t.text.mid, "fires 7d: {d} \u{00B7} FP: {d} ({d:.0}%)", .{ r.fires_7d, r.fp_7d, r.fpRate() * 100 });
+    var lf: [16]u8 = undefined;
+    const last_fire: []const u8 = if (r.last_fire_ms > 0)
+        ui.fmt.age(&lf, @divFloor(dash.unixNowMs() - r.last_fire_ms, 1000))
+    else
+        "never";
+    zgui.textColored(t.text.mid, "fires 7d: {d} \u{00B7} FP: {d} ({d:.0}%) \u{00B7} last fired {s}{s}", .{
+        r.fires_7d, r.fp_7d, r.fpRate() * 100, last_fire, if (r.last_fire_ms > 0) " ago" else "",
+    });
 }
