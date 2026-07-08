@@ -35,8 +35,12 @@ pub const SYSTEM_PROMPT =
     \\
     \\You have READ-ONLY tools:
     \\  - Dashboard tools (get_alerts, get_alert_detail, get_cases, get_iocs, get_rules,
-    \\    get_yara_rules, search_events, get_attack_coverage, get_sensor_health) read the
-    \\    live in-app data. Prefer them over guessing; cite concrete ids/values.
+    \\    get_yara_rules, search_events, get_attack_coverage, get_sensor_health,
+    \\    get_enrichment, get_pipelines, get_data_sources, get_feeds, get_threat_actors,
+    \\    get_jobs, get_audit_trail) read the live in-app data. Prefer them over
+    \\    guessing; cite concrete ids/values. get_enrichment returns the full stored
+    \\    verdict/hosting/pivot detail for one IOC; get_yara_rules with
+    \\    include_content=true returns rule bodies for review.
     \\  - Threat-intel tools (ti_lookup_hash, ti_lookup_domain, ti_lookup_ip,
     \\    ti_scan_url, ti_get_url_result, ti_search_urlscan) query VirusTotal and
     \\    urlscan.io through an MCP server, when configured.
@@ -57,15 +61,30 @@ pub const SYSTEM_PROMPT =
     \\match).
 ;
 
-/// Resolve the MCP argv from config (splits TD_MCP_CMD on spaces into `buf`).
+/// Resolve the MCP argv from config. TD_MCP_CMD splits on spaces, with
+/// double-quoted tokens kept whole so Windows paths with spaces work:
+///   TD_MCP_CMD="C:\Program Files\Python\python.exe" -m threatintel_mcp
 pub fn resolveMcpArgv(cfg: Config, buf: *[16][]const u8) []const []const u8 {
     const cmd = cfg.mcp_cmd orelse return &default_mcp_argv;
     var n: usize = 0;
-    var it = std.mem.tokenizeScalar(u8, cmd, ' ');
-    while (it.next()) |tok| {
-        if (n >= buf.len) break;
-        buf[n] = tok;
-        n += 1;
+    var i: usize = 0;
+    while (i < cmd.len and n < buf.len) {
+        while (i < cmd.len and cmd[i] == ' ') i += 1;
+        if (i >= cmd.len) break;
+        if (cmd[i] == '"') {
+            const start = i + 1;
+            const end = std.mem.indexOfScalarPos(u8, cmd, start, '"') orelse cmd.len;
+            if (end > start) {
+                buf[n] = cmd[start..end];
+                n += 1;
+            }
+            i = @min(end + 1, cmd.len);
+        } else {
+            const start = i;
+            while (i < cmd.len and cmd[i] != ' ') i += 1;
+            buf[n] = cmd[start..i];
+            n += 1;
+        }
     }
     if (n == 0) return &default_mcp_argv;
     return buf[0..n];
@@ -77,11 +96,11 @@ pub fn resolveMcpArgv(cfg: Config, buf: *[16][]const u8) []const []const u8 {
 pub fn selfTest(gpa: std.mem.Allocator, store: *data.Store) !void {
     // 1) Native tools produce valid JSON for the live world.
     for (tools.native_tools) |tool| {
-        const out = try tools.execute(gpa, store, tool.name, "{}");
+        const out = try tools.execute(gpa, store, .{}, tool.name, "{}");
         defer gpa.free(out);
         if (!(std.json.validate(gpa, out) catch false)) return error.ToolJsonInvalid;
     }
-    if (tools.execute(gpa, store, "does_not_exist", "{}")) |_| {
+    if (tools.execute(gpa, store, .{}, "does_not_exist", "{}")) |_| {
         return error.UnknownToolNotRejected;
     } else |err| if (err != error.UnknownTool) return err;
 
@@ -117,13 +136,16 @@ pub fn selfTest(gpa: std.mem.Allocator, store: *data.Store) !void {
     }
 }
 
-test "resolveMcpArgv default + override" {
+test "resolveMcpArgv default + override + quoted paths" {
     var buf: [16][]const u8 = undefined;
     const def = resolveMcpArgv(.{}, &buf);
     try std.testing.expectEqual(@as(usize, 3), def.len);
     const ovr = resolveMcpArgv(.{ .mcp_cmd = "python -m threatintel_mcp.server" }, &buf);
     try std.testing.expectEqual(@as(usize, 3), ovr.len);
     try std.testing.expectEqualStrings("python", ovr[0]);
+    const quoted = resolveMcpArgv(.{ .mcp_cmd = "\"C:\\Program Files\\Python\\python.exe\" -m server" }, &buf);
+    try std.testing.expectEqual(@as(usize, 3), quoted.len);
+    try std.testing.expectEqualStrings("C:\\Program Files\\Python\\python.exe", quoted[0]);
 }
 
 test "ai selfTest passes offline" {

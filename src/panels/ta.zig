@@ -42,9 +42,16 @@ pub fn render(d: *Dashboard) void {
         zgui.spacing();
 
         zgui.textColored(t.text.lo, "techniques (click \u{2192} ATK):", .{});
+        const chip_pad = zgui.getStyle().frame_padding[0] * 2;
         for (a.techniques[0..a.technique_count], 0..) |tid, i| {
             const tech = domain.attack.get(tid);
-            if (i % 4 != 0) zgui.sameLine(.{ .spacing = 6 });
+            // Wrap by measured width, not count — chips must never clip at
+            // the panel edge however narrow the dock slot is.
+            if (i != 0) {
+                zgui.sameLine(.{ .spacing = 6 });
+                const chip_w = zgui.calcTextSize(tech.id, .{})[0] + chip_pad;
+                if (zgui.getContentRegionAvail()[0] < chip_w) zgui.newLine();
+            }
             var cb: [32]u8 = undefined;
             const chip = std.fmt.bufPrintZ(&cb, "{s}##tat{d}", .{ tech.id, i }) catch continue;
             const covered = s.coverageForTechnique(tid) == 2;

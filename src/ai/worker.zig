@@ -27,6 +27,9 @@ pub const McpState = enum { off, starting, ready, failed };
 pub const UiToWorker = union(enum) {
     user_message: struct { text: []u8, context: ?[]u8 },
     tool_reply: struct { id: u32, json: []u8, is_error: bool },
+    /// Drop the conversation history (panel "clear" button) — the context
+    /// window and token cost start fresh.
+    reset,
     cancel,
     shutdown,
 };
@@ -153,6 +156,13 @@ pub const Worker = struct {
         self.inbox.push(self.io, self.gpa, .cancel) catch {};
     }
 
+    /// Clear the conversation history (render thread). No-op until the
+    /// worker thread exists — there is no history before the first send.
+    pub fn reset(self: *Worker) void {
+        if (!self.started) return;
+        self.inbox.push(self.io, self.gpa, .reset) catch {};
+    }
+
     pub fn replyToolQuery(self: *Worker, id: u32, json: []const u8, is_error: bool) void {
         const j = self.gpa.dupe(u8, json) catch return;
         self.inbox.push(self.io, self.gpa, .{ .tool_reply = .{ .id = id, .json = j, .is_error = is_error } }) catch {};
@@ -192,6 +202,11 @@ pub const Worker = struct {
             switch (msg) {
                 .shutdown => return,
                 .cancel => {},
+                .reset => {
+                    for (self.convo.items) |t| self.gpa.free(t.content_json);
+                    self.convo.clearRetainingCapacity();
+                    self.pushStatus("conversation cleared");
+                },
                 .tool_reply => |tr| self.gpa.free(tr.json),
                 .user_message => |um| {
                     self.handleUserMessage(um.text, um.context);
@@ -203,6 +218,9 @@ pub const Worker = struct {
     }
 
     fn handleUserMessage(self: *Worker, text: []const u8, context: ?[]const u8) void {
+        // Whatever path exits this function, the panel must unfreeze —
+        // a missed idle leaves the input gated forever.
+        defer self.pushOut(.idle);
         const user_content = anthropic.buildUserContent(self.gpa, text, context) catch return;
         self.convo.append(self.gpa, .{ .role = .user, .content_json = user_content }) catch return;
 
@@ -254,6 +272,9 @@ pub const Worker = struct {
             };
 
             if (parsed.stop_reason != .tool_use or parsed.tool_uses.len == 0) {
+                if (parsed.stop_reason == .max_tokens) {
+                    self.pushErr("response truncated at the token cap \u{2014} ask a follow-up to continue", .{});
+                }
                 self.pushOut(.{ .turn_done = .{ .input_tokens = parsed.input_tokens, .output_tokens = parsed.output_tokens } });
                 break;
             }
@@ -280,7 +301,11 @@ pub const Worker = struct {
                 break;
             };
         }
-        self.pushOut(.idle);
+        // Falling out of the loop (not break) = the model was still asking
+        // for tools at the cap — say so instead of going silent.
+        if (iter == MAX_ITERS) {
+            self.pushErr("tool-iteration limit ({d}) reached \u{2014} ask a follow-up to continue the investigation", .{MAX_ITERS});
+        }
     }
 
     const ToolText = struct { text: []u8, is_error: bool };
@@ -301,8 +326,15 @@ pub const Worker = struct {
             const bare = name[3..];
             if (self.mcp_client) |*m| {
                 const cr = m.callTool(self.gpa, bare, input_json) catch |err| {
-                    const msg = try std.fmt.allocPrint(self.gpa, "MCP call failed: {s}", .{@errorName(err)});
+                    // A transport-level failure means the child is gone —
+                    // degrade for real: flip the LED, stop advertising its
+                    // tools, and reap the process instead of burning every
+                    // remaining iteration on repeated dead calls.
+                    const msg = try std.fmt.allocPrint(self.gpa, "MCP call failed: {s} \u{2014} threat-intel tools disabled for this session", .{@errorName(err)});
                     self.emitToolDone(name, msg, true);
+                    m.deinit();
+                    self.mcp_client = null;
+                    self.pushOut(.{ .mcp_state = .failed });
                     return .{ .text = msg, .is_error = true };
                 };
                 self.emitToolDone(name, cr.text, cr.is_error);
@@ -338,6 +370,7 @@ pub const Worker = struct {
                     self.gpa.free(tr.json);
                 },
                 .cancel => break,
+                .reset => {},
                 .shutdown => {
                     self.inbox.push(self.io, self.gpa, .shutdown) catch {};
                     break;
@@ -398,7 +431,7 @@ pub fn freeInbox(gpa: Allocator, m: UiToWorker) void {
             if (um.context) |c| gpa.free(c);
         },
         .tool_reply => |tr| gpa.free(tr.json),
-        .cancel, .shutdown => {},
+        .reset, .cancel, .shutdown => {},
     }
 }
 

@@ -25,6 +25,16 @@ pub fn render(d: *Dashboard) void {
 
     // ── Config-needed state ──────────────────────────────────────────────
     if ((!a.cfg.configured() or a.worker == null) and !a.tour_demo) {
+        zgui.pushTextWrapPos(0);
+        defer zgui.popTextWrapPos();
+        if (a.cfg.configured()) {
+            // Key IS set but the worker failed to allocate — saying "set
+            // the key" here would send the user chasing the wrong problem.
+            zgui.textColored(t.sev.crit, "{s} AI worker failed to start", .{ui.fonts.fa.triangle_exclamation});
+            zgui.spacing();
+            zgui.textWrapped("ANTHROPIC_API_KEY is set, but the assistant worker could not be created (out of memory?). Restart the app to retry.", .{});
+            return;
+        }
         zgui.textColored(t.sev.warn, "{s} AI assistant not configured", .{ui.fonts.fa.circle_info});
         zgui.spacing();
         zgui.textWrapped("Set the ANTHROPIC_API_KEY environment variable and restart the app to enable the assistant.", .{});
@@ -64,6 +74,22 @@ pub fn render(d: *Dashboard) void {
         if (zgui.smallButton("Stop##ai")) {
             if (a.worker) |w| w.cancel();
         }
+    } else if (a.transcript.items.len > 0) {
+        zgui.sameLine(.{ .spacing = 12 });
+        if (zgui.smallButton("Clear##ai")) {
+            if (a.worker) |w| w.reset();
+            for (a.transcript.items) |*item| d.allocator.free(item.text);
+            a.transcript.clearRetainingCapacity();
+            a.last_in_tokens = 0;
+            a.last_out_tokens = 0;
+            ui.events.post(.info, "ai", "conversation cleared", .{});
+        }
+        if (zgui.isItemHovered(.{})) {
+            if (zgui.beginTooltip()) {
+                zgui.textColored(t.text.mid, "start a fresh conversation (drops the accumulated context + token cost)", .{});
+                zgui.endTooltip();
+            }
+        }
     }
     zgui.separator();
 
@@ -75,8 +101,10 @@ pub fn render(d: *Dashboard) void {
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = t.bg.sunken });
     if (zgui.beginChild("##ai_transcript", .{ .w = avail[0], .h = @max(80, avail[1] - input_h) })) {
         if (a.transcript.items.len == 0) {
+            zgui.pushTextWrapPos(0);
             zgui.textColored(t.text.lo, "Ask about alerts, hunt across telemetry, review rules, or enrich an indicator.", .{});
             zgui.textColored(t.text.lo, "Threat-intel results are untrusted external data; the assistant is read-only.", .{});
+            zgui.popTextWrapPos();
         }
         for (a.transcript.items, 0..) |*it, i| {
             renderItem(d, it, i);
@@ -126,9 +154,17 @@ pub fn render(d: *Dashboard) void {
     }
 }
 
+fn copyText(d: *Dashboard, text: []const u8) void {
+    // Clipboard needs a sentinel — dupe through the frame allocator-less
+    // path with a stack cap for typical replies, heap for long ones.
+    const z = d.allocator.dupeZ(u8, text) catch return;
+    defer d.allocator.free(z);
+    zgui.setClipboardText(z);
+    ui.events.post(.ok, "ai", "reply copied to clipboard", .{});
+}
+
 fn renderItem(d: *Dashboard, it: *dash.ChatItem, idx: usize) void {
     const t = ui.theme.default;
-    _ = d;
     switch (it.kind) {
         .user => {
             zgui.textColored(t.accent, "you", .{});
@@ -136,6 +172,12 @@ fn renderItem(d: *Dashboard, it: *dash.ChatItem, idx: usize) void {
         },
         .assistant => {
             zgui.textColored(t.identity.intel, "claude", .{});
+            zgui.sameLine(.{ .spacing = 8 });
+            var cb: [24]u8 = undefined;
+            const cl = std.fmt.bufPrintZ(&cb, "copy##aicp{d}", .{idx}) catch "copy";
+            zgui.pushStyleColor4f(.{ .idx = .text, .c = t.text.lo });
+            if (zgui.smallButton(cl)) copyText(d, it.text);
+            zgui.popStyleColor(.{ .count = 1 });
             zgui.textWrapped("{s}", .{it.text});
         },
         .tool_call => {
@@ -169,7 +211,9 @@ fn renderItem(d: *Dashboard, it: *dash.ChatItem, idx: usize) void {
             }
         },
         .err => {
+            zgui.pushTextWrapPos(0);
             zgui.textColored(t.sev.crit, "{s} {s}", .{ ui.fonts.fa.triangle_exclamation, it.text });
+            zgui.popTextWrapPos();
         },
     }
     zgui.spacing();

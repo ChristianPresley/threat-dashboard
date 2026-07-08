@@ -11,6 +11,18 @@ const Dashboard = dash.Dashboard;
 var status_dwell: ui.confirm.Dwell = .{};
 var pending_status: ?domain.CaseStatus = null;
 
+/// Seed the meta editor's buffers from a case and enter edit mode.
+fn startMetaEdit(d: *Dashboard, c: *const domain.Case) void {
+    @memset(&d.cas_title_buf, 0);
+    const tn = @min(c.title.len, d.cas_title_buf.len - 1);
+    @memcpy(d.cas_title_buf[0..tn], c.title.slice()[0..tn]);
+    @memset(&d.cas_assignee_buf, 0);
+    const an = @min(c.assignee.len, d.cas_assignee_buf.len - 1);
+    @memcpy(d.cas_assignee_buf[0..an], c.assignee.slice()[0..an]);
+    d.cas_meta_sev = c.severity;
+    d.cas_meta_edit = c.id;
+}
+
 fn caseStatusColor(st: domain.CaseStatus) [4]f32 {
     const t = ui.theme.default.sev;
     return switch (st) {
@@ -26,18 +38,78 @@ pub fn render(d: *Dashboard) void {
     const t = ui.theme.default;
     const s = &d.store;
 
+    // ── Header: counts + case creation ───────────────────────────────────
+    zgui.textColored(t.text.lo, "{d} cases \u{00B7} {d} open", .{ s.cases.items.len, s.openCaseCount() });
+    zgui.sameLine(.{ .spacing = 12 });
+    if (zgui.smallButton("+ new case##cas")) {
+        const now = dash.unixNowMs();
+        if (s.addCase(.{
+            .id = 0,
+            .title = domain.FixedStr(96).from("Untitled case"),
+            .severity = .medium,
+            .status = .open,
+            .assignee = domain.FixedStr(24).from("cpresley"),
+            .opened_ms = now,
+            .updated_ms = now,
+        })) |cid| {
+            d.cas_sel = cid;
+            // Drop straight into the meta editor so it gets a real title.
+            startMetaEdit(d, s.caseById(cid).?);
+            ui.events.post(.ok, "cases", "case #{d} opened", .{cid});
+        }
+    }
+
+    // ── Keyboard: ↑↓ row selection, Enter toggles detail, Esc disarms ───
+    {
+        const n = s.cases.items.len;
+        var sel_pos: ?usize = null;
+        if (d.cas_sel) |sid| {
+            for (s.cases.items, 0..) |*c, p| {
+                if (c.id == sid) {
+                    sel_pos = p;
+                    break;
+                }
+            }
+        }
+        const win_focused = zgui.isWindowFocused(.{ .root_window = true, .child_windows = true });
+        if (win_focused and !zgui.io.getWantTextInput() and n > 0) {
+            if (zgui.isKeyPressed(.down_arrow, true)) {
+                const p = if (sel_pos) |p| @min(p + 1, n - 1) else 0;
+                d.cas_sel = s.cases.items[p].id;
+            }
+            if (zgui.isKeyPressed(.up_arrow, true)) {
+                const p = if (sel_pos) |p| p -| 1 else 0;
+                d.cas_sel = s.cases.items[p].id;
+            }
+            if (zgui.isKeyPressed(.enter, false)) {
+                d.cas_sel = if (d.cas_sel != null) null else s.cases.items[0].id;
+            }
+            // Esc disarms a pending status confirm (never confirms).
+            if (zgui.isKeyPressed(.escape, false) and pending_status != null) {
+                pending_status = null;
+                status_dwell.reset();
+            }
+        }
+    }
+
     const avail = zgui.getContentRegionAvail();
     const detail_h: f32 = if (d.cas_sel != null) @max(150, avail[1] * 0.42) else 0;
     const table_h = @max(80, avail[1] - detail_h);
 
-    const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };
-    if (zgui.beginTable("##cas_table", .{ .column = 6, .flags = flags, .outer_size = .{ avail[0], table_h } })) {
-        zgui.tableSetupColumn("#", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 30 });
-        zgui.tableSetupColumn("Sev", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 46 });
-        zgui.tableSetupColumn("Status", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 88 });
-        zgui.tableSetupColumn("Title", .{ .flags = .{ .width_stretch = true } });
-        zgui.tableSetupColumn("Assignee", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 84 });
-        zgui.tableSetupColumn("Updated", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 70 });
+    // Width-planned columns: Title is the payload; in narrow docks drop
+    // Assignee, then Updated, then Status rather than crushing the Title.
+    const cols = [_]ui.table.Col{
+        .{ .name = "#", .w = 30 },
+        .{ .name = "Sev", .w = 46 },
+        .{ .name = "Status", .w = 88, .prio = 1 },
+        .{ .name = "Title" },
+        .{ .name = "Assignee", .w = 84, .prio = 3 },
+        .{ .name = "Updated", .w = 70, .prio = 2 },
+    };
+    const pl = ui.table.plan(&cols, avail[0], 150);
+    const flags = zgui.TableFlags{ .resizable = true, .no_saved_settings = true, .borders = .{ .inner_h = true }, .scroll_y = true };
+    if (zgui.beginTable("##cas_table", .{ .column = pl.count, .flags = flags, .outer_size = .{ avail[0], table_h } })) {
+        ui.table.setup(&cols, &pl);
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
@@ -64,16 +136,22 @@ pub fn render(d: *Dashboard) void {
 
             _ = zgui.tableNextColumn();
             zgui.textColored(dash.sevColor(c.severity), "{s}", .{c.severity.label()});
-            _ = zgui.tableNextColumn();
-            zgui.textColored(caseStatusColor(c.status), "{s}", .{c.status.label()});
+            if (pl.on(2)) {
+                _ = zgui.tableNextColumn();
+                zgui.textColored(caseStatusColor(c.status), "{s}", .{c.status.label()});
+            }
             _ = zgui.tableNextColumn();
             zgui.textUnformattedColored(if (dim) t.text.lo else t.text.hi, c.title.slice());
-            _ = zgui.tableNextColumn();
-            zgui.textUnformattedColored(t.text.mid, if (c.assignee.len > 0) c.assignee.slice() else "\u{2014}");
-            _ = zgui.tableNextColumn();
-            var ab: [16]u8 = undefined;
-            const age_s = @divFloor(dash.unixNowMs() - c.updated_ms, 1000);
-            zgui.textColored(t.text.lo, "{s}", .{ui.fmt.age(&ab, age_s)});
+            if (pl.on(4)) {
+                _ = zgui.tableNextColumn();
+                zgui.textUnformattedColored(t.text.mid, if (c.assignee.len > 0) c.assignee.slice() else "\u{2014}");
+            }
+            if (pl.on(5)) {
+                _ = zgui.tableNextColumn();
+                var ab: [16]u8 = undefined;
+                const age_s = @divFloor(dash.unixNowMs() - c.updated_ms, 1000);
+                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.age(&ab, age_s)});
+            }
         }
         zgui.endTable();
     }
@@ -86,13 +164,47 @@ pub fn render(d: *Dashboard) void {
     };
 
     zgui.separator();
-    zgui.pushFont(ui.fonts.mono_medium, ui.fonts.size.title);
-    zgui.textUnformatted(c.title.slice());
-    zgui.popFont();
-    zgui.sameLine(.{ .spacing = 10 });
-    zgui.textColored(caseStatusColor(c.status), "{s}", .{c.status.label()});
-    zgui.sameLine(.{ .spacing = 10 });
-    zgui.textColored(t.text.mid, "assignee: {s}", .{if (c.assignee.len > 0) c.assignee.slice() else "\u{2014}"});
+    if (d.cas_meta_edit != null and d.cas_meta_edit.? == c.id) {
+        // ── Meta editor: title / severity / assignee ─────────────────────
+        zgui.setNextItemWidth(280);
+        _ = zgui.inputTextWithHint("##cas_title", .{ .hint = "case title", .buf = &d.cas_title_buf });
+        zgui.sameLine(.{ .spacing = 8 });
+        zgui.setNextItemWidth(90);
+        if (zgui.beginCombo("##cas_sev", .{ .preview_value = d.cas_meta_sev.label() })) {
+            const sevs = [_]domain.Severity{ .info, .low, .medium, .high, .critical };
+            inline for (sevs, 0..) |sv, svi| {
+                var ib: [24]u8 = undefined;
+                const il = std.fmt.bufPrintZ(&ib, "{s}##cassev{d}", .{ sv.label(), svi }) catch "sev";
+                if (zgui.selectable(il, .{ .selected = d.cas_meta_sev == sv })) d.cas_meta_sev = sv;
+            }
+            zgui.endCombo();
+        }
+        zgui.sameLine(.{ .spacing = 8 });
+        zgui.setNextItemWidth(110);
+        _ = zgui.inputTextWithHint("##cas_assignee", .{ .hint = "assignee", .buf = &d.cas_assignee_buf });
+        zgui.sameLine(.{ .spacing = 8 });
+        if (zgui.smallButton("Save##casmeta")) {
+            const title = std.mem.sliceTo(&d.cas_title_buf, 0);
+            _ = s.updateCaseMeta(c.id, if (title.len > 0) title else "Untitled case", d.cas_meta_sev, std.mem.sliceTo(&d.cas_assignee_buf, 0), dash.unixNowMs());
+            ui.events.post(.ok, "cases", "case #{d} updated", .{c.id});
+            d.cas_meta_edit = null;
+        }
+        zgui.sameLine(.{ .spacing = 6 });
+        if (zgui.smallButton("Cancel##casmeta")) d.cas_meta_edit = null;
+    } else {
+        zgui.pushFont(ui.fonts.mono_medium, ui.fonts.size.title);
+        zgui.textUnformatted(c.title.slice());
+        zgui.popFont();
+        zgui.sameLine(.{ .spacing = 10 });
+        zgui.textColored(caseStatusColor(c.status), "{s}", .{c.status.label()});
+        zgui.sameLine(.{ .spacing = 10 });
+        zgui.textColored(t.text.mid, "assignee: {s}", .{if (c.assignee.len > 0) c.assignee.slice() else "\u{2014}"});
+        zgui.sameLine(.{ .spacing = 10 });
+        var ob: [16]u8 = undefined;
+        zgui.textColored(t.text.lo, "opened {s} ago", .{ui.fmt.age(&ob, @divFloor(dash.unixNowMs() - c.opened_ms, 1000))});
+        zgui.sameLine(.{ .spacing = 10 });
+        if (zgui.smallButton("Edit##casmeta")) startMetaEdit(d, c);
+    }
 
     // Status transition with T1 dwell: pick target, confirm arms, fire.
     {
@@ -130,18 +242,35 @@ pub fn render(d: *Dashboard) void {
         }
     }
 
-    // Linked alerts.
+    // Linked alerts: click opens in ALQ; ✕ unlinks (through the Store so
+    // the detach persists and audits).
     zgui.spacing();
     zgui.textColored(t.text.mid, "linked alerts ({d}):", .{c.alert_count});
+    var unlink: ?u32 = null;
     for (c.alert_ids[0..c.alert_count]) |aid| {
         const a = s.alertById(aid) orelse continue;
-        zgui.textColored(dash.sevColor(a.severity), "  {s}", .{a.severity.label()});
+        var xb: [24]u8 = undefined;
+        const xl = std.fmt.bufPrintZ(&xb, "{s}##casunl{d}", .{ ui.fonts.fa.xmark, aid }) catch "x";
+        if (zgui.smallButton(xl)) unlink = aid;
+        if (zgui.isItemHovered(.{})) {
+            if (zgui.beginTooltip()) {
+                zgui.textColored(t.text.mid, "remove alert #{d} from this case", .{aid});
+                zgui.endTooltip();
+            }
+        }
+        zgui.sameLine(.{ .spacing = 8 });
+        zgui.textColored(dash.sevColor(a.severity), "{s}", .{a.severity.label()});
         zgui.sameLine(.{ .spacing = 8 });
         var lb: [140]u8 = undefined;
         const ll = std.fmt.bufPrintZ(&lb, "{s} \u{00B7} {s}##casal{d}", .{ a.title.slice(), a.entity.slice(), aid }) catch continue;
         if (zgui.selectable(ll, .{})) {
             d.alq_sel = aid;
             d.focusPanel(dash.PANEL_ALQ);
+        }
+    }
+    if (unlink) |aid| {
+        if (s.unassignAlertFromCase(aid, dash.unixNowMs())) {
+            ui.events.post(.info, "cases", "alert #{d} removed from case #{d}", .{ aid, c.id });
         }
     }
 

@@ -133,8 +133,10 @@ pub const Provider = struct {
             }
         }
         {
-            // Cap: newest 10k indicators (v1 OOM guard).
-            var res = try self.pool.query("select id, type, value, confidence, feed, first_seen_ms, last_seen_ms, hits from iocs order by last_seen_ms desc limit 10000", .{});
+            // Cap: newest 10k indicators (v1 OOM guard), re-sorted ascending
+            // so iocById's binary search over id order holds (same shape as
+            // the events load below).
+            var res = try self.pool.query("select id, type, value, confidence, feed, first_seen_ms, last_seen_ms, hits from (select * from iocs order by last_seen_ms desc limit 10000) sub order by id asc", .{});
             defer res.deinit();
             while (try res.next()) |row| {
                 try s.iocs.append(alloc, .{
@@ -429,13 +431,58 @@ pub const Provider = struct {
                 .{ @as(i16, @intFromEnum(v.status)), v.now_ms, @as(i16, @intCast(v.id)) },
             ),
             .case_assign => |v| blk: {
+                // Mirror Store.assignAlertToCase exactly, including the
+                // implicit new → investigating flip — otherwise the next
+                // snapshot reverts the alert to NEW while still cased.
                 _ = try self.pool.exec(
-                    "update alerts set case_id = $1 where id = $2",
-                    .{ @as(i16, @intCast(v.case_id)), @as(i32, @intCast(v.alert_id)) },
+                    "update alerts set case_id = $1, status = case when status = $2 then $3 else status end where id = $4",
+                    .{ @as(i16, @intCast(v.case_id)), @as(i16, @intFromEnum(domain.AlertStatus.new)), @as(i16, @intFromEnum(domain.AlertStatus.investigating)), @as(i32, @intCast(v.alert_id)) },
                 );
                 break :blk try self.pool.exec(
                     "update cases set alert_ids = trim(both ',' from alert_ids || ',' || $1), updated_ms = $2 where id = $3",
                     .{ v.alert_id, v.now_ms, @as(i16, @intCast(v.case_id)) },
+                );
+            },
+            .case_unassign => |v| blk: {
+                _ = try self.pool.exec(
+                    "update alerts set case_id = null, status = case when status = $1 then $2 else status end where id = $3",
+                    .{ @as(i16, @intFromEnum(domain.AlertStatus.investigating)), @as(i16, @intFromEnum(domain.AlertStatus.new)), @as(i32, @intCast(v.alert_id)) },
+                );
+                // Strip the alert id from the case's CSV (head, middle, tail,
+                // and only-entry positions) by rebuilding through arrays.
+                break :blk try self.pool.exec(
+                    "update cases set alert_ids = array_to_string(array_remove(string_to_array(alert_ids, ','), $1::text), ','), updated_ms = $2 where id = $3",
+                    .{ v.alert_id, v.now_ms, @as(i16, @intCast(v.case_id)) },
+                );
+            },
+            .case_add => |v| try self.insertCaseRow(&v.c),
+            .case_update => |v| try self.pool.exec(
+                "update cases set title=$1, severity=$2, assignee=$3, updated_ms=$4 where id=$5",
+                .{ v.title.slice(), @as(i16, @intFromEnum(v.severity)), v.assignee.slice(), v.now_ms, @as(i16, @intCast(v.id)) },
+            ),
+            .feed_status => |v| try self.pool.exec(
+                "update feeds set status=$1, last_sync_ms=$2 where id=$3",
+                .{ @as(i16, @intFromEnum(v.status)), v.last_sync_ms, @as(i16, @intCast(v.id)) },
+            ),
+            .rule_fp => |v| try self.pool.exec(
+                "update rules set fp_7d=$1 where id=$2",
+                .{ @as(i32, @intCast(v.fp_7d)), @as(i16, @intCast(v.id)) },
+            ),
+            .retention_prune => |v| blk: {
+                // Mirror Store.pruneRetention: drop completed runs beyond
+                // keep_runs per pipeline, resolved dead letters older than
+                // the cutoff, and audit rows beyond the app-side cap.
+                _ = try self.pool.exec(
+                    "delete from pipeline_runs where id in (select id from (select id, row_number() over (partition by pipeline order by started_ms desc, id desc) rn from pipeline_runs where status <> $1) t where rn > $2)",
+                    .{ @as(i16, @intFromEnum(domain.RunStatus.running)), @as(i64, @intCast(v.keep_runs)) },
+                );
+                _ = try self.pool.exec(
+                    "delete from dead_letters where state <> $1 and ts_ms < $2",
+                    .{ @as(i16, @intFromEnum(domain.DlqState.open)), v.dlq_before_ms },
+                );
+                break :blk try self.pool.exec(
+                    "delete from audit_log where id not in (select id from audit_log order by id desc limit 512)",
+                    .{},
                 );
             },
             .yara_status => |v| try self.pool.exec(
@@ -452,8 +499,8 @@ pub const Provider = struct {
                 .{ @as(i32, @intCast(v.id)), @as(i32, @intCast(v.ioc_id)), @as(i16, @intFromEnum(domain.ScanState.pending)), v.now_ms },
             ),
             .urlscan_update => |v| try self.pool.exec(
-                "update urlscan_scans set state=$1, completed_ms=$2 where id=$3",
-                .{ @as(i16, @intFromEnum(v.state)), v.now_ms, @as(i32, @intCast(v.id)) },
+                "update urlscan_scans set state=$1, completed_ms=$2, err=$3 where id=$4",
+                .{ @as(i16, @intFromEnum(v.state)), v.now_ms, v.err.slice(), @as(i32, @intCast(v.id)) },
             ),
             .case_notes => |v| try self.pool.exec(
                 "update cases set notes=$1, updated_ms=$2 where id=$3",
@@ -468,15 +515,32 @@ pub const Provider = struct {
                 .{ @as(i16, @intFromEnum(v.status)), @as(i16, @intCast(v.id)) },
             ),
             .pipeline_add => |v| try self.insertPipelineRow(&v.p),
-            .pipeline_run_add => |v| try self.insertPipelineRunRow(&v.run),
+            .pipeline_run_add => |v| blk: {
+                _ = try self.insertPipelineRunRow(&v.run);
+                // Mirror Store.addPipelineRun's last_run_ms stamp — without
+                // it a restart mid-run regresses the stamp and the
+                // scheduler re-fires the pipeline immediately.
+                break :blk try self.pool.exec(
+                    "update pipelines set last_run_ms = greatest(last_run_ms, $1) where id = $2",
+                    .{ v.run.started_ms, @as(i16, @intCast(v.run.pipeline)) },
+                );
+            },
             .pipeline_run_update => |v| blk: {
                 _ = try self.pool.exec(
                     "update pipeline_runs set duration_ms=$1, rows_in=$2, rows_out=$3, rows_rejected=$4, status=$5, tests_passed=$6, tests_failed=$7, err=$8, watermark_ms=$9 where id=$10",
                     .{ v.run.duration_ms, @as(i64, @intCast(v.run.rows_in)), @as(i64, @intCast(v.run.rows_out)), @as(i64, @intCast(v.run.rows_rejected)), @as(i16, @intFromEnum(v.run.status)), @as(i16, @intCast(v.run.tests_passed)), @as(i16, @intCast(v.run.tests_failed)), v.run.err.slice(), v.run.watermark_ms, @as(i32, @intCast(v.run.id)) },
                 );
+                // Watermark advances only on success/partial — mirror
+                // Store.updatePipelineRun (a failed run must not move it).
+                if (v.run.status == .success or v.run.status == .partial) {
+                    break :blk try self.pool.exec(
+                        "update pipelines set last_run_ms = greatest(last_run_ms, $1), watermark_ms = greatest(watermark_ms, $2) where id = $3",
+                        .{ v.run.started_ms, v.run.watermark_ms, @as(i16, @intCast(v.run.pipeline)) },
+                    );
+                }
                 break :blk try self.pool.exec(
-                    "update pipelines set last_run_ms = greatest(last_run_ms, $1), watermark_ms = greatest(watermark_ms, $2) where id = $3",
-                    .{ v.run.started_ms, v.run.watermark_ms, @as(i16, @intCast(v.run.pipeline)) },
+                    "update pipelines set last_run_ms = greatest(last_run_ms, $1) where id = $2",
+                    .{ v.run.started_ms, @as(i16, @intCast(v.run.pipeline)) },
                 );
             },
             .pipeline_tests => |v| blk: {
@@ -492,6 +556,44 @@ pub const Provider = struct {
                 .{ @as(i16, @intFromEnum(v.state)), @as(i32, @intCast(v.id)) },
             ),
         };
+    }
+
+    fn insertCaseRow(self: *Provider, c: *const domain.Case) anyerror!?i64 {
+        var csv_buf: [200]u8 = undefined;
+        const csv = idCsv(u32, &csv_buf, c.alert_ids[0..c.alert_count]);
+        return self.pool.exec(
+            "insert into cases (id, title, severity, status, assignee, opened_ms, updated_ms, alert_ids, notes) values ($1,$2,$3,$4,$5,$6,$7,$8,$9) on conflict (id) do nothing",
+            .{ @as(i16, @intCast(c.id)), c.title.slice(), @as(i16, @intFromEnum(c.severity)), @as(i16, @intFromEnum(c.status)), c.assignee.slice(), c.opened_ms, c.updated_ms, csv, c.notes.slice() },
+        );
+    }
+
+    /// Persist one audit entry (chain of custody survives restarts). Called
+    /// from the worker thread via the ToWorker.audit queue.
+    pub fn insertAuditRow(self: *Provider, e: *const domain.AuditEntry) anyerror!?i64 {
+        return self.pool.exec(
+            "insert into audit_log (id, ts_ms, actor, action, target) values ($1,$2,$3,$4,$5) on conflict (id) do nothing",
+            .{ @as(i64, @intCast(e.id)), e.ts_ms, e.actor.slice(), e.action.slice(), e.target.slice() },
+        );
+    }
+
+    /// Load the persisted audit trail (newest `cap` entries, ascending).
+    /// Returns the highest id seen so the caller can continue the sequence.
+    pub fn loadAudit(self: *Provider, gpa: std.mem.Allocator, out: *std.ArrayList(domain.AuditEntry), cap: u32) !u32 {
+        var res = try self.pool.query("select id, ts_ms, actor, action, target from (select * from audit_log order by id desc limit $1) sub order by id asc", .{@as(i64, @intCast(cap))});
+        defer res.deinit();
+        var max_id: u32 = 0;
+        while (try res.next()) |row| {
+            const id: u32 = @intCast(try row.get(i64, 0));
+            try out.append(gpa, .{
+                .id = id,
+                .ts_ms = try row.get(i64, 1),
+                .actor = domain.FixedStr(24).from(try row.get([]const u8, 2)),
+                .action = domain.FixedStr(28).from(try row.get([]const u8, 3)),
+                .target = domain.FixedStr(64).from(try row.get([]const u8, 4)),
+            });
+            if (id > max_id) max_id = id;
+        }
+        return max_id;
     }
 
     fn insertPipelineRunRow(self: *Provider, r: *const domain.PipelineRun) anyerror!?i64 {

@@ -26,27 +26,32 @@ pub fn render(d: *Dashboard) void {
     zgui.textColored(t.text.lo, "{d} feeds \u{00B7} {d} IOCs", .{ s.feeds.items.len, s.iocs.items.len });
     zgui.sameLine(.{ .spacing = 10 });
     if (zgui.smallButton("Sync all##feed")) {
-        if (d.jobs.enqueue(.feed_sync, 0, "all feeds", dash.unixNowMs()) != null) {
-            for (s.feeds.items) |*f| f.status = .syncing;
-            s.touch();
-        } else {
-            ui.events.post(.warn, "feeds", "a fleet sync is already queued/running", .{});
+        // A fleet sync and per-feed syncs must never overlap — whichever
+        // completes first would flip feeds the other still owns.
+        if (d.jobs.anyActive(.feed_sync)) {
+            ui.events.post(.warn, "feeds", "a feed sync is already queued/running \u{2014} see JOB", .{});
+        } else if (d.jobs.enqueue(.feed_sync, 0, "all feeds", dash.unixNowMs()) != null) {
+            for (s.feeds.items) |*f| {
+                if (f.status != .syncing) _ = s.setFeedStatus(f.id, .syncing, null);
+            }
         }
     }
 
-    const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };
-    if (zgui.beginTable("##feed_table", .{ .column = 5, .flags = flags })) {
-        // Feed stretches: the name is the payload. The source URL is dropped
-        // from the table (it's boilerplate flavor) so names stay whole in the
-        // narrow INTEL column; it's still available on hover.
-        // Status is just the LED (color = state); the label + URL live in the
-        // hover tooltip. That reclaims width for the feed Name in the narrow
-        // INTEL column so names never clip.
-        zgui.tableSetupColumn("St", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 26 });
-        zgui.tableSetupColumn("Feed", .{ .flags = .{ .width_stretch = true } });
-        zgui.tableSetupColumn("IOCs", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 50 });
-        zgui.tableSetupColumn("Sync", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 60 });
-        zgui.tableSetupColumn("##act", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 42 });
+    // Feed stretches: the name is the payload. Status is just the LED
+    // (label + URL live in the hover tooltip); the width plan drops the
+    // IOCs count first when the INTEL column runs narrow so names never
+    // clip regardless of dock geometry.
+    const cols = [_]ui.table.Col{
+        .{ .name = "St", .w = 26 },
+        .{ .name = "Feed" },
+        .{ .name = "IOCs", .w = 50, .prio = 1 },
+        .{ .name = "Sync", .w = 60 },
+        .{ .name = "##act", .w = 42 },
+    };
+    const pl = ui.table.plan(&cols, zgui.getContentRegionAvail()[0], 150);
+    const flags = zgui.TableFlags{ .resizable = true, .no_saved_settings = true, .borders = .{ .inner_h = true }, .scroll_y = true };
+    if (zgui.beginTable("##feed_table", .{ .column = pl.count, .flags = flags })) {
+        ui.table.setup(&cols, &pl);
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
@@ -68,8 +73,10 @@ pub fn render(d: *Dashboard) void {
                     zgui.endTooltip();
                 }
             }
-            _ = zgui.tableNextColumn();
-            zgui.textColored(t.text.mid, "{d}", .{f.ioc_count});
+            if (pl.on(2)) {
+                _ = zgui.tableNextColumn();
+                zgui.textColored(t.text.mid, "{d}", .{f.ioc_count});
+            }
             _ = zgui.tableNextColumn();
             var ab: [16]u8 = undefined;
             const age_s = @divFloor(dash.unixNowMs() - f.last_sync_ms, 1000);
@@ -84,9 +91,10 @@ pub fn render(d: *Dashboard) void {
                 var bb: [24]u8 = undefined;
                 const bl = std.fmt.bufPrintZ(&bb, "Sync##feed{d}", .{f.id}) catch "Sync";
                 if (zgui.smallButton(bl)) {
-                    if (d.jobs.enqueue(.feed_sync, @as(u32, f.id) + 1, f.name.slice(), dash.unixNowMs()) != null) {
-                        f.status = .syncing;
-                        s.touch();
+                    if (d.jobs.active(.feed_sync, 0) != null) {
+                        ui.events.post(.warn, "feeds", "a fleet sync is already queued/running \u{2014} see JOB", .{});
+                    } else if (d.jobs.enqueue(.feed_sync, @as(u32, f.id) + 1, f.name.slice(), dash.unixNowMs()) != null) {
+                        _ = s.setFeedStatus(f.id, .syncing, null);
                     }
                 }
             }

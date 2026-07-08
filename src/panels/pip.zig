@@ -53,6 +53,26 @@ fn defaultMat(kind: domain.StepKind) domain.Materialization {
     };
 }
 
+/// sameLine, then wrap to a fresh line when a small-button chip with this
+/// label wouldn't fit the remaining row width (chips must never clip at the
+/// panel edge, however narrow the dock slot).
+fn chipSameLine(label: []const u8, spacing: f32) void {
+    zgui.sameLine(.{ .spacing = spacing });
+    const w = zgui.calcTextSize(label, .{ .hide_text_after_double_hash = true })[0] +
+        zgui.getStyle().frame_padding[0] * 2;
+    if (zgui.getContentRegionAvail()[0] < w) zgui.newLine();
+}
+
+/// Same idea for a lineage text segment "→ main (meta)": wrap before the
+/// arrow when the whole segment wouldn't fit the remaining row width.
+fn segSameLine(main: []const u8, meta: []const u8, spacing: f32) void {
+    zgui.sameLine(.{ .spacing = spacing });
+    const w = zgui.calcTextSize("\u{2192}", .{})[0] +
+        zgui.calcTextSize(main, .{})[0] +
+        zgui.calcTextSize(meta, .{})[0] + 2 * spacing + 3;
+    if (zgui.getContentRegionAvail()[0] < w) zgui.newLine();
+}
+
 pub fn render(d: *Dashboard) void {
     const t = ui.theme.default;
     const s = &d.store;
@@ -92,7 +112,7 @@ pub fn render(d: *Dashboard) void {
         zgui.setKeyboardFocusHere(0);
     }
     zgui.setNextItemWidth(200);
-    _ = zgui.inputTextWithHint("##pip_filter", .{ .hint = "filter name/model (Ctrl+F)", .buf = &d.pip_filter_buf });
+    _ = zgui.inputTextWithHint("##pip_filter", .{ .hint = "filter (Ctrl+F)", .buf = &d.pip_filter_buf });
     zgui.sameLine(.{ .spacing = 8 });
     {
         const sc = s.sourceStateCounts();
@@ -244,17 +264,23 @@ pub fn render(d: *Dashboard) void {
             zgui.textColored(t.sev.crit, "source #{d} missing", .{p.source});
         }
         for (p.steps[0..p.step_count]) |*st| {
-            zgui.sameLine(.{ .spacing = 5 });
+            var mb: [64]u8 = undefined;
+            const meta = std.fmt.bufPrint(&mb, "({s} \u{00B7} {s})", .{ st.kind.label(), st.materialization.label() }) catch "";
+            segSameLine(st.model.slice(), meta, 5);
             zgui.textColored(t.text.lo, "\u{2192}", .{});
             zgui.sameLine(.{ .spacing = 5 });
             zgui.textColored(t.amber, "{s}", .{st.model.slice()});
             zgui.sameLine(.{ .spacing = 3 });
-            zgui.textColored(t.text.lo, "({s} \u{00B7} {s})", .{ st.kind.label(), st.materialization.label() });
+            zgui.textColored(t.text.lo, "{s}", .{meta});
         }
-        zgui.sameLine(.{ .spacing = 5 });
-        zgui.textColored(t.text.lo, "\u{2192}", .{});
-        zgui.sameLine(.{ .spacing = 5 });
-        zgui.textColored(t.text.hi, "{s} {s}", .{ p.sink.label(), p.target.slice() });
+        {
+            var sb: [80]u8 = undefined;
+            const sink_txt = std.fmt.bufPrint(&sb, "{s} {s}", .{ p.sink.label(), p.target.slice() }) catch "";
+            segSameLine(sink_txt, "", 5);
+            zgui.textColored(t.text.lo, "\u{2192}", .{});
+            zgui.sameLine(.{ .spacing = 5 });
+            zgui.textColored(t.text.hi, "{s}", .{sink_txt});
+        }
     }
 
     // Sink health: last landing, 24h volume, watermark lag.
@@ -363,6 +389,8 @@ pub fn render(d: *Dashboard) void {
             shown += 1;
             zgui.textColored(t.sev.crit, "  {s}", .{dl.kind.label()});
             zgui.sameLine(.{ .spacing = 6 });
+            zgui.textColored(t.text.lo, "{s} \u{00B7} run #{d}", .{ dl.target.slice(), dl.run_id });
+            zgui.sameLine(.{ .spacing = 6 });
             zgui.textColored(t.text.mid, "{s}", .{dl.sample.slice()});
             zgui.sameLine(.{ .spacing = 8 });
             var rb: [28]u8 = undefined;
@@ -410,6 +438,14 @@ pub fn render(d: *Dashboard) void {
                     zgui.sameLine(.{ .spacing = 6 });
                     zgui.textColored(t.sev.warn, "{d} rejected", .{run.rows_rejected});
                 }
+                if (run.tests_passed + run.tests_failed > 0) {
+                    zgui.sameLine(.{ .spacing = 6 });
+                    zgui.textColored(
+                        if (run.tests_failed > 0) t.sev.warn else t.sev.ok,
+                        "tests {d}/{d}",
+                        .{ run.tests_passed, run.tests_passed + run.tests_failed },
+                    );
+                }
             }
         }
         if (shown == 0) zgui.textColored(t.text.lo, "  no runs yet", .{});
@@ -436,10 +472,11 @@ fn renderSources(d: *Dashboard) void {
     const h: f32 = @floatFromInt(28 + 19 * s.sources.items.len);
     if (zgui.beginChild("##pip_sources", .{ .h = @min(h, 190) })) {
         const flags = zgui.TableFlags{ .borders = .{ .inner_h = true }, .scroll_y = true };
-        if (zgui.beginTable("##pip_src_table", .{ .column = 6, .flags = flags })) {
+        if (zgui.beginTable("##pip_src_table", .{ .column = 7, .flags = flags })) {
             zgui.tableSetupColumn("Kind", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 66 });
             zgui.tableSetupColumn("Source", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 150 });
             zgui.tableSetupColumn("DSN", .{ .flags = .{ .width_stretch = true } });
+            zgui.tableSetupColumn("Tables", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 52 });
             zgui.tableSetupColumn("State", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 92 });
             zgui.tableSetupColumn("Latency", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 64 });
             zgui.tableSetupColumn("##test", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 44 });
@@ -453,6 +490,8 @@ fn renderSources(d: *Dashboard) void {
                 zgui.textUnformattedColored(t.text.mid, src.name.slice());
                 _ = zgui.tableNextColumn();
                 zgui.textUnformattedColored(t.text.lo, src.dsn.slice());
+                _ = zgui.tableNextColumn();
+                zgui.textColored(t.text.mid, "{d}", .{src.tables});
                 _ = zgui.tableNextColumn();
                 zgui.textColored(connColor(src.state), "{s}", .{src.state.label()});
                 _ = zgui.tableNextColumn();
@@ -493,30 +532,39 @@ fn renderBuilder(d: *Dashboard) void {
     const s = &d.store;
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = t.bg.sunken });
     defer zgui.popStyleColor(.{ .count = 1 });
-    if (zgui.beginChild("##pip_builder", .{ .h = 108 })) {
+    if (zgui.beginChild("##pip_builder", .{ .child_flags = .{ .auto_resize_y = true } })) {
         zgui.textColored(t.text.mid, "new pipeline \u{2014} source \u{2192} models \u{2192} sink", .{});
 
         zgui.setNextItemWidth(170);
         _ = zgui.inputTextWithHint("##pip_name", .{ .hint = "name (snake_case)", .buf = &d.pip_new_name });
         zgui.sameLine(.{ .spacing = 8 });
 
-        // Source picker.
-        if (d.pip_new_source >= s.sources.items.len) d.pip_new_source = 0;
-        var pb: [64]u8 = undefined;
-        const src_preview: [:0]const u8 = if (s.sources.items.len == 0) "no sources" else blk: {
-            const src = &s.sources.items[d.pip_new_source];
-            break :blk std.fmt.bufPrintZ(&pb, "{s} \u{00B7} {s}", .{ src.kind.label(), src.name.slice() }) catch "source";
+        // Source picker — tracked by source ID, not list position, so a PG
+        // snapshot that reorders/removes sources can't silently retarget
+        // the builder.
+        const sel_src: ?*domain.DataSource = blk: {
+            if (d.pip_new_source_id) |sid| {
+                if (s.sourceById(sid)) |src| break :blk src;
+            }
+            break :blk if (s.sources.items.len > 0) &s.sources.items[0] else null;
         };
+        if (sel_src) |src| d.pip_new_source_id = src.id;
+        var pb: [64]u8 = undefined;
+        const src_preview: [:0]const u8 = if (sel_src) |src|
+            std.fmt.bufPrintZ(&pb, "{s} \u{00B7} {s}", .{ src.kind.label(), src.name.slice() }) catch "source"
+        else
+            "no sources";
         zgui.setNextItemWidth(210);
         if (zgui.beginCombo("##pip_src", .{ .preview_value = src_preview })) {
-            for (s.sources.items, 0..) |*src, i| {
+            for (s.sources.items) |*src| {
                 var lb: [72]u8 = undefined;
-                const ll = std.fmt.bufPrintZ(&lb, "{s} \u{00B7} {s}##bsrc{d}", .{ src.kind.label(), src.name.slice(), i }) catch continue;
-                if (zgui.selectable(ll, .{ .selected = i == d.pip_new_source })) d.pip_new_source = i;
+                const ll = std.fmt.bufPrintZ(&lb, "{s} \u{00B7} {s}##bsrc{d}", .{ src.kind.label(), src.name.slice(), src.id }) catch continue;
+                if (zgui.selectable(ll, .{ .selected = d.pip_new_source_id == src.id })) d.pip_new_source_id = src.id;
             }
             zgui.endCombo();
         }
-        zgui.sameLine(.{ .spacing = 8 });
+        // Second row: name + source alone total ~390px; keeping sink/target/
+        // schedule on the same line overflowed every dock slot under ~800px.
 
         // Sink picker + target.
         const sink_fields = @typeInfo(domain.SinkKind).@"enum".fields;
@@ -541,9 +589,9 @@ fn renderBuilder(d: *Dashboard) void {
         // pipeline name at create time).
         zgui.textColored(t.text.lo, "models:", .{});
         for (d.pip_new_steps[0..d.pip_new_step_count], 0..) |*st, i| {
-            zgui.sameLine(.{ .spacing = 5 });
             var cb: [48]u8 = undefined;
             const cl = std.fmt.bufPrintZ(&cb, "{s} ({s}) \u{00D7}##bstep{d}", .{ st.kind.label(), st.materialization.label(), i }) catch continue;
+            chipSameLine(cl, 5);
             if (zgui.smallButton(cl)) {
                 // Remove: shift the tail left.
                 var k = i;
@@ -554,9 +602,9 @@ fn renderBuilder(d: *Dashboard) void {
         if (d.pip_new_step_count < domain.PIPELINE_STEP_CAP) {
             const kinds = [_]domain.StepKind{ .staging, .dedup, .filter, .enrich, .join, .aggregate, .mask };
             for (kinds, 0..) |k, ki| {
-                zgui.sameLine(.{ .spacing = 4 });
                 var ab: [24]u8 = undefined;
                 const al = std.fmt.bufPrintZ(&ab, "+{s}##badd{d}", .{ k.label(), ki }) catch continue;
+                chipSameLine(al, 4);
                 if (zgui.smallButton(al)) {
                     d.pip_new_steps[d.pip_new_step_count] = .{ .kind = k, .materialization = defaultMat(k) };
                     d.pip_new_step_count += 1;
@@ -567,12 +615,12 @@ fn renderBuilder(d: *Dashboard) void {
         // Create.
         const name = std.mem.sliceTo(&d.pip_new_name, 0);
         const target = std.mem.sliceTo(&d.pip_new_target, 0);
-        const ready = name.len > 0 and target.len > 0 and d.pip_new_step_count > 0 and s.sources.items.len > 0;
+        const ready = name.len > 0 and target.len > 0 and d.pip_new_step_count > 0 and d.pip_new_source_id != null;
         if (ready) {
-            zgui.sameLine(.{ .spacing = 14 });
+            chipSameLine("Create", 14);
             if (zgui.smallButton("Create##pipmk")) createPipeline(d, name, target, sink);
         } else {
-            zgui.sameLine(.{ .spacing = 14 });
+            chipSameLine("need name + target + \u{2265}1 model", 14);
             zgui.textColored(t.text.lo, "need name + target + \u{2265}1 model", .{});
         }
     }
@@ -584,7 +632,7 @@ fn createPipeline(d: *Dashboard, name: []const u8, target: []const u8, sink: dom
     var proto: domain.Pipeline = .{
         .id = 0,
         .name = domain.FixedStr(64).from(name),
-        .source = s.sources.items[d.pip_new_source].id,
+        .source = d.pip_new_source_id orelse return,
         .sink = sink,
         .target = domain.FixedStr(64).from(target),
         .schedule_min = @intCast(std.math.clamp(d.pip_new_sched, 0, 1440)),

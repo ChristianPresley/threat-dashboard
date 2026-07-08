@@ -244,3 +244,13 @@ create index if not exists dead_letters_pipe_idx on dead_letters (pipeline, stat
 alter table alerts add column if not exists acked_ms bigint not null default 0;
 
 alter table alerts add column if not exists resolved_ms bigint not null default 0;
+
+-- Chain of custody: the app-side audit trail mirrors here so it survives
+-- restarts (retention keeps the newest 512 rows)
+create table if not exists audit_log (
+  id bigint primary key,
+  ts_ms bigint not null,
+  actor text not null,
+  action text not null,
+  target text not null
+);

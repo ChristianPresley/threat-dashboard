@@ -133,7 +133,21 @@ fn drawCell(d: *Dashboard, s: *@import("data").Store, tid: attack.TechniqueId) v
         zgui.textColored(t.identity.detect, "Y", .{});
     }
     if (heat > 0) {
+        // The heat badge clicks through to the actual alerts in ALQ.
         zgui.sameLine(.{ .spacing = 4 });
-        zgui.textColored(t.sev.crit, "{d}", .{heat});
+        var hb: [24]u8 = undefined;
+        const hl = std.fmt.bufPrintZ(&hb, "{d}##atkheat{d}", .{ heat, tid }) catch "n";
+        zgui.pushStyleColor4f(.{ .idx = .text, .c = t.sev.crit });
+        if (zgui.selectable(hl, .{ .w = 22 })) {
+            d.alq_technique_filter = tid;
+            d.focusPanel(dash.PANEL_ALQ);
+        }
+        zgui.popStyleColor(.{ .count = 1 });
+        if (zgui.isItemHovered(.{})) {
+            if (zgui.beginTooltip()) {
+                zgui.textColored(t.text.mid, "open the {d} open alert(s) in ALQ", .{heat});
+                zgui.endTooltip();
+            }
+        }
     }
 }

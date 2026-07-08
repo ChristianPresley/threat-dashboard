@@ -125,6 +125,22 @@ fn strOf(v: ?std.json.Value) ?[]const u8 {
 
 // ── Live client (worker thread) ──────────────────────────────────────────
 
+const windows = std.os.windows;
+const kernel32_pipe = struct {
+    extern "kernel32" fn PeekNamedPipe(
+        hNamedPipe: windows.HANDLE,
+        lpBuffer: ?*anyopaque,
+        nBufferSize: windows.DWORD,
+        lpBytesRead: ?*windows.DWORD,
+        lpTotalBytesAvail: ?*windows.DWORD,
+        lpBytesLeftThisMessage: ?*windows.DWORD,
+    ) callconv(.winapi) windows.BOOL;
+};
+
+/// Per-response deadline: a child that spawns but never replies (wrong
+/// binary, not actually MCP) must not wedge the worker thread forever.
+const READ_TIMEOUT_MS: i64 = 30_000;
+
 pub const Client = struct {
     io: std.Io,
     gpa: Allocator,
@@ -164,10 +180,31 @@ pub const Client = struct {
         }
         self.tools.deinit(self.gpa);
         // Close stdin (EOF → the server exits), then clear the child's copy
-        // so wait()'s cleanup doesn't double-close the same handle.
+        // so wait()'s cleanup doesn't double-close the same handle. Kill
+        // before waiting: a child that ignores EOF must not hang app exit
+        // or leave an orphan (the server is a read-only query proxy — an
+        // abrupt kill loses nothing).
         self.in_file.close(self.io);
         self.child.stdin = null;
-        _ = self.child.wait(self.io) catch {};
+        // kill() terminates, reaps, and releases all resources itself —
+        // no wait() after it (wait asserts on the already-reaped child).
+        self.child.kill(self.io);
+    }
+
+    /// Wait until the child's stdout has readable bytes (or the deadline
+    /// passes). Prevents a silent/hung server from blocking the worker in
+    /// an uninterruptible pipe read.
+    fn waitForData(self: *Client, timeout_ms: i64) !void {
+        var waited: i64 = 0;
+        while (waited < timeout_ms) : (waited += 20) {
+            var avail: windows.DWORD = 0;
+            if (!kernel32_pipe.PeekNamedPipe(self.out_file.handle, null, 0, null, &avail, null).toBool()) {
+                return error.McpClosed; // pipe broken — child died
+            }
+            if (avail > 0) return;
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(20), .awake) catch {};
+        }
+        return error.McpTimeout;
     }
 
     fn writeLine(self: *Client, json: []const u8) !void {
@@ -178,10 +215,14 @@ pub const Client = struct {
     }
 
     /// Read response lines until one matches `id` (skipping notifications).
+    /// Each line read is deadline-gated via waitForData.
     fn readResult(self: *Client, id: i64) !RpcResult {
         var fr = self.out_file.reader(self.io, &self.out_buf);
         var attempts: u32 = 0;
         while (attempts < 64) : (attempts += 1) {
+            // Only gate on the pipe when the reader has nothing buffered —
+            // a prior read may have pulled several frames at once.
+            if (fr.interface.bufferedLen() == 0) try self.waitForData(READ_TIMEOUT_MS);
             const line = (try fr.interface.takeDelimiter('\n')) orelse return error.McpClosed;
             if (line.len == 0) continue;
             var res = try parseRpcResult(self.gpa, line);

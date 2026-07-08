@@ -23,6 +23,17 @@ fn pivotTo(d: *Dashboard, id: u32) void {
     d.enr_sel = id;
 }
 
+/// Create a urlscan submission and queue its own url_scan job (arg = scan
+/// id) — independent of enrichment batches, so canceling one never kills
+/// the other.
+fn submitScan(d: *Dashboard, ioc_id: u32) void {
+    const scan_id = d.store.submitUrlScan(ioc_id, dash.unixNowMs()) orelse return;
+    var db: [24]u8 = undefined;
+    const detail = std.fmt.bufPrint(&db, "scan #{d}", .{scan_id}) catch "scan";
+    _ = d.jobs.enqueue(.url_scan, scan_id, detail, dash.unixNowMs());
+    ui.events.post(.info, "urlscan", "submission #{d} queued (unlisted)", .{scan_id});
+}
+
 fn defangCopy(value: []const u8) void {
     var copy_buf: [136:0]u8 = undefined;
     const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{value}) catch "";
@@ -207,14 +218,20 @@ pub fn render(d: *Dashboard) void {
                     else => t.sev.warn,
                 };
                 zgui.textColored(scan_col, "urlscan: {s}", .{scan.state.label()});
+                if (scan.state == .err and scan.err.len > 0) {
+                    zgui.sameLine(.{ .spacing = 6 });
+                    zgui.textColored(t.sev.crit, "({s})", .{scan.err.slice()});
+                }
                 zgui.sameLine(.{ .spacing = 6 });
                 zgui.textColored(t.text.lo, "submitted {s} ago", .{ui.fmt.age(&ab, age_s)});
-            } else {
-                if (zgui.smallButton("Submit to urlscan##enr")) {
-                    _ = s.submitUrlScan(sel, dash.unixNowMs());
-                    _ = d.jobs.enqueue(.ioc_enrichment, 0, "urlscan", dash.unixNowMs());
-                    ui.events.post(.info, "urlscan", "submission queued (unlisted)", .{});
+                // A failed scan is retryable — a fresh submission supersedes
+                // the errored one (urlScanForIoc returns the latest).
+                if (scan.state == .err) {
+                    zgui.sameLine(.{ .spacing = 10 });
+                    if (zgui.smallButton("Resubmit##enrscan")) submitScan(d, sel);
                 }
+            } else {
+                if (zgui.smallButton("Submit to urlscan##enr")) submitScan(d, sel);
             }
         },
         .hash_sha256, .email => {},

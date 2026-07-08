@@ -466,6 +466,13 @@ pub fn main(init: std.process.Init) !void {
                     ui.events.post(.crit, "db", "PG load failed: {s} — running on the mock world", .{@errorName(err)});
                     break :blk false;
                 };
+                // Chain of custody: restore the persisted audit trail so a
+                // restart doesn't blank AUD.
+                if (boot.loadAudit(allocator, &dashboard.audit, dashboard_mod.Dashboard.AUDIT_CAP)) |max_id| {
+                    dashboard.audit_next_id = max_id + 1;
+                } else |err| {
+                    ui.events.post(.warn, "db", "audit trail load failed: {s}", .{@errorName(err)});
+                }
                 break :blk true;
             };
             boot.deinit();

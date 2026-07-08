@@ -14,8 +14,12 @@ pub fn render(d: *Dashboard) void {
 
     zgui.textColored(t.text.lo, "{d} action(s) recorded \u{00B7} cap {d}", .{ d.audit.items.len, Dashboard.AUDIT_CAP });
     zgui.sameLine(.{ .spacing = 10 });
-    zgui.setNextItemWidth(180);
-    _ = zgui.inputTextWithHint("##aud_filter", .{ .hint = "filter action/target", .buf = &d.aud_filter_buf });
+    if (d.aud_focus_filter and zgui.isWindowFocused(.{ .root_window = true, .child_windows = true })) {
+        d.aud_focus_filter = false;
+        zgui.setKeyboardFocusHere(0);
+    }
+    zgui.setNextItemWidth(210);
+    _ = zgui.inputTextWithHint("##aud_filter", .{ .hint = "filter action/target (Ctrl+F)", .buf = &d.aud_filter_buf });
     const filter = std.mem.sliceTo(&d.aud_filter_buf, 0);
 
     const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };

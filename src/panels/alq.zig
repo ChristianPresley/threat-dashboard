@@ -35,7 +35,14 @@ pub fn render(d: *Dashboard) void {
         zgui.setKeyboardFocusHere(0);
     }
     zgui.setNextItemWidth(180);
-    _ = zgui.inputTextWithHint("##alq_filter", .{ .hint = "filter title/entity (Ctrl+F)", .buf = &d.alq_filter_buf });
+    _ = zgui.inputTextWithHint("##alq_filter", .{ .hint = "filter (Ctrl+F)", .buf = &d.alq_filter_buf });
+    if (d.alq_technique_filter) |tid| {
+        const tech = domain.attack.get(tid);
+        zgui.sameLine(.{ .spacing = 10 });
+        zgui.textColored(t.amber, "technique {s}", .{tech.id});
+        zgui.sameLine(.{ .spacing = 4 });
+        if (zgui.smallButton("\u{00D7}##alqtech")) d.alq_technique_filter = null;
+    }
 
     // ── Collect visible rows (newest first) ──────────────────────────────
     const filter = std.mem.sliceTo(&d.alq_filter_buf, 0);
@@ -48,6 +55,9 @@ pub fn render(d: *Dashboard) void {
             const a = &s.alerts.items[i];
             if (!d.alq_sev_show[@intFromEnum(a.severity)]) continue;
             if (!d.alq_show_closed and !a.status.isOpen()) continue;
+            if (d.alq_technique_filter) |tid| {
+                if (a.technique == null or a.technique.? != tid) continue;
+            }
             if (filter.len > 0 and
                 std.ascii.indexOfIgnoreCase(a.title.slice(), filter) == null and
                 std.ascii.indexOfIgnoreCase(a.entity.slice(), filter) == null) continue;
@@ -98,7 +108,11 @@ pub fn render(d: *Dashboard) void {
 
     // ── Table + detail split ─────────────────────────────────────────────
     const avail = zgui.getContentRegionAvail();
-    const detail_h: f32 = if (d.alq_sel != null) 110 else 0;
+    // Detail grows with the linked-event list (one selectable per event).
+    const detail_h: f32 = if (d.alq_sel) |sid| blk: {
+        const ev_n: f32 = if (s.alertById(sid)) |a| @floatFromInt(a.event_count) else 1;
+        break :blk 110 + @max(0, ev_n - 1) * 18;
+    } else 0;
     const table_h = @max(80, avail[1] - detail_h);
 
     const flags = zgui.TableFlags{
@@ -158,11 +172,28 @@ pub fn render(d: *Dashboard) void {
                 zgui.textUnformattedColored(text_col, a.entity.slice());
                 _ = zgui.tableNextColumn();
                 if (a.rule < s.rules.items.len) {
-                    zgui.textUnformattedColored(t.text.mid, s.rules.items[a.rule].code.slice());
+                    // Click through to the rule in RUL.
+                    const r = &s.rules.items[a.rule];
+                    var rb: [32]u8 = undefined;
+                    const rl = std.fmt.bufPrintZ(&rb, "{s}##alqrule{d}", .{ r.code.slice(), a.id }) catch @as([:0]const u8, "rule");
+                    zgui.pushStyleColor4f(.{ .idx = .text, .c = t.text.mid });
+                    if (zgui.selectable(rl, .{})) {
+                        d.rul_sel = r.id;
+                        d.focusPanel(dash.PANEL_RUL);
+                    }
+                    zgui.popStyleColor(.{ .count = 1 });
                 }
                 _ = zgui.tableNextColumn();
                 if (a.case_id) |cid| {
-                    zgui.textColored(t.accent, "#{d}", .{cid});
+                    // Click through to the case in CAS.
+                    var casb: [24]u8 = undefined;
+                    const casl = std.fmt.bufPrintZ(&casb, "#{d}##alqcase{d}", .{ cid, a.id }) catch @as([:0]const u8, "case");
+                    zgui.pushStyleColor4f(.{ .idx = .text, .c = t.accent });
+                    if (zgui.selectable(casl, .{})) {
+                        d.cas_sel = cid;
+                        d.focusPanel(dash.PANEL_CAS);
+                    }
+                    zgui.popStyleColor(.{ .count = 1 });
                 } else {
                     zgui.textColored(t.text.lo, "\u{2014}", .{});
                 }
@@ -186,20 +217,47 @@ pub fn render(d: *Dashboard) void {
                 zgui.textColored(t.accent, "{s} {s}", .{ tech.id, tech.name });
             }
 
-            // First linked event's command line — investigation context.
-            if (a.event_count > 0) {
-                if (s.eventById(a.event_ids[0])) |e| {
-                    dash.textWrappedColored(t.text.mid, "{s}  {s}", .{ e.process.slice(), e.cmdline.slice() });
-                }
+            if (a.assignee.len > 0) {
+                zgui.sameLine(.{ .spacing = 12 });
+                zgui.textColored(t.text.lo, "assignee: {s}", .{a.assignee.slice()});
             }
 
-            if (zgui.smallButton("Ack (A)")) ackAlert(d, sid);
-            zgui.sameLine(.{ .spacing = 6 });
-            if (zgui.smallButton("False+ (F)")) markFp(d, sid);
-            zgui.sameLine(.{ .spacing = 6 });
-            if (zgui.smallButton("Resolve")) {
-                _ = s.setAlertStatus(sid, .resolved, dash.unixNowMs());
-                ui.events.post(.ok, "alerts", "alert #{d} resolved", .{sid});
+            // Linked events — each clicks through to EVT.
+            for (a.event_ids[0..a.event_count]) |eid| {
+                const e = s.eventById(eid) orelse continue;
+                var eb: [200]u8 = undefined;
+                const el = std.fmt.bufPrintZ(&eb, "{s}  {s}##alqev{d}", .{ e.process.slice(), e.cmdline.slice(), eid }) catch continue;
+                zgui.pushStyleColor4f(.{ .idx = .text, .c = t.text.mid });
+                if (zgui.selectable(el, .{})) {
+                    d.evt_sel = eid;
+                    d.focusPanel(dash.PANEL_EVT);
+                }
+                zgui.popStyleColor(.{ .count = 1 });
+            }
+
+            // Lifecycle actions match the alert's state: open alerts close
+            // (ack/FP/resolve/suppress), closed alerts reopen.
+            if (a.status.isOpen()) {
+                if (a.status == .new) {
+                    if (zgui.smallButton("Ack (A)")) ackAlert(d, sid);
+                    zgui.sameLine(.{ .spacing = 6 });
+                }
+                if (zgui.smallButton("False+ (F)")) markFp(d, sid);
+                zgui.sameLine(.{ .spacing = 6 });
+                if (zgui.smallButton("Resolve")) {
+                    _ = s.setAlertStatus(sid, .resolved, dash.unixNowMs());
+                    ui.events.post(.ok, "alerts", "alert #{d} resolved", .{sid});
+                }
+                zgui.sameLine(.{ .spacing = 6 });
+                if (zgui.smallButton("Suppress")) {
+                    _ = s.setAlertStatus(sid, .suppressed, dash.unixNowMs());
+                    ui.events.post(.info, "alerts", "alert #{d} suppressed", .{sid});
+                }
+            } else {
+                if (zgui.smallButton("Reopen")) {
+                    _ = s.setAlertStatus(sid, .new, dash.unixNowMs());
+                    ui.events.post(.info, "alerts", "alert #{d} reopened", .{sid});
+                }
             }
             zgui.sameLine(.{ .spacing = 12 });
             // Case assignment combo.
@@ -234,10 +292,9 @@ fn ackAlert(d: *Dashboard, id: u32) void {
 
 fn markFp(d: *Dashboard, id: u32) void {
     if (d.store.setAlertStatus(id, .false_positive, dash.unixNowMs())) {
-        // Tuning feedback: count it on the rule.
-        if (d.store.alertById(id)) |a| {
-            if (a.rule < d.store.rules.items.len) d.store.rules.items[a.rule].fp_7d += 1;
-        }
+        // Tuning feedback: count it on the rule (through the Store so it
+        // persists to PG and lands in the audit trail).
+        if (d.store.alertById(id)) |a| _ = d.store.bumpRuleFp(a.rule);
         ui.events.post(.info, "alerts", "alert #{d} marked false-positive", .{id});
     }
 }

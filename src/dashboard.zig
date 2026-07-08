@@ -355,7 +355,7 @@ const commands = [_]ui.registry.Command{
     .{ .code = "AUD", .name = "Audit Trail", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_AUD), .desc = "Focus the Audit Trail (chain of custody: every analyst/system action, who \u{00B7} what \u{00B7} when)" },
     .{ .code = "LOG", .name = "Event Log", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_LOG), .desc = "Focus the Event Log (app status/event stream, Ctrl+E exports CSV)" },
     .{ .code = "JOB", .name = "Jobs", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_JOB), .desc = "Focus Jobs (async work: phase, progress, cancel)" },
-    .{ .code = "SET", .name = "Settings", .kind = .panel, .menu_group = "Panels", .key_hint = "Ctrl+,", .run = makePanelRun(PANEL_SET), .desc = "Focus Settings (appearance \u{00B7} mock seed \u{00B7} persistence paths)" },
+    .{ .code = "SET", .name = "Settings", .kind = .panel, .menu_group = "Panels", .key_hint = "Ctrl+,", .run = makePanelRun(PANEL_SET), .desc = "Focus Settings (mock seed \u{00B7} layout persistence \u{00B7} data providers \u{00B7} AI status)" },
     .{ .code = "HELP", .name = "Directory", .kind = .panel, .menu_group = "Panels", .key_hint = "?", .run = makePanelRun(PANEL_HELP), .desc = "Focus the HELP directory (codes \u{00B7} keyboard map \u{00B7} command grammar)" },
     .{ .code = "AI", .name = "AI Assistant", .kind = .panel, .menu_group = "Panels", .key_hint = "Ctrl+Shift+A", .run = makePanelRun(PANEL_AI), .desc = "Focus the AI Assistant (Claude chat with read-only dashboard + threat-intel tools)" },
     // -- Workspaces --
@@ -402,13 +402,21 @@ const keymap_global = [_]KeyBinding{
     .{ .chord = "Ctrl+Shift+A", .action = "AI \u{00B7} Assistant (Claude chat with dashboard + threat-intel tools)" },
     .{ .chord = "?", .action = "HELP directory (Shift+/ outside text inputs)" },
     .{ .chord = "Ctrl+S", .action = "snapshot layout + UI state now (toast confirms)" },
-    .{ .chord = "Esc", .action = "clear command line \u{2192} close popup \u{2192} cancel modal (never confirms)" },
+    .{ .chord = "Esc", .action = "clear command line \u{2192} close popup \u{2192} disarm an armed confirm (never confirms)" },
+    .{ .chord = "middle-click", .action = "dismiss a toast" },
+};
+
+const keymap_cmdline = [_]KeyBinding{
+    .{ .chord = "Enter", .action = "run the exact code, else the highlighted match" },
+    .{ .chord = "\u{2191} \u{2193}", .action = "move the match selection; on an empty line \u{2191} recalls submitted commands (shell-style)" },
+    .{ .chord = "Tab", .action = "complete to the highlighted match" },
+    .{ .chord = ">", .action = "optional palette prefix \u{2014} fuzzy-search names as well as codes" },
 };
 
 const keymap_tables = [_]KeyBinding{
-    .{ .chord = "Ctrl+F", .action = "focus the panel's filter box (ALQ EVT RUL IOC YAR PIP)" },
+    .{ .chord = "Ctrl+F", .action = "focus the panel's filter box (ALQ EVT RUL IOC YAR PIP AUD NET)" },
     .{ .chord = "\u{2191} \u{2193}", .action = "row selection (ALQ EVT RUL CAS)" },
-    .{ .chord = "Enter", .action = "default row action (ALQ ack \u{00B7} EVT detail \u{00B7} RUL toggle detail)" },
+    .{ .chord = "Enter", .action = "default row action (ALQ ack \u{00B7} EVT detail \u{00B7} RUL/CAS toggle detail)" },
     .{ .chord = "Ctrl+E", .action = "export visible rows to CSV (LOG \u{2014} toast with path)" },
 };
 
@@ -418,16 +426,17 @@ const keymap_alq = [_]KeyBinding{
     .{ .chord = "C", .action = "assign the selected alert to the selected case" },
 };
 
-const keymap_modal = [_]KeyBinding{
-    .{ .chord = "Enter", .action = "confirms only after the dwell has elapsed" },
-    .{ .chord = "Esc", .action = "always cancels" },
+const keymap_confirm = [_]KeyBinding{
+    .{ .chord = "click \u{00B7} wait \u{00B7} click", .action = "destructive actions arm a short dwell; the Confirm button appears when it elapses" },
+    .{ .chord = "Esc", .action = "disarms an armed confirm (RUL disable \u{00B7} CAS status \u{00B7} YAR deprecate \u{00B7} PIP pause)" },
 };
 
 pub const keymap_sections = [_]KeyMapSection{
     .{ .title = "Global", .keys = &keymap_global },
+    .{ .title = "Command line", .keys = &keymap_cmdline },
     .{ .title = "Tables (focused panel)", .keys = &keymap_tables },
     .{ .title = "Alert Queue (ALQ focused)", .keys = &keymap_alq },
-    .{ .title = "Modals", .keys = &keymap_modal },
+    .{ .title = "Dwell confirms", .keys = &keymap_confirm },
 };
 
 // ===== ui_state.json plumbing ============================================
@@ -452,13 +461,53 @@ const UiStateJson = struct {
     seed: u64 = 42,
     alq_show_closed: bool = false,
     evt_filter: []const u8 = "",
+    // Additive since the README promised "filters" persist — chip sets ride
+    // as bitmasks; absent fields keep their defaults (old files still parse).
+    alq_filter: []const u8 = "",
+    rul_filter: []const u8 = "",
+    ioc_filter: []const u8 = "",
+    yar_filter: []const u8 = "",
+    pip_filter: []const u8 = "",
+    alq_sev: u32 = 0b11111,
+    log_sev: u32 = 0b11111,
+    ioc_types: u32 = 0b11111,
+    evt_kinds: u32 = 0b1111111,
+    yar_fail_only: bool = false,
+    tun_threshold: f32 = 0.5,
 };
+
+fn packBools(comptime n: usize, bits: *const [n]bool) u32 {
+    var out: u32 = 0;
+    inline for (bits, 0..) |b, i| {
+        if (b) out |= @as(u32, 1) << @intCast(i);
+    }
+    return out;
+}
+
+fn unpackBools(comptime n: usize, mask: u32, bits: *[n]bool) void {
+    inline for (bits, 0..) |*b, i| b.* = (mask >> @intCast(i)) & 1 == 1;
+}
+
+fn copyFilter(dst: anytype, src: []const u8) void {
+    @memset(dst, 0);
+    const n = @min(src.len, dst.len - 1);
+    @memcpy(dst[0..n], src[0..n]);
+}
 
 /// Command-line InputText callback: ↑↓ move the suggestion selection while
 /// matches are open; on an empty line (or mid-recall) they walk the
 /// submitted-command history instead, shell-style.
 fn cmdInputCallback(cb_data: *zgui.InputTextCallbackData) callconv(.c) i32 {
     const self: *Dashboard = @ptrCast(@alignCast(cb_data.user_data orelse return 0));
+    // Tab: complete to the highlighted match's code.
+    if (cb_data.event_flag.callback_completion) {
+        if (self.palette_match_count > 0) {
+            const m = self.palette_matches[self.palette_sel];
+            cb_data.deleteChars(0, cb_data.buf_text_len);
+            cb_data.insertChars(0, commands[m.idx].code);
+        }
+        return 0;
+    }
     if (!cb_data.event_flag.callback_history) return 0;
     const n = self.palette_match_count;
     if (self.cmd_history_pos == null and n > 0) {
@@ -604,6 +653,7 @@ pub const Dashboard = struct {
     alq_filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8),
     alq_focus_filter: bool = false,
     alq_assign_case: ?u16 = null,
+    alq_technique_filter: ?attack.TechniqueId = null,
 
     // -- EVT panel state --
     evt_filter_buf: [64:0]u8 = std.mem.zeroes([64:0]u8),
@@ -627,6 +677,11 @@ pub const Dashboard = struct {
     sen_sel: ?u16 = null,
     tun_threshold: f32 = 0.5,
 
+    // -- NET panel state --
+    net_filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8),
+    net_focus_filter: bool = false,
+    net_ioc_only: bool = false,
+
     // -- YAR panel state --
     yar_sel: ?u16 = null,
     yar_filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8),
@@ -643,6 +698,12 @@ pub const Dashboard = struct {
     cas_notes_edit: ?u16 = null, // case id being edited
     cas_notes_buf: [480:0]u8 = std.mem.zeroes([480:0]u8),
 
+    // -- CAS metadata editing (title / severity / assignee) --
+    cas_meta_edit: ?u16 = null, // case id being edited
+    cas_title_buf: [96:0]u8 = std.mem.zeroes([96:0]u8),
+    cas_assignee_buf: [24:0]u8 = std.mem.zeroes([24:0]u8),
+    cas_meta_sev: domain.Severity = .medium,
+
     // -- PIP panel state --
     pip_sel: ?u16 = null,
     pip_filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8),
@@ -651,7 +712,7 @@ pub const Dashboard = struct {
     pip_show_sources: bool = false,
     pip_new_name: [48:0]u8 = std.mem.zeroes([48:0]u8),
     pip_new_target: [64:0]u8 = std.mem.zeroes([64:0]u8),
-    pip_new_source: usize = 0, // index into store.sources
+    pip_new_source_id: ?u16 = null, // DataSource.id (stable across snapshot swaps)
     pip_new_sink: usize = 0, // SinkKind ordinal
     pip_new_sched: i32 = 15,
     pip_new_steps: [domain.PIPELINE_STEP_CAP]domain.PipelineStep = @splat(domain.PipelineStep{}),
@@ -665,6 +726,7 @@ pub const Dashboard = struct {
     /// attribute to "system" instead of the analyst.
     audit_system: bool = false,
     aud_filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8),
+    aud_focus_filter: bool = false,
 
     // -- Jobs (queue engine; side effects in onJobComplete/onJobCanceled) --
     jobs: data.jobs.Engine,
@@ -736,6 +798,8 @@ pub const Dashboard = struct {
         self.audit.append(self.allocator, entry) catch return;
         self.audit_next_id += 1;
         if (self.audit.items.len > AUDIT_CAP) _ = self.audit.orderedRemove(0);
+        // Chain of custody survives restarts: mirror to PG off-thread.
+        if (self.pg_worker) |w| w.queueAudit(entry);
     }
 
     fn auditTarget(buf: []u8, m: data.Mutation) []const u8 {
@@ -744,7 +808,13 @@ pub const Dashboard = struct {
             .rule_status => |v| std.fmt.bufPrint(buf, "rule #{d} \u{2192} {s}", .{ v.id, v.status.label() }),
             .case_status => |v| std.fmt.bufPrint(buf, "case #{d} \u{2192} {s}", .{ v.id, v.status.label() }),
             .case_assign => |v| std.fmt.bufPrint(buf, "alert #{d} \u{2192} case #{d}", .{ v.alert_id, v.case_id }),
+            .case_unassign => |v| std.fmt.bufPrint(buf, "alert #{d} removed from case #{d}", .{ v.alert_id, v.case_id }),
+            .case_add => |v| std.fmt.bufPrint(buf, "case #{d} opened: {s}", .{ v.c.id, v.c.title.slice() }),
+            .case_update => |v| std.fmt.bufPrint(buf, "case #{d} edited ({s})", .{ v.id, v.title.slice() }),
             .case_notes => |v| std.fmt.bufPrint(buf, "case #{d} notes edited", .{v.id}),
+            .feed_status => |v| std.fmt.bufPrint(buf, "feed #{d} \u{2192} {s}", .{ v.id, v.status.label() }),
+            .rule_fp => |v| std.fmt.bufPrint(buf, "rule #{d} FP feedback ({d} in 7d)", .{ v.id, v.fp_7d }),
+            .retention_prune => |v| std.fmt.bufPrint(buf, "retention sweep (keep {d} runs)", .{v.keep_runs}),
             .yara_status => |v| std.fmt.bufPrint(buf, "yara #{d} \u{2192} {s}", .{ v.id, v.status.label() }),
             .yara_ci => |v| std.fmt.bufPrint(buf, "yara #{d} CI recorded", .{v.id}),
             .enrichment_upsert => |v| std.fmt.bufPrint(buf, "ioc #{d} enrichment {s}", .{ v.e.ioc_id, v.e.status.label() }),
@@ -802,7 +872,7 @@ pub const Dashboard = struct {
             if (self.alq_sel) |aid| {
                 var qb: [48]u8 = undefined;
                 const q = std.fmt.bufPrint(&qb, "{{\"id\":{d}}}", .{aid}) catch "{}";
-                if (ai.tools.execute(self.allocator, &self.store, "get_alert_detail", q)) |j| {
+                if (ai.tools.execute(self.allocator, &self.store, self.toolExtras(), "get_alert_detail", q)) |j| {
                     defer self.allocator.free(j);
                     ctx_buf.writer.print("<attached_alert>{s}</attached_alert>", .{j}) catch {};
                     has_ctx = true;
@@ -822,6 +892,11 @@ pub const Dashboard = struct {
         w.send(text, if (has_ctx) ctx_buf.written() else null);
         self.assistant.busy = true;
         self.assistant.setStatus("thinking");
+    }
+
+    /// Dashboard-owned state the native tools may read (job queue + audit).
+    fn toolExtras(self: *Dashboard) ai.tools.Extras {
+        return .{ .jobs = self.jobs.jobs.items, .audit = self.audit.items };
     }
 
     /// Drain worker → UI events once per frame (the only place worker output
@@ -853,7 +928,7 @@ pub const Dashboard = struct {
                 },
                 .tool_query => |q| {
                     // Execute the native tool against the Store, reply.
-                    if (ai.tools.execute(self.allocator, &self.store, q.name, q.input_json)) |res| {
+                    if (ai.tools.execute(self.allocator, &self.store, self.toolExtras(), q.name, q.input_json)) |res| {
                         w.replyToolQuery(q.id, res, false);
                         self.allocator.free(res);
                     } else |err| {
@@ -1001,6 +1076,7 @@ pub const Dashboard = struct {
         self.panel_force_open = @splat(false);
         self.rul_technique_filter = null;
         self.yar_technique_filter = null;
+        self.alq_technique_filter = null;
         self.evt_range = null;
         @memset(&self.cmd_buf, 0);
         self.palette_match_count = 0;
@@ -1155,6 +1231,7 @@ pub const Dashboard = struct {
         self.evt_range = null;
         self.yar_sel = null;
         self.yar_technique_filter = null;
+        self.alq_technique_filter = null;
         self.enr_sel = null;
         self.enr_history_len = 0;
         self.pip_sel = null;
@@ -1203,8 +1280,13 @@ pub const Dashboard = struct {
             self.pip_show_sources = true;
             self.panel_focus_request = PANEL_PIP;
         }
-        // Float SET + HELP + AI once, late in the OPS hold, for coverage.
-        if (ws == .ops and hold_pos == VALIDATE_HOLD - 14) {
+        // Screenshots fire at hold_pos == VALIDATE_HOLD - 8 (main.zig); clear
+        // toasts two frames earlier so captures show panel content while the
+        // earlier frames of each hold still exercise the toast render path.
+        if (hold_pos == VALIDATE_HOLD - 10) ui.events.dismissToasts();
+        // Float SET + HELP + AI once, late in the OPS hold, for coverage —
+        // after the capture frame so they don't occlude the OPS screenshot.
+        if (ws == .ops and hold_pos == VALIDATE_HOLD - 6) {
             self.panel_force_open[PANEL_SET] = true;
             self.panel_force_open[PANEL_HELP] = true;
             self.panel_force_open[PANEL_AI] = true;
@@ -1277,6 +1359,17 @@ pub const Dashboard = struct {
         }
         self.renderPanelWindows();
 
+        // Filter-focus flags are one-frame signals (see Ctrl+F above) —
+        // whatever the focused panel didn't consume dies here.
+        self.alq_focus_filter = false;
+        self.evt_focus_filter = false;
+        self.rul_focus_filter = false;
+        self.ioc_focus_filter = false;
+        self.yar_focus_filter = false;
+        self.pip_focus_filter = false;
+        self.aud_focus_filter = false;
+        self.net_focus_filter = false;
+
         self.renderToasts(wp, wsz);
         self.renderCritBanner(wp, wsz);
         self.renderFooter(wp, wsz);
@@ -1331,15 +1424,20 @@ pub const Dashboard = struct {
             self.cmd_focus_request = true;
         }
 
-        // Ctrl+F: focus the focused panel's filter box (panels consume the
-        // matching *_focus_filter flag on their next render).
-        if (ctrl and !shift and zgui.isKeyPressed(.f, false)) {
+        // Ctrl+F: focus the focused panel's filter box. The flags are
+        // one-frame signals: every filterable panel gets one, the focused
+        // panel consumes its own this frame, and render() clears the rest
+        // at frame end — a latched flag can never steal focus later.
+        // Suppressed while typing so Ctrl+F inside a text field is inert.
+        if (ctrl and !shift and !zgui.io.getWantTextInput() and zgui.isKeyPressed(.f, false)) {
             self.alq_focus_filter = true;
             self.evt_focus_filter = true;
             self.rul_focus_filter = true;
             self.ioc_focus_filter = true;
             self.yar_focus_filter = true;
             self.pip_focus_filter = true;
+            self.aud_focus_filter = true;
+            self.net_focus_filter = true;
         }
 
         // `?` (Shift+/ outside text inputs) opens the HELP directory.
@@ -1456,11 +1554,18 @@ pub const Dashboard = struct {
         const submitted = zgui.inputTextWithHint("##cmdline", .{
             .hint = "code or search \u{00B7} Ctrl+K",
             .buf = &self.cmd_buf,
-            .flags = .{ .enter_returns_true = true, .callback_history = true },
+            .flags = .{ .enter_returns_true = true, .callback_history = true, .callback_completion = true },
             .callback = cmdInputCallback,
             .user_data = self,
         });
         const cmd_active = zgui.isItemActive();
+        // Esc clears the line for real (ImGui's native Esc only reverts to
+        // the activation value, which after a failed submit is the typo).
+        if (cmd_active and zgui.isKeyPressed(.escape, false)) {
+            @memset(&self.cmd_buf, 0);
+            self.palette_match_count = 0;
+            self.cmd_history_pos = null;
+        }
         const text = std.mem.sliceTo(&self.cmd_buf, 0);
 
         // Refresh fuzzy matches while typing.
@@ -1493,6 +1598,9 @@ pub const Dashboard = struct {
                 @memset(&self.cmd_buf, 0);
                 self.palette_match_count = 0;
                 self.cmd_history_pos = null;
+            } else if (text.len > 0) {
+                // Never a silent no-op: say so, keep the text for fixing.
+                ui.events.post(.warn, "cmd", "no matching command: {s}", .{text});
             }
             // Keep focus for chained commands.
             zgui.setKeyboardFocusHere(-1);
@@ -1535,7 +1643,7 @@ pub const Dashboard = struct {
                         zgui.textColored(t.text.lo, "{s}", .{cmd.key_hint});
                     }
                 }
-                zgui.textColored(t.text.lo, "Enter runs \u{00B7} \u{2191}\u{2193} select \u{00B7} Esc clears", .{});
+                zgui.textColored(t.text.lo, "Enter runs \u{00B7} \u{2191}\u{2193} select \u{00B7} Tab completes \u{00B7} Esc clears", .{});
             }
             zgui.end();
         }
@@ -1613,17 +1721,23 @@ pub const Dashboard = struct {
                     upd.err = domain.FixedStr(32).from("canceled");
                     _ = self.store.upsertEnrichment(upd);
                 }
+            },
+            .url_scan => {
+                // Only THIS submission (arg = scan id) errs out.
                 for (self.store.urlscans.items) |*u| {
-                    if (u.state == .pending) _ = self.store.setUrlScanState(u.id, .err, now);
+                    if (u.id == j.arg and u.state == .pending) {
+                        _ = self.store.setUrlScanState(u.id, .err, "canceled", now);
+                    }
                 }
             },
             .feed_sync => {
                 // A canceled sync is NOT a successful one: revert the spinner
-                // without stamping last_sync_ms.
+                // without stamping last_sync_ms. Per-feed cancels (arg =
+                // id + 1) leave other in-flight syncs alone.
                 for (self.store.feeds.items) |*f| {
-                    if (f.status == .syncing) f.status = .ok;
+                    if (j.arg != 0 and f.id != j.arg - 1) continue;
+                    if (f.status == .syncing) _ = self.store.setFeedStatus(f.id, .ok, null);
                 }
-                self.store.touch();
             },
             else => {},
         }
@@ -1648,19 +1762,26 @@ pub const Dashboard = struct {
                     _ = self.store.upsertEnrichment(filled);
                     done += 1;
                 }
-                // Pending url scans complete alongside.
-                for (self.store.urlscans.items) |*u| {
-                    if (u.state == .pending) _ = self.store.setUrlScanState(u.id, .done, now);
-                }
                 if (done > 0) ui.events.post(.ok, "enrich", "{d} IOC(s) enriched", .{done});
+            },
+            .url_scan => {
+                // Complete THIS submission (arg = scan id).
+                for (self.store.urlscans.items) |*u| {
+                    if (u.id == j.arg and u.state == .pending) {
+                        _ = self.store.setUrlScanState(u.id, .done, "", now);
+                        ui.events.post(.ok, "enrich", "url scan #{d} completed", .{u.id});
+                    }
+                }
             },
             .yara_ci => {
                 // Re-run CI: fresh scan times with a small deterministic
-                // jitter keyed off the rule name (not the world PRNG).
+                // jitter keyed off the rule name + job id (not the world
+                // PRNG, and not the wall clock — the guided tour captures
+                // this and must reproduce byte-for-byte).
                 var pass: u32 = 0;
                 for (self.store.yara.items) |*y| {
                     var g = y.gates;
-                    const h = std.hash.Fnv1a_64.hash(y.name.slice()) ^ @as(u64, @bitCast(now));
+                    const h = std.hash.Fnv1a_64.hash(y.name.slice()) ^ @as(u64, j.id);
                     var local = std.Random.DefaultPrng.init(h);
                     const jitter = local.random().float(f32) * 4.0 - 2.0;
                     g.scan_ms = @max(0.5, g.scan_ms + jitter);
@@ -1711,21 +1832,21 @@ pub const Dashboard = struct {
             .feed_sync => {
                 // Per-feed (arg = id + 1) or fleet-wide (arg = 0). The
                 // err-story feed stays broken: its sync completes as a
-                // deterministic failure instead of silently healing.
+                // deterministic failure instead of silently healing. All
+                // transitions ride Store.setFeedStatus so they persist to
+                // PG, land in the audit trail, and survive snapshot swaps.
                 var synced: u32 = 0;
                 for (self.store.feeds.items) |*f| {
                     if (j.arg != 0 and f.id != j.arg - 1) continue;
                     if (f.status != .syncing) continue;
                     if (std.mem.eql(u8, f.name.slice(), "Emerging Threats")) {
-                        f.status = .err;
+                        _ = self.store.setFeedStatus(f.id, .err, null);
                         ui.events.post(.warn, "feeds", "{s} sync FAILED: upstream 401 \u{2014} check credentials", .{f.name.slice()});
                     } else {
-                        f.status = .ok;
-                        f.last_sync_ms = now;
+                        _ = self.store.setFeedStatus(f.id, .ok, now);
                         synced += 1;
                     }
                 }
-                self.store.touch();
                 if (synced > 0) ui.events.post(.ok, "feeds", "{d} feed(s) synced", .{synced});
             },
             .rule_backtest => {
@@ -1743,13 +1864,11 @@ pub const Dashboard = struct {
                 }
             },
             .retention_sweep => {
-                // Bounded-history housekeeping (mock mode only — under PG
-                // the snapshot refresh owns the row set).
-                if (self.mock_ticking) {
-                    const runs = self.store.prunePipelineRuns(30);
-                    const dlq = self.store.pruneDeadLetters(now - 24 * std.time.ms_per_hour);
-                    ui.events.post(.ok, "retention", "sweep: {d} old run(s), {d} resolved dead letter(s) pruned", .{ runs, dlq });
-                }
+                // Bounded-history housekeeping. The single retention_prune
+                // mutation mirrors the deletions to PG (and the audit
+                // trail), so the sweep is real under both providers.
+                const pruned = self.store.pruneRetention(30, now - 24 * std.time.ms_per_hour);
+                ui.events.post(.ok, "retention", "sweep: {d} old run(s), {d} resolved dead letter(s) pruned", .{ pruned.runs, pruned.dlq });
             },
         }
     }
@@ -2116,6 +2235,18 @@ pub const Dashboard = struct {
             if (visible) {
                 drawPanelIdentityBar(i);
                 panels_mod.render(self, i);
+                // Right-click on the panel background: float it out of its
+                // dock node (consumers of panel_float_request undock+resize).
+                if (zgui.beginPopupContextWindow()) {
+                    var fb: [64]u8 = undefined;
+                    const fl = std.fmt.bufPrintZ(&fb, "Float {s}##float{d}", .{ panels[i].code, i }) catch "Float";
+                    if (zgui.menuItem(fl, .{})) {
+                        self.panel_float_request[i] = true;
+                        self.panel_force_open[i] = true;
+                        self.panel_focus_request = i;
+                    }
+                    zgui.endPopup();
+                }
             }
             zgui.end();
             if (!keep_open) self.panel_force_open[i] = false;
@@ -2333,15 +2464,25 @@ pub const Dashboard = struct {
         var pbuf: [300]u8 = undefined;
         const path = self.uiStatePath(&pbuf) orelse return;
 
-        var jbuf: [512]u8 = undefined;
-        const evt_filter = std.mem.sliceTo(&self.evt_filter_buf, 0);
-        // Fields are JSON-escape-free by construction (enum tag, ints, a
-        // filter string that panels keep to plain ASCII).
-        const json = std.fmt.bufPrint(&jbuf, "{{\n  \"schema_version\": 1,\n  \"workspace\": \"{s}\",\n  \"seed\": {d},\n  \"alq_show_closed\": {},\n  \"evt_filter\": \"{s}\"\n}}\n", .{
+        var jbuf: [1024]u8 = undefined;
+        // Fields are JSON-escape-free by construction (enum tags, ints,
+        // filter strings that panels keep to plain ASCII).
+        const json = std.fmt.bufPrint(&jbuf, "{{\n  \"schema_version\": 1,\n  \"workspace\": \"{s}\",\n  \"seed\": {d},\n  \"alq_show_closed\": {},\n  \"evt_filter\": \"{s}\",\n  \"alq_filter\": \"{s}\",\n  \"rul_filter\": \"{s}\",\n  \"ioc_filter\": \"{s}\",\n  \"yar_filter\": \"{s}\",\n  \"pip_filter\": \"{s}\",\n  \"alq_sev\": {d},\n  \"log_sev\": {d},\n  \"ioc_types\": {d},\n  \"evt_kinds\": {d},\n  \"yar_fail_only\": {},\n  \"tun_threshold\": {d:.3}\n}}\n", .{
             @tagName(ui.layout.active),
             self.seed,
             self.alq_show_closed,
-            evt_filter,
+            std.mem.sliceTo(&self.evt_filter_buf, 0),
+            std.mem.sliceTo(&self.alq_filter_buf, 0),
+            std.mem.sliceTo(&self.rul_filter_buf, 0),
+            std.mem.sliceTo(&self.ioc_filter_buf, 0),
+            std.mem.sliceTo(&self.yar_filter_buf, 0),
+            std.mem.sliceTo(&self.pip_filter_buf, 0),
+            packBools(5, &self.alq_sev_show),
+            packBools(5, &self.log_sev_show),
+            packBools(5, &self.ioc_type_show),
+            packBools(7, &self.evt_kind_show),
+            self.yar_fail_only,
+            self.tun_threshold,
         }) catch return;
         ui.layout.atomicWrite(path, json) catch |err| {
             std.log.warn("ui_state: save failed: {s}", .{@errorName(err)});
@@ -2372,9 +2513,18 @@ pub const Dashboard = struct {
         }
         self.ui_state_last_ws = ui.layout.active;
         self.alq_show_closed = v.alq_show_closed;
-        const flen = @min(v.evt_filter.len, self.evt_filter_buf.len - 1);
-        @memset(&self.evt_filter_buf, 0);
-        @memcpy(self.evt_filter_buf[0..flen], v.evt_filter[0..flen]);
+        copyFilter(&self.evt_filter_buf, v.evt_filter);
+        copyFilter(&self.alq_filter_buf, v.alq_filter);
+        copyFilter(&self.rul_filter_buf, v.rul_filter);
+        copyFilter(&self.ioc_filter_buf, v.ioc_filter);
+        copyFilter(&self.yar_filter_buf, v.yar_filter);
+        copyFilter(&self.pip_filter_buf, v.pip_filter);
+        unpackBools(5, v.alq_sev, &self.alq_sev_show);
+        unpackBools(5, v.log_sev, &self.log_sev_show);
+        unpackBools(5, v.ioc_types, &self.ioc_type_show);
+        unpackBools(7, v.evt_kinds, &self.evt_kind_show);
+        self.yar_fail_only = v.yar_fail_only;
+        self.tun_threshold = std.math.clamp(v.tun_threshold, 0.0, 1.0);
         // Seed restore only when the current world was built with the
         // default: an explicit --seed wins.
         if (v.seed != self.seed and self.seed == 42) {
@@ -2582,6 +2732,68 @@ pub const Dashboard = struct {
             if (!s.setCaseNotes(cid, "selftest probe note", unixNowMs())) return error.MutateFailed;
             if (!std.mem.eql(u8, s.cases.items[0].notes.slice(), "selftest probe note")) return error.MutateFailed;
             if (!s.setCaseNotes(cid, before.slice(), unixNowMs())) return error.MutateFailed;
+        }
+
+        // Feed sync lifecycle: syncing keeps the stamp, ok stamps it.
+        {
+            const f0 = &s.feeds.items[0];
+            const fid = f0.id;
+            const prev_status = f0.status;
+            const prev_ms = f0.last_sync_ms;
+            if (!s.setFeedStatus(fid, .syncing, null)) return error.MutateFailed;
+            if (s.feedById(fid).?.last_sync_ms != prev_ms) return error.FeedStampLeaked;
+            if (!s.setFeedStatus(fid, prev_status, prev_ms)) return error.MutateFailed;
+        }
+
+        // Case CRUD: create → assign → unassign → meta edit.
+        {
+            const now = unixNowMs();
+            const aid = blk: {
+                for (s.alerts.items) |*a| {
+                    if (a.case_id == null and a.status == .new) break :blk a.id;
+                }
+                return error.NoUncasedAlert;
+            };
+            const cid = s.addCase(.{
+                .id = 0,
+                .title = domain.FixedStr(96).from("selftest probe case"),
+                .severity = .low,
+                .opened_ms = now,
+                .updated_ms = now,
+            }) orelse return error.MutateFailed;
+            if (!s.assignAlertToCase(aid, cid, now)) return error.MutateFailed;
+            if (s.alertById(aid).?.status != .investigating) return error.CaseAssignNoFlip;
+            if (!s.unassignAlertFromCase(aid, now)) return error.MutateFailed;
+            if (s.alertById(aid).?.case_id != null) return error.CaseUnassignLeft;
+            if (s.alertById(aid).?.status != .new) return error.CaseUnassignNoRevert;
+            if (!s.updateCaseMeta(cid, "selftest probe case (edited)", .medium, "cpresley", now)) return error.MutateFailed;
+        }
+
+        // FP feedback lands on the rule.
+        {
+            const rid = s.rules.items[0].id;
+            const before = s.rules.items[0].fp_7d;
+            if (!s.bumpRuleFp(rid)) return error.MutateFailed;
+            if (s.ruleById(rid).?.fp_7d != before + 1) return error.FpFeedbackLost;
+        }
+
+        // url_scan job lifecycle: submit → its own job kind → complete only
+        // that submission.
+        {
+            const url_ioc = blk: {
+                for (s.iocs.items) |*ic| {
+                    if (ic.type == .url and s.urlScanForIoc(ic.id) == null) break :blk ic.id;
+                }
+                break :blk s.iocs.items[0].id;
+            };
+            const scan_id = s.submitUrlScan(url_ioc, unixNowMs()) orelse return error.MutateFailed;
+            _ = self.jobs.enqueue(.url_scan, scan_id, "scan", unixNowMs()) orelse return error.JobNotQueued;
+            const job = self.jobs.active(.url_scan, scan_id) orelse return error.JobNotQueued;
+            const jcopy = job.*;
+            self.onJobComplete(&jcopy);
+            for (s.urlscans.items) |*u| {
+                if (u.id == scan_id and u.state != .done) return error.UrlScanNotCompleted;
+            }
         }
 
         // ui_state round-trip through the JSON path.

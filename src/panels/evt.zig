@@ -30,7 +30,7 @@ pub fn render(d: *Dashboard) void {
         zgui.setKeyboardFocusHere(0);
     }
     zgui.setNextItemWidth(220);
-    _ = zgui.inputTextWithHint("##evt_filter", .{ .hint = "substring: process/cmdline/host/user", .buf = &d.evt_filter_buf });
+    _ = zgui.inputTextWithHint("##evt_filter", .{ .hint = "filter (Ctrl+F)", .buf = &d.evt_filter_buf });
     if (d.evt_range != null) {
         zgui.sameLine(.{ .spacing = 10 });
         zgui.textColored(t.amber, "TLN range", .{});
@@ -69,6 +69,33 @@ pub fn render(d: *Dashboard) void {
         zgui.spacing();
         zgui.textColored(t.text.lo, "No events match.", .{});
         return;
+    }
+
+    // ── Keyboard: ↑↓ row selection, Enter opens the detail row ──────────
+    {
+        var sel_pos: ?usize = null;
+        if (d.evt_sel) |eid| {
+            for (rows[0..m], 0..) |ri, p| {
+                if (s.events.items[ri].id == eid) {
+                    sel_pos = p;
+                    break;
+                }
+            }
+        }
+        const win_focused = zgui.isWindowFocused(.{ .root_window = true, .child_windows = true });
+        if (win_focused and !zgui.io.getWantTextInput()) {
+            if (zgui.isKeyPressed(.down_arrow, true)) {
+                const p = if (sel_pos) |p| @min(p + 1, m - 1) else 0;
+                d.evt_sel = s.events.items[rows[p]].id;
+            }
+            if (zgui.isKeyPressed(.up_arrow, true)) {
+                const p = if (sel_pos) |p| p -| 1 else 0;
+                d.evt_sel = s.events.items[rows[p]].id;
+            }
+            if (zgui.isKeyPressed(.enter, false) and d.evt_sel == null) {
+                d.evt_sel = s.events.items[rows[0]].id;
+            }
+        }
     }
 
     const avail = zgui.getContentRegionAvail();
@@ -137,6 +164,11 @@ pub fn render(d: *Dashboard) void {
             zgui.textColored(t.text.mid, "#{d} \u{00B7} {s} \u{00B7} {s} \u{00B7} {s}", .{
                 e.id, e.kind.label(), s.hostName(e.host), s.userName(e.user),
             });
+            if (e.sensor < s.sensors.items.len) {
+                const sn = &s.sensors.items[e.sensor];
+                zgui.sameLine(.{ .spacing = 10 });
+                zgui.textColored(t.text.lo, "via {s} ({s})", .{ sn.host.slice(), sn.kind.label() });
+            }
             if (e.technique) |tid| {
                 const tech = domain.attack.get(tid);
                 zgui.sameLine(.{ .spacing = 10 });

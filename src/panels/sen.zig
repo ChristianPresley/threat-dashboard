@@ -28,36 +28,58 @@ pub fn render(d: *Dashboard) void {
     zgui.sameLine(.{ .spacing = 10 });
     zgui.textColored(if (down_n > 0) t.sev.crit else t.text.lo, "{d} down", .{down_n});
 
-    const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };
-    if (zgui.beginTable("##sen_table", .{ .column = 6, .flags = flags })) {
-        zgui.tableSetupColumn("", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 20 });
-        zgui.tableSetupColumn("Sensor", .{ .flags = .{ .width_stretch = true } });
-        zgui.tableSetupColumn("Kind", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 58 });
-        zgui.tableSetupColumn("EPS", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 66 });
-        zgui.tableSetupColumn("Lag", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 64 });
-        zgui.tableSetupColumn("Version", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 70 });
+    // Width-planned columns: the sensor name is the payload; narrow docks
+    // drop Version, then Kind (both live in the status-dot tooltip).
+    const cols = [_]ui.table.Col{
+        .{ .name = "", .w = 20 },
+        .{ .name = "Sensor" },
+        .{ .name = "Kind", .w = 58, .prio = 1 },
+        .{ .name = "EPS", .w = 66 },
+        .{ .name = "Lag", .w = 64 },
+        .{ .name = "Version", .w = 70, .prio = 2 },
+    };
+    const avail = zgui.getContentRegionAvail();
+    const detail_h: f32 = if (d.sen_sel != null) 24 else 0;
+    const pl = ui.table.plan(&cols, avail[0], 140);
+    const flags = zgui.TableFlags{ .resizable = true, .no_saved_settings = true, .borders = .{ .inner_h = true }, .scroll_y = true };
+    if (zgui.beginTable("##sen_table", .{ .column = pl.count, .flags = flags, .outer_size = .{ avail[0], @max(80, avail[1] - detail_h) } })) {
+        ui.table.setup(&cols, &pl);
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
         for (s.sensors.items) |*sn| {
             zgui.tableNextRow(.{});
-            if (sn.status == .down) {
+            const selected = d.sen_sel != null and d.sen_sel.? == sn.id;
+            if (selected) {
+                zgui.tableSetBgColor(.{ .target = .row_bg0, .color = zgui.colorConvertFloat4ToU32(t.bg.selected) });
+            } else if (sn.status == .down) {
                 zgui.tableSetBgColor(.{ .target = .row_bg0, .color = zgui.colorConvertFloat4ToU32(t.sev.crit_dim) });
             } else if (sn.status == .degraded) {
                 zgui.tableSetBgColor(.{ .target = .row_bg0, .color = zgui.colorConvertFloat4ToU32(t.sev.warn_dim) });
             }
             _ = zgui.tableNextColumn();
+            // Row-spanning selectable behind the status dot.
+            var slbl: [24]u8 = undefined;
+            const sl = std.fmt.bufPrintZ(&slbl, "##senrow{d}", .{sn.id}) catch "##s";
+            const cur = zgui.getCursorPosX();
+            if (zgui.selectable(sl, .{ .selected = selected, .flags = .{ .span_all_columns = true, .allow_overlap = true } })) {
+                d.sen_sel = if (selected) null else sn.id;
+            }
+            zgui.sameLine(.{});
+            zgui.setCursorPosX(cur);
             zgui.textColored(dash.sensorStatusColor(sn.status), "{s}", .{ui.fonts.fa.circle});
             if (zgui.isItemHovered(.{})) {
                 if (zgui.beginTooltip()) {
-                    zgui.text("{s}", .{sn.status.label()});
+                    zgui.text("{s} \u{00B7} {s} \u{00B7} v{s}", .{ sn.status.label(), sn.kind.label(), sn.version.slice() });
                     zgui.endTooltip();
                 }
             }
             _ = zgui.tableNextColumn();
             zgui.textUnformattedColored(t.text.hi, sn.host.slice());
-            _ = zgui.tableNextColumn();
-            zgui.textColored(t.text.mid, "{s}", .{sn.kind.label()});
+            if (pl.on(2)) {
+                _ = zgui.tableNextColumn();
+                zgui.textColored(t.text.mid, "{s}", .{sn.kind.label()});
+            }
             _ = zgui.tableNextColumn();
             // EPS flash-on-update: background tint via the flash engine.
             const key = ui.flash.cellKey("sen_eps", sn.id, 0);
@@ -79,9 +101,30 @@ pub fn render(d: *Dashboard) void {
             } else {
                 zgui.textColored(t.text.mid, "{d:.1}s", .{sn.lag_s});
             }
-            _ = zgui.tableNextColumn();
-            zgui.textUnformattedColored(t.text.lo, sn.version.slice());
+            if (pl.on(5)) {
+                _ = zgui.tableNextColumn();
+                zgui.textUnformattedColored(t.text.lo, sn.version.slice());
+            }
         }
         zgui.endTable();
+    }
+
+    // ── Detail line for the selection (the down-sensor "when did we last
+    //    hear from it" answer) ────────────────────────────────────────────
+    if (d.sen_sel) |sid| {
+        const sn = blk: {
+            for (s.sensors.items) |*x| {
+                if (x.id == sid) break :blk x;
+            }
+            d.sen_sel = null;
+            return;
+        };
+        var ab: [16]u8 = undefined;
+        const age_s = @divFloor(dash.unixNowMs() - sn.last_seen_ms, 1000);
+        zgui.textColored(dash.sensorStatusColor(sn.status), "{s}", .{sn.status.label()});
+        zgui.sameLine(.{ .spacing = 8 });
+        zgui.textColored(t.text.mid, "{s} \u{00B7} {s} \u{00B7} v{s} \u{00B7} last seen {s} ago", .{
+            sn.host.slice(), sn.kind.label(), sn.version.slice(), ui.fmt.age(&ab, age_s),
+        });
     }
 }

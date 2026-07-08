@@ -48,6 +48,9 @@ pub fn render(d: *Dashboard) void {
     }
 
     // ── Controls ─────────────────────────────────────────────────────────
+    // The range can be cleared from EVT/NET (their × button) — drop the
+    // brush handles too instead of leaving them armed on a dead range.
+    if (brush_on and d.evt_range == null) brush_on = false;
     if (dash.filterChip("brush##tln", brush_on, t.accent)) {
         brush_on = !brush_on;
         if (brush_on) {
@@ -78,7 +81,7 @@ pub fn render(d: *Dashboard) void {
     const avail = zgui.getContentRegionAvail();
     if (zgui.plot.beginPlot("##tln_plot", .{
         .w = avail[0],
-        .h = @max(120, avail[1] - 2),
+        .h = @max(140, avail[1] - 2),
         .flags = .{ .no_title = true },
     })) {
         zgui.plot.setupAxis(.x1, .{ .flags = .{ .no_label = true } });
@@ -88,7 +91,9 @@ pub fn render(d: *Dashboard) void {
             .min = @floatFromInt(@divFloor(start_ms, 1000)),
             .max = @floatFromInt(@divFloor(now_ms, 1000)),
         });
-        zgui.plot.setupLegend(.{ .north = true, .west = true }, .{});
+        // Outside horizontal legend: never overlaps the area chart and can't
+        // be vertically clipped in short docks (costs one text row of canvas).
+        zgui.plot.setupLegend(.{ .north = true }, .{ .horizontal = true, .outside = true });
 
         // Draw top-down so lower layers stay visible under higher ones.
         const order = [_]domain.Severity{ .critical, .high, .medium, .low, .info };

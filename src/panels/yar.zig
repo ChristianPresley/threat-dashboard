@@ -82,7 +82,7 @@ pub fn render(d: *Dashboard) void {
         zgui.setKeyboardFocusHere(0);
     }
     zgui.setNextItemWidth(200);
-    _ = zgui.inputTextWithHint("##yar_filter", .{ .hint = "filter name/code (Ctrl+F)", .buf = &d.yar_filter_buf });
+    _ = zgui.inputTextWithHint("##yar_filter", .{ .hint = "filter (Ctrl+F)", .buf = &d.yar_filter_buf });
     zgui.sameLine(.{ .spacing = 8 });
     if (dash.filterChip("failures only##yarfail", d.yar_fail_only, t.sev.crit)) {
         d.yar_fail_only = !d.yar_fail_only;
@@ -227,6 +227,13 @@ pub fn render(d: *Dashboard) void {
     gateGlyph("tp", g.tp == .pass, "true-positive");
     gateGlyph("fp", g.fpPass(), "false-positive");
     zgui.textColored(dash.gateColor(g.perfPass()), "perf {d:.0}/{d:.0}ms", .{ g.scan_ms, g.budget_ms });
+    zgui.sameLine(.{ .spacing = 10 });
+    if (g.last_ci_ms > 0) {
+        var cib: [16]u8 = undefined;
+        zgui.textColored(t.text.lo, "CI ran {s} ago", .{ui.fmt.age(&cib, @divFloor(dash.unixNowMs() - g.last_ci_ms, 1000))});
+    } else {
+        zgui.textColored(t.text.lo, "CI: never ran", .{});
+    }
     zgui.sameLine(.{ .spacing = 10 });
     zgui.textColored(t.text.lo, "TP fixture: samples/{s}.bin (mapping.yml)", .{y.name.slice()});
 
