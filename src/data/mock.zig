@@ -120,6 +120,34 @@ const rule_defs = [_]struct {
     .{ .name = "Backup service stop", .tid = "T1489", .sev = .high, .query = "svc where action == 'stop' and name in (backup_services)" },
 };
 
+/// YARA rule blueprints (rules-as-code): each carries the mandatory
+/// 7-field metadata plus a *scripted* CI gate story so the YAR panel tells
+/// a coherent narrative — one meta failure, one TP miss, one FP offender,
+/// one perf blowout, the rest green.
+const yara_defs = [_]struct {
+    name: []const u8,
+    tid: []const u8,
+    sev: domain.Severity,
+    status: domain.YaraStatus = .active,
+    description: []const u8,
+    reference: []const u8,
+    strings_excerpt: []const u8,
+    condition: []const u8,
+    meta_fail: bool = false, // reference field missing → metadata policy gate fails
+    tp_fail: bool = false, // synthetic fixture no longer fires
+    fp_count: u16 = 0, // goodware-corpus hits
+    scan_ms: f32,
+}{
+    .{ .name = "PowerShell_EncodedCommand", .tid = "T1059.001", .sev = .high, .description = "Detects PowerShell invoked with an encoded (Base64) command payload", .reference = "https://attack.mitre.org/techniques/T1059/001/", .strings_excerpt = "$flag = /-e(nc|c)?\\s+[A-Za-z0-9+\\/]{40,}={0,2}/ nocase\n$ps = \"powershell\" nocase", .condition = "$ps and $flag", .scan_ms = 4.1 },
+    .{ .name = "PowerShell_AMSI_Bypass", .tid = "T1562.001", .sev = .critical, .description = "Detects reflective AMSI bypass patterns in PowerShell/.NET", .reference = "https://attack.mitre.org/techniques/T1562/001/", .strings_excerpt = "$a1 = \"AmsiScanBuffer\" ascii wide\n$a2 = \"amsiInitFailed\" ascii wide\n$r = \"[Ref].Assembly.GetType\" nocase", .condition = "$r and any of ($a*)", .scan_ms = 5.6 },
+    .{ .name = "Webshell_PHP_Eval_Base64", .tid = "T1505.003", .sev = .critical, .description = "PHP webshell: eval over a base64-decoded superglobal", .reference = "https://attack.mitre.org/techniques/T1505/003/", .strings_excerpt = "$php = \"<?php\"\n$sink = \"eval(\" nocase\n$dec = \"base64_decode(\" nocase\n$sg = /_(GET|POST|REQUEST)\\[/", .condition = "$php and $sink and $dec and $sg", .fp_count = 2, .scan_ms = 7.9 },
+    .{ .name = "Phishing_Kit_CredHarvest_HTML", .tid = "T1566.002", .sev = .high, .description = "Credential-harvest page: password field + off-site POST + staged decoder", .reference = "https://attack.mitre.org/techniques/T1566/002/", .strings_excerpt = "$pw = \"type=\\\"password\\\"\" nocase\n$post = /action=\\\"https?:\\/\\/[^\\\"]{8,}\\\"/ nocase\n$b64 = \"atob(\" nocase", .condition = "$pw and $post and $b64", .meta_fail = true, .scan_ms = 6.3 },
+    .{ .name = "LNK_ScriptHost_Dropper", .tid = "T1204.002", .sev = .high, .description = "Shortcut dropper: script-host launch with window-stealth flags", .reference = "https://attack.mitre.org/techniques/T1204/002/", .strings_excerpt = "$host = /(wscript|cscript|mshta|powershell)(\\.exe)?/ nocase\n$hide = /-w(indowstyle)?\\s+hidden/ nocase", .condition = "$host and $hide", .scan_ms = 3.4 },
+    .{ .name = "Base64_Encoded_PE_Heuristic", .tid = "T1027", .sev = .medium, .description = "Base64-embedded PE: MZ header prefix or DOS-stub marker in encoded form", .reference = "https://attack.mitre.org/techniques/T1027/", .strings_excerpt = "$mz1 = \"TVqQAAMAAAAEAAAA\"\n$stub = \"VGhpcyBwcm9ncmFtIGNhbm5vdCBiZSBydW4\"", .condition = "any of them", .scan_ms = 86.0 },
+    .{ .name = "LLM_Jailbreak_PromptInjection", .tid = "T1204.002", .sev = .low, .status = .draft, .description = "Prompt-injection payloads in untrusted text: override/role/exfil phrase banks", .reference = "https://attack.mitre.org/techniques/T1204/", .strings_excerpt = "$o1 = \"ignore previous instructions\" nocase\n$o2 = \"disregard your system prompt\" nocase\n$x1 = \"reveal your instructions\" nocase", .condition = "2 of them", .tp_fail = true, .scan_ms = 9.2 },
+    .{ .name = "Ransomware_Note_Template", .tid = "T1486", .sev = .critical, .description = "Ransom-note skeleton: encryption claim + payment channel + deadline threat", .reference = "https://attack.mitre.org/techniques/T1486/", .strings_excerpt = "$enc = /files (have been|are) encrypted/ nocase\n$tor = /[a-z2-7]{56}\\.onion/\n$btc = /\\b(bitcoin|monero|btc|xmr)\\b/ nocase", .condition = "$enc and ($tor or $btc)", .scan_ms = 44.0 },
+};
+
 /// One stage of a scripted incident chain.
 const ChainStage = struct {
     kind: domain.EventKind,
@@ -425,6 +453,13 @@ pub const Generator = struct {
         // ── Cases: one per chain + misc clusters ─────────────────────────
         try self.buildCases(store);
 
+        // ── YARA rules + IOC enrichment + url scans ──────────────────────
+        // Appended after everything else so the RNG draw sequence of the
+        // pre-existing world is untouched (same seed ⇒ same events/alerts).
+        try self.buildYara(store);
+        try self.buildEnrichment(store);
+        try self.buildUrlScans(store);
+
         store.touch();
     }
 
@@ -714,6 +749,213 @@ pub const Generator = struct {
         }
     }
 
+    fn buildYara(self: *Generator, store: *Store) !void {
+        const alloc = store.allocator;
+        for (yara_defs, 0..) |yd, i| {
+            const r = self.rand();
+            try store.yara.append(alloc, .{
+                .id = @intCast(i),
+                .code = domain.FixedStr(8).fromFmt("Y-{d:0>4}", .{i + 1}),
+                .name = domain.FixedStr(64).from(yd.name),
+                .status = yd.status,
+                .severity = yd.sev,
+                .technique = tidOf(yd.tid),
+                .author = domain.FixedStr(24).from(analyst_pool[i % 3]),
+                .date_ms = self.base_ms - @as(i64, r.intRangeAtMost(u32, 3, 54)) * std.time.ms_per_day,
+                .description = domain.FixedStr(160).from(yd.description),
+                // The meta-fail story is a missing `reference` field.
+                .reference = if (yd.meta_fail) .{} else domain.FixedStr(96).from(yd.reference),
+                .version = 1 + @as(u16, @intCast(i % 3)),
+                .strings_excerpt = domain.FixedStr(240).from(yd.strings_excerpt),
+                .condition = domain.FixedStr(160).from(yd.condition),
+                .gates = .{
+                    .compile = .pass,
+                    .meta = if (yd.meta_fail) .fail else .pass,
+                    .tp = if (yd.tp_fail) .fail else .pass,
+                    .fp_count = yd.fp_count,
+                    .scan_ms = yd.scan_ms + r.float(f32) * 2.0,
+                    .last_ci_ms = self.base_ms - @as(i64, r.intRangeAtMost(u32, 10, 300)) * std.time.ms_per_min,
+                },
+            });
+        }
+    }
+
+    const registrar_pool = [_][]const u8{
+        "NameCheap Inc.", "GoDaddy.com LLC", "Tucows Domains", "PDR Ltd.",
+        "Hosting Concepts BV", "NiceNIC Intl",
+    };
+    const as_pool = [_]struct { asn: u32, owner: []const u8, cc: []const u8 }{
+        .{ .asn = 13335, .owner = "CLOUDFLARENET", .cc = "US" },
+        .{ .asn = 16509, .owner = "AMAZON-02", .cc = "US" },
+        .{ .asn = 9009, .owner = "M247 Europe", .cc = "RO" },
+        .{ .asn = 20473, .owner = "AS-VULTR", .cc = "US" },
+        .{ .asn = 44477, .owner = "STARK-INDUSTRIES", .cc = "MD" },
+        .{ .asn = 197695, .owner = "AS-REG", .cc = "RU" },
+    };
+    const threat_label_pool = [_][]const u8{
+        "trojan.agent/generic", "phishing.credharvest", "downloader.ps1/cradle",
+        "ransomware.locknote", "backdoor.webshell", "infostealer.chromium",
+    };
+    const brand_pool = [_][]const u8{ "Microsoft", "Okta", "DHL", "DocuSign", "" };
+    const tls_issuer_pool = [_][]const u8{
+        "R11 (Let's Encrypt)", "GTS CA 1P5", "Sectigo RSA DV", "self-signed",
+    };
+
+    /// Enrichment as a *pure function* of the IOC value: FNV-1a(value) seeds
+    /// a LOCAL prng, so build-time and runtime-job enrichment of the same
+    /// IOC are byte-identical and never consume the generator's main stream.
+    /// Date fields anchor to the IOC's own timestamps (not `now_ms`) so the
+    /// record is reproducible; only `fetched_ms` carries the call time.
+    pub fn enrichmentFor(store: *const Store, ioc: *const domain.Ioc, now_ms: i64) domain.IocEnrichment {
+        const hash = std.hash.Fnv1a_64.hash(ioc.value.slice());
+        var local = std.Random.DefaultPrng.init(hash);
+        const r = local.random();
+
+        var e: domain.IocEnrichment = .{
+            .ioc_id = ioc.id,
+            .status = .done,
+            .source = .mock,
+            .fetched_ms = now_ms,
+            .first_seen_ms = ioc.first_seen_ms,
+            .last_seen_ms = ioc.last_seen_ms,
+        };
+
+        // Verdict correlates with feed confidence.
+        const roll = r.intRangeAtMost(u8, 0, 99);
+        e.verdict = if (ioc.confidence >= 80)
+            (if (roll < 75) domain.Verdict.malicious else if (roll < 95) .suspicious else .clean)
+        else if (ioc.confidence >= 50)
+            (if (roll < 25) domain.Verdict.malicious else if (roll < 70) .suspicious else .clean)
+        else
+            (if (roll < 8) domain.Verdict.malicious else if (roll < 30) .suspicious else .clean);
+
+        const engines: u16 = r.intRangeAtMost(u16, 65, 95);
+        switch (e.verdict) {
+            .malicious => {
+                e.det_malicious = r.intRangeAtMost(u16, engines * 45 / 100, engines * 80 / 100);
+                e.det_suspicious = r.intRangeAtMost(u16, 0, 4);
+                e.reputation = -@as(i32, r.intRangeAtMost(u16, 20, 90));
+                e.threat_label = domain.FixedStr(48).from(threat_label_pool[@intCast(hash % threat_label_pool.len)]);
+            },
+            .suspicious => {
+                e.det_malicious = r.intRangeAtMost(u16, 0, 2);
+                e.det_suspicious = r.intRangeAtMost(u16, 3, 12);
+                e.reputation = -@as(i32, r.intRangeAtMost(u16, 5, 30));
+            },
+            else => {
+                e.reputation = r.intRangeAtMost(u8, 0, 40);
+            },
+        }
+        e.det_undetected = r.intRangeAtMost(u16, 2, 10);
+        e.det_harmless = engines - @min(engines, e.det_malicious + e.det_suspicious + e.det_undetected);
+
+        switch (ioc.type) {
+            .domain => {
+                e.registrar = domain.FixedStr(48).from(registrar_pool[@intCast(hash % registrar_pool.len)]);
+                // NRD story: malicious domains skew young.
+                const age_days: u32 = if (e.verdict == .malicious)
+                    r.intRangeAtMost(u32, 3, 60)
+                else
+                    r.intRangeAtMost(u32, 30, 900);
+                e.creation_ms = ioc.first_seen_ms - @as(i64, age_days) * std.time.ms_per_day;
+                e.categories = domain.FixedStr(96).from(switch (e.verdict) {
+                    .malicious => "malware hosting, newly registered",
+                    .suspicious => "uncategorized, parked",
+                    else => "content delivery",
+                });
+            },
+            .ip => {
+                const as_e = as_pool[@intCast(hash % as_pool.len)];
+                e.asn = as_e.asn;
+                e.as_owner = domain.FixedStr(48).from(as_e.owner);
+                e.country = domain.FixedStr(4).from(as_e.cc);
+                // /24 network derived from the value's first three octets.
+                const v = ioc.value.slice();
+                const cut = std.mem.lastIndexOfScalar(u8, v, '.') orelse v.len;
+                e.network = domain.FixedStr(24).fromFmt("{s}.0/24", .{v[0..cut]});
+            },
+            .url => {
+                e.scan_score = switch (e.verdict) {
+                    .malicious => r.intRangeAtMost(u8, 70, 100),
+                    .suspicious => r.intRangeAtMost(u8, 40, 69),
+                    else => r.intRangeAtMost(u8, 0, 30),
+                };
+                e.brands = domain.FixedStr(48).from(brand_pool[@intCast(hash % brand_pool.len)]);
+                // Host part of the URL (strip scheme, cut at first '/').
+                const v = ioc.value.slice();
+                const host_start = if (std.mem.indexOf(u8, v, "://")) |p| p + 3 else 0;
+                const host_end = std.mem.indexOfScalarPos(u8, v, host_start, '/') orelse v.len;
+                e.page_domain = domain.FixedStr(64).from(v[host_start..host_end]);
+                e.page_ip = domain.FixedStr(46).fromFmt("{d}.{d}.{d}.{d}", .{
+                    r.intRangeAtMost(u8, 45, 195), r.intRangeAtMost(u8, 0, 255),
+                    r.intRangeAtMost(u8, 0, 255),  r.intRangeAtMost(u8, 1, 254),
+                });
+                e.tls_issuer = domain.FixedStr(48).from(tls_issuer_pool[@intCast(hash % tls_issuer_pool.len)]);
+            },
+            .hash_sha256, .email => {},
+        }
+
+        // Pivots: index arithmetic over the IOC list (no RNG-order
+        // dependence), filtered to ip/domain, skipping self and duplicates.
+        if (store.iocs.items.len > 1 and (ioc.type == .url or ioc.type == .domain or ioc.type == .ip)) {
+            const want: u8 = if (e.verdict == .malicious) 6 else 3;
+            var k: u64 = 0;
+            while (k < 24 and e.pivot_count < want) : (k += 1) {
+                const idx: usize = @intCast((hash +% k *% 7919) % store.iocs.items.len);
+                const cand = &store.iocs.items[idx];
+                if (cand.id == ioc.id) continue;
+                if (cand.type != .ip and cand.type != .domain) continue;
+                var dup = false;
+                for (e.pivot_ids[0..e.pivot_count]) |pid| {
+                    if (pid == cand.id) dup = true;
+                }
+                if (dup) continue;
+                e.pivot_ids[e.pivot_count] = cand.id;
+                e.pivot_count += 1;
+            }
+        }
+        return e;
+    }
+
+    fn buildEnrichment(self: *Generator, store: *Store) !void {
+        const alloc = store.allocator;
+        // Enrich the interesting subset: every IOC that actually hit
+        // telemetry, plus every 7th by index for breadth (~120 records).
+        for (store.iocs.items, 0..) |*ic, i| {
+            if (ic.hits == 0 and i % 7 != 0) continue;
+            try store.enrichments.append(alloc, enrichmentFor(store, ic, self.base_ms));
+        }
+    }
+
+    fn buildUrlScans(self: *Generator, store: *Store) !void {
+        const alloc = store.allocator;
+        // Completed submissions for the first 3 enriched url IOCs, plus one
+        // pending — the submit → pending → done lifecycle on screen.
+        var made: u32 = 0;
+        for (store.iocs.items) |*ic| {
+            if (ic.type != .url) continue;
+            var enriched = false;
+            for (store.enrichments.items) |*e| {
+                if (e.ioc_id == ic.id) {
+                    enriched = true;
+                    break;
+                }
+            }
+            if (!enriched) continue;
+            const done = made < 3;
+            const submitted = self.base_ms - @as(i64, made + 1) * std.time.ms_per_hour;
+            try store.urlscans.append(alloc, .{
+                .id = made + 1,
+                .ioc_id = ic.id,
+                .state = if (done) .done else .pending,
+                .submitted_ms = submitted,
+                .completed_ms = if (done) submitted + 25 * std.time.ms_per_s else 0,
+            });
+            made += 1;
+            if (made >= 4) break;
+        }
+    }
+
     /// Live trickle: expected ~0.35 events/s (diurnal-weighted), the odd
     /// alert, sensor eps jitter. Call once per frame with wall-clock ms.
     pub fn tick(self: *Generator, store: *Store, now_ms: i64) void {
@@ -798,6 +1040,23 @@ pub const Generator = struct {
             step.mix(&h, a.entity.slice());
         }
         for (store.iocs.items) |*ic| step.mix(&h, ic.value.slice());
+        for (store.yara.items) |*y| {
+            step.mix(&h, y.name.slice());
+            step.mix(&h, std.mem.asBytes(&y.gates.fp_count));
+            step.mix(&h, std.mem.asBytes(&y.gates.scan_ms));
+            step.mix(&h, &.{ @intFromEnum(y.gates.compile), @intFromEnum(y.gates.meta), @intFromEnum(y.gates.tp) });
+        }
+        for (store.enrichments.items) |*e| {
+            step.mix(&h, std.mem.asBytes(&e.ioc_id));
+            step.mix(&h, &.{@intFromEnum(e.verdict)});
+            step.mix(&h, std.mem.asBytes(&e.det_malicious));
+            step.mix(&h, std.mem.asBytes(&e.det_suspicious));
+            step.mix(&h, std.mem.asBytes(&e.pivot_count));
+        }
+        for (store.urlscans.items) |*u| {
+            step.mix(&h, std.mem.asBytes(&u.id));
+            step.mix(&h, &.{@intFromEnum(u.state)});
+        }
         return h;
     }
 };
@@ -850,4 +1109,50 @@ test "world shape sane" {
     for (s.events.items) |*e| {
         if (e.parent) |p| try std.testing.expect(s.eventById(p) != null);
     }
+
+    // YARA world shape: all blueprints landed, scripted gate stories hold.
+    try std.testing.expectEqual(yara_defs.len, s.yara.items.len);
+    var failing: usize = 0;
+    for (s.yara.items) |*y| {
+        try std.testing.expect(y.technique < attack.techniques.len);
+        if (!y.gates.allPass()) failing += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), failing); // meta, tp, fp, perf stories
+
+    // Enrichment: breadth + referential integrity + pivot resolution.
+    try std.testing.expect(s.enrichments.items.len > 100);
+    for (s.enrichments.items) |*e| {
+        try std.testing.expect(s.iocById(e.ioc_id) != null);
+        try std.testing.expect(e.detTotal() > 0);
+        for (e.pivot_ids[0..e.pivot_count]) |pid| {
+            try std.testing.expect(s.iocById(pid) != null);
+        }
+    }
+
+    // Url scans reference url-type IOCs; lifecycle story present.
+    try std.testing.expectEqual(@as(usize, 4), s.urlscans.items.len);
+    var pending: usize = 0;
+    for (s.urlscans.items) |*u| {
+        const ic = s.iocById(u.ioc_id).?;
+        try std.testing.expectEqual(domain.IocType.url, ic.type);
+        if (u.state == .pending) pending += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), pending);
+}
+
+test "enrichmentFor is a pure function of the IOC" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    var g = Generator.init(42, 1_750_000_000_000);
+    try g.build(&s);
+
+    const ic = &s.iocs.items[0];
+    const a = Generator.enrichmentFor(&s, ic, 111);
+    const b = Generator.enrichmentFor(&s, ic, 222);
+    try std.testing.expectEqual(a.verdict, b.verdict);
+    try std.testing.expectEqual(a.det_malicious, b.det_malicious);
+    try std.testing.expectEqual(a.reputation, b.reputation);
+    try std.testing.expectEqual(a.creation_ms, b.creation_ms);
+    try std.testing.expectEqual(a.pivot_count, b.pivot_count);
+    try std.testing.expectEqualSlices(u32, &a.pivot_ids, &b.pivot_ids);
 }

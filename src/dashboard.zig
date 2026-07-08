@@ -54,6 +54,8 @@ pub const panels = [_]Panel{
     .{ .code = "JOB", .name = "Jobs", .group = "Ops" },
     .{ .code = "SET", .name = "Settings", .group = "Ops" },
     .{ .code = "HELP", .name = "Directory", .group = "Ops" },
+    .{ .code = "YAR", .name = "YARA Rules", .group = "Detect" },
+    .{ .code = "ENR", .name = "IOC Enrichment", .group = "Intel" },
 };
 
 pub const PANEL_PST: usize = 0;
@@ -75,6 +77,8 @@ pub const PANEL_LOG: usize = 15;
 pub const PANEL_JOB: usize = 16;
 pub const PANEL_SET: usize = 17;
 pub const PANEL_HELP: usize = 18;
+pub const PANEL_YAR: usize = 19;
+pub const PANEL_ENR: usize = 20;
 
 /// Workspace membership: only members of the ACTIVE workspace are
 /// submitted (plus force-opens). SET and HELP are in no preset — they
@@ -88,9 +92,9 @@ pub fn panelInWorkspace(idx: usize, ws: ui.layout.Workspace) bool {
             idx == PANEL_NET or idx == PANEL_IOC or idx == PANEL_LOG or
             idx == PANEL_JOB,
         .detect => idx == PANEL_RUL or idx == PANEL_ATK or idx == PANEL_TUN or
-            idx == PANEL_ALQ or idx == PANEL_LOG,
+            idx == PANEL_ALQ or idx == PANEL_LOG or idx == PANEL_YAR,
         .intel => idx == PANEL_FEED or idx == PANEL_IOC or idx == PANEL_TA or
-            idx == PANEL_CAS or idx == PANEL_LOG,
+            idx == PANEL_CAS or idx == PANEL_LOG or idx == PANEL_ENR,
         .ops => idx == PANEL_SEN or idx == PANEL_ING or idx == PANEL_JOB or
             idx == PANEL_ALQ or idx == PANEL_LOG,
     };
@@ -196,6 +200,34 @@ pub fn sensorStatusColor(s: domain.SensorStatus) [4]f32 {
     };
 }
 
+/// YARA quality grade ('A'..'F') → theme score band.
+pub fn gradeColor(g: u8) [4]f32 {
+    const t = ui.theme.default.score;
+    return switch (g) {
+        'A' => t.a,
+        'B' => t.b,
+        'C' => t.c,
+        'D' => t.d,
+        else => t.f,
+    };
+}
+
+/// Enrichment verdict → severity family (state, not identity).
+pub fn verdictColor(v: domain.Verdict) [4]f32 {
+    const t = ui.theme.default;
+    return switch (v) {
+        .malicious => t.sev.crit,
+        .suspicious => t.sev.warn,
+        .clean => t.sev.ok,
+        .unknown => t.text.lo,
+    };
+}
+
+pub fn gateColor(pass: bool) [4]f32 {
+    const t = ui.theme.default.sev;
+    return if (pass) t.ok else t.crit;
+}
+
 /// Toggleable filter chip: filled when on, outlined when off.
 pub fn filterChip(label: [:0]const u8, on: bool, hue: [4]f32) bool {
     const t = ui.theme.default;
@@ -296,7 +328,9 @@ const commands = [_]ui.registry.Command{
     .{ .code = "RUL", .name = "Detection Rules", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_RUL), .desc = "Focus Detection Rules (enable/disable, fire + FP stats, query text)" },
     .{ .code = "TUN", .name = "Rule Tuning", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_TUN), .desc = "Focus Rule Tuning (noisiest rules, fires vs FP rate)" },
     .{ .code = "ATK", .name = "ATT&CK Matrix", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_ATK), .desc = "Focus the ATT&CK coverage matrix (rule coverage + open-alert heat per technique)" },
+    .{ .code = "YAR", .name = "YARA Rules", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_YAR), .desc = "Focus YARA Rules (rule library + CI gate health: compile/meta/TP/FP/perf, quality grades)" },
     .{ .code = "IOC", .name = "IOC List", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_IOC), .desc = "Focus the IOC List (indicators by type/feed/confidence, hit counts)" },
+    .{ .code = "ENR", .name = "IOC Enrichment", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_ENR), .desc = "Focus IOC Enrichment (verdict, detection stats, whois/ASN, url scan, pivot to contacted indicators)" },
     .{ .code = "TA", .name = "Threat Actors", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_TA), .desc = "Focus Threat Actors (profiles, aliases, technique chips, notes)" },
     .{ .code = "FEED", .name = "Intel Feeds", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_FEED), .desc = "Focus Intel Feeds (sync status, staleness, IOC counts)" },
     .{ .code = "SEN", .name = "Sensor Health", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_SEN), .desc = "Focus Sensor Health (RAG grid: EDR/FW/IDS/DNS/proxy/cloud, EPS + lag)" },
@@ -501,13 +535,29 @@ pub const Dashboard = struct {
     sen_sel: ?u16 = null,
     tun_threshold: f32 = 0.5,
 
+    // -- YAR panel state --
+    yar_sel: ?u16 = null,
+    yar_filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8),
+    yar_focus_filter: bool = false,
+    yar_fail_only: bool = false,
+    yar_technique_filter: ?attack.TechniqueId = null,
+
+    // -- ENR panel state --
+    enr_sel: ?u32 = null, // Ioc.id
+    enr_history: [8]u32 = @splat(0), // pivot breadcrumb (back button)
+    enr_history_len: u8 = 0,
+
     // -- Mock jobs --
-    jobs: [4]MockJob = .{
+    jobs: [5]MockJob = .{
         .{ .name = "feed sync" },
         .{ .name = "rule backtest" },
         .{ .name = "ioc enrichment" },
         .{ .name = "retention sweep" },
+        .{ .name = "yara ci" },
     },
+
+    pub const JOB_ENRICH: usize = 2;
+    pub const JOB_YARA_CI: usize = 4;
 
     pub fn init(allocator: Allocator, seed: u64) Dashboard {
         var d = Dashboard{
@@ -559,6 +609,10 @@ pub const Dashboard = struct {
         self.rul_sel = null;
         self.prc_sel_root = null;
         self.evt_range = null;
+        self.yar_sel = null;
+        self.yar_technique_filter = null;
+        self.enr_sel = null;
+        self.enr_history_len = 0;
         ui.events.post(.ok, "world", "world regenerated with seed {d}", .{seed});
     }
 
@@ -721,6 +775,7 @@ pub const Dashboard = struct {
             self.evt_focus_filter = true;
             self.rul_focus_filter = true;
             self.ioc_focus_filter = true;
+            self.yar_focus_filter = true;
         }
 
         // `?` (Shift+/ outside text inputs) opens the HELP directory.
@@ -919,7 +974,7 @@ pub const Dashboard = struct {
     }
 
     fn tickJobs(self: *Dashboard) void {
-        for (&self.jobs) |*j| {
+        for (&self.jobs, 0..) |*j, i| {
             if (!j.running) continue;
             j.progress += self.dt * 0.12;
             if (j.progress >= 1.0) {
@@ -927,8 +982,87 @@ pub const Dashboard = struct {
                 j.running = false;
                 j.phase = "done";
                 ui.events.post(.ok, "jobs", "{s} finished", .{j.name});
+                self.onJobDone(i);
             }
         }
+    }
+
+    /// Job-completion side effects (render thread; panels see the results
+    /// next frame via Store.generation).
+    fn onJobDone(self: *Dashboard, idx: usize) void {
+        const now = unixNowMs();
+        switch (idx) {
+            JOB_ENRICH => {
+                // Complete every pending enrichment with its deterministic
+                // record (pure function of the IOC value — see mock.zig).
+                var done: u32 = 0;
+                var i: usize = 0;
+                while (i < self.store.enrichments.items.len) : (i += 1) {
+                    const e = &self.store.enrichments.items[i];
+                    if (e.status != .pending) continue;
+                    const ic = self.store.iocById(e.ioc_id) orelse continue;
+                    var filled = data.mock.Generator.enrichmentFor(&self.store, ic, now);
+                    filled.status = .done;
+                    _ = self.store.upsertEnrichment(filled);
+                    done += 1;
+                }
+                // Pending url scans complete alongside.
+                for (self.store.urlscans.items) |*u| {
+                    if (u.state == .pending) _ = self.store.setUrlScanState(u.id, .done, now);
+                }
+                if (done > 0) ui.events.post(.ok, "enrich", "{d} IOC(s) enriched", .{done});
+            },
+            JOB_YARA_CI => {
+                // Re-run CI: fresh scan times with a small deterministic
+                // jitter keyed off the rule name (not the world PRNG).
+                var pass: u32 = 0;
+                for (self.store.yara.items) |*y| {
+                    var g = y.gates;
+                    const h = std.hash.Fnv1a_64.hash(y.name.slice()) ^ @as(u64, @bitCast(now));
+                    var local = std.Random.DefaultPrng.init(h);
+                    const jitter = local.random().float(f32) * 4.0 - 2.0;
+                    g.scan_ms = @max(0.5, g.scan_ms + jitter);
+                    g.last_ci_ms = now;
+                    _ = self.store.recordYaraCi(y.id, g);
+                    if (g.allPass()) pass += 1;
+                }
+                ui.events.post(
+                    if (pass == self.store.yara.items.len) .ok else .warn,
+                    "yara",
+                    "CI run: {d}/{d} rules passing all gates",
+                    .{ pass, self.store.yara.items.len },
+                );
+            },
+            else => {},
+        }
+    }
+
+    /// Mark IOCs pending + kick the enrichment job. Mock flavor of the
+    /// live pipeline: a real MCP source would upsert the same shapes.
+    pub fn requestEnrichment(self: *Dashboard, ioc_ids: []const u32) void {
+        if (self.jobs[JOB_ENRICH].running) {
+            ui.events.post(.warn, "enrich", "enrichment rate-limited \u{2014} a run is already in flight", .{});
+            return;
+        }
+        var queued: u32 = 0;
+        for (ioc_ids) |id| {
+            if (self.store.iocById(id) == null) continue;
+            if (self.store.enrichmentForIoc(id)) |e| {
+                if (e.status == .done) continue; // already enriched
+                var p = e.*;
+                p.status = .pending;
+                _ = self.store.upsertEnrichment(p); // touch + PG mirror
+            } else {
+                _ = self.store.upsertEnrichment(.{ .ioc_id = id, .status = .pending });
+            }
+            queued += 1;
+        }
+        if (queued == 0) {
+            ui.events.post(.info, "enrich", "nothing to enrich \u{2014} selection already covered", .{});
+            return;
+        }
+        ui.events.post(.info, "enrich", "{d} IOC(s) queued for enrichment", .{queued});
+        self.startJob(JOB_ENRICH);
     }
 
     pub fn startJob(self: *Dashboard, idx: usize) void {
@@ -1108,6 +1242,7 @@ pub const Dashboard = struct {
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_TUN, ws), right);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_LOG, ws), bottom);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_ALQ, ws), bottom);
+                zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_YAR, ws), center);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_ATK, ws), center);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_RUL, ws), center);
             },
@@ -1125,6 +1260,7 @@ pub const Dashboard = struct {
                 _ = zgui.dockBuilderSplitNode(top, .left, 0.34, &feed_node, &ioc_node);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_TA, ws), right);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_FEED, ws), feed_node);
+                zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_ENR, ws), ioc_node);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_IOC, ws), ioc_node);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_LOG, ws), bottom);
                 zgui.dockBuilderDockWindow(panelWindowName(&nb, PANEL_CAS, ws), bottom);
@@ -1504,10 +1640,62 @@ pub const Dashboard = struct {
         }
         if (shown == 0) return error.NoPowershellInWorld;
 
+        // YARA rules: technique bounds + gate consistency (a TP can't fire
+        // if the rule doesn't compile).
+        if (s.yara.items.len == 0) return error.NoYaraRules;
+        for (s.yara.items) |*y| {
+            if (y.technique >= attack.technique_count) return error.YaraTechniqueDangling;
+            if (y.gates.tp == .pass and y.gates.compile == .fail) return error.YaraGateInconsistent;
+            _ = y.score();
+            _ = y.grade();
+        }
+        _ = s.yaraGradeHistogram();
+        _ = s.yaraSeverityDistribution();
+        _ = s.yaraGatePassCounts();
+        tid = 0;
+        while (tid < attack.technique_count) : (tid += 1) _ = s.yaraCoverageForTechnique(tid);
+
+        // Enrichment: every row resolves to an IOC; pivots resolve; url
+        // scans reference url-type IOCs.
+        for (s.enrichments.items) |*e| {
+            if (s.iocById(e.ioc_id) == null) return error.EnrichmentIocDangling;
+            if (e.status == .done and e.detTotal() == 0) return error.EnrichmentEmpty;
+            for (e.pivot_ids[0..e.pivot_count]) |pid| {
+                if (s.iocById(pid) == null) return error.PivotIocDangling;
+            }
+        }
+        for (s.urlscans.items) |*u| {
+            const ic = s.iocById(u.ioc_id) orelse return error.UrlScanIocDangling;
+            if (ic.type != .url) return error.UrlScanNotUrl;
+        }
+        _ = s.enrichedCounts();
+
+        // enrichmentFor is a pure function of the IOC (guards the FNV seed).
+        if (s.iocs.items.len > 0) {
+            const ic0 = &s.iocs.items[0];
+            const a0 = data.mock.Generator.enrichmentFor(s, ic0, 1);
+            const b0 = data.mock.Generator.enrichmentFor(s, ic0, 2);
+            if (a0.verdict != b0.verdict or a0.det_malicious != b0.det_malicious or
+                a0.pivot_count != b0.pivot_count) return error.EnrichmentNotPure;
+        }
+
         // Mutation round-trip.
         const first_alert = s.alerts.items[0].id;
         if (!s.setAlertStatus(first_alert, .acked)) return error.MutateFailed;
         if (!s.setAlertStatus(first_alert, .new)) return error.MutateFailed;
+
+        // New mutation paths round-trip (no hook installed under selftest).
+        const y0 = s.yara.items[0].id;
+        if (!s.setYaraStatus(y0, .deprecated)) return error.MutateFailed;
+        if (!s.setYaraStatus(y0, .active)) return error.MutateFailed;
+        if (!s.recordYaraCi(y0, s.yara.items[0].gates)) return error.MutateFailed;
+        {
+            const probe_id: u32 = s.iocs.items[0].id;
+            _ = s.upsertEnrichment(.{ .ioc_id = probe_id, .status = .pending });
+            var filled = data.mock.Generator.enrichmentFor(s, &s.iocs.items[0], unixNowMs());
+            filled.status = .done;
+            if (!s.upsertEnrichment(filled)) return error.MutateFailed;
+        }
 
         // ui_state round-trip through the JSON path.
         if (!self.applyUiStateData("{\"schema_version\":1,\"workspace\":\"hunt\",\"seed\":42}"))

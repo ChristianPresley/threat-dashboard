@@ -345,6 +345,320 @@ pub const ThreatActor = struct {
     notes: FixedStr(600) = .{},
 };
 
+// ── YARA rule engineering (rules-as-code CI) ─────────────────────────────
+
+pub const GateResult = enum(u8) {
+    pass,
+    fail,
+
+    pub fn label(self: GateResult) [:0]const u8 {
+        return switch (self) {
+            .pass => "PASS",
+            .fail => "FAIL",
+        };
+    }
+};
+
+/// Per-rule CI health record — the five gates every YARA rule must satisfy:
+/// compile (warnings-as-errors), metadata policy, true-positive fixture,
+/// false-positive goodware corpus, and a per-rule scan-time budget.
+pub const YaraGates = struct {
+    compile: GateResult = .pass,
+    meta: GateResult = .pass,
+    tp: GateResult = .pass,
+    fp_count: u16 = 0, // goodware-corpus hits; 0 = pass
+    scan_ms: f32 = 0, // best-of-3 corpus scan time
+    budget_ms: f32 = 50,
+    last_ci_ms: i64 = 0,
+
+    pub fn fpPass(self: *const YaraGates) bool {
+        return self.fp_count == 0;
+    }
+
+    pub fn perfPass(self: *const YaraGates) bool {
+        return self.scan_ms <= self.budget_ms;
+    }
+
+    pub fn allPass(self: *const YaraGates) bool {
+        return self.compile == .pass and self.meta == .pass and
+            self.tp == .pass and self.fpPass() and self.perfPass();
+    }
+};
+
+pub const YaraStatus = enum(u8) {
+    active,
+    draft,
+    deprecated,
+
+    pub fn label(self: YaraStatus) [:0]const u8 {
+        return switch (self) {
+            .active => "ACTIVE",
+            .draft => "DRAFT",
+            .deprecated => "DEPRECATED",
+        };
+    }
+};
+
+/// A YARA rule as a versioned artifact: mandatory 7-field metadata
+/// (author, date, description, reference, mitre_attack, severity, version)
+/// plus its latest CI gate results.
+pub const YaraRule = struct {
+    id: u16,
+    code: FixedStr(8) = .{}, // "Y-0001"
+    name: FixedStr(64) = .{}, // rule identifier, e.g. PowerShell_AMSI_Bypass
+    status: YaraStatus = .active,
+    severity: Severity = .medium,
+    technique: attack.TechniqueId,
+    author: FixedStr(24) = .{},
+    date_ms: i64 = 0,
+    description: FixedStr(160) = .{},
+    reference: FixedStr(96) = .{},
+    version: u16 = 1,
+    strings_excerpt: FixedStr(240) = .{},
+    condition: FixedStr(160) = .{},
+    gates: YaraGates = .{},
+
+    /// Quality score 0..100 from gate results. Compile failure is a hard 0
+    /// (nothing else can be trusted); the rest subtract: meta −20, TP miss
+    /// −30, −8 per goodware FP (cap −24), perf over budget −15 (over 2×
+    /// budget −25).
+    pub fn score(self: *const YaraRule) u8 {
+        const g = &self.gates;
+        if (g.compile == .fail) return 0;
+        var s: i32 = 100;
+        if (g.meta == .fail) s -= 20;
+        if (g.tp == .fail) s -= 30;
+        s -= @min(@as(i32, g.fp_count) * 8, 24);
+        if (!g.perfPass()) s -= if (g.scan_ms > g.budget_ms * 2) @as(i32, 25) else 15;
+        return @intCast(@max(s, 0));
+    }
+
+    /// Letter grade for the theme Score band: A ≥75, B ≥60, C ≥45, D ≥30, F.
+    pub fn grade(self: *const YaraRule) u8 {
+        const s = self.score();
+        if (s >= 75) return 'A';
+        if (s >= 60) return 'B';
+        if (s >= 45) return 'C';
+        if (s >= 30) return 'D';
+        return 'F';
+    }
+};
+
+// ── IOC enrichment (threat-intel lookup shapes) ──────────────────────────
+
+pub const Verdict = enum(u8) {
+    unknown,
+    clean,
+    suspicious,
+    malicious,
+
+    pub fn label(self: Verdict) [:0]const u8 {
+        return switch (self) {
+            .unknown => "UNKNOWN",
+            .clean => "CLEAN",
+            .suspicious => "SUSPICIOUS",
+            .malicious => "MALICIOUS",
+        };
+    }
+};
+
+/// Async-fill lifecycle: a live source marks `.pending`, then upserts
+/// `.done` or `.err`. The mock build writes `.done` records directly.
+pub const EnrichStatus = enum(u8) {
+    none,
+    pending,
+    done,
+    err,
+
+    pub fn label(self: EnrichStatus) [:0]const u8 {
+        return switch (self) {
+            .none => "NONE",
+            .pending => "PENDING",
+            .done => "DONE",
+            .err => "ERROR",
+        };
+    }
+};
+
+pub const EnrichSource = enum(u8) {
+    mock,
+    virustotal,
+    urlscan,
+
+    pub fn label(self: EnrichSource) [:0]const u8 {
+        return switch (self) {
+            .mock => "mock",
+            .virustotal => "virustotal",
+            .urlscan => "urlscan",
+        };
+    }
+};
+
+pub const ENRICH_PIVOT_CAP = 25;
+
+/// Reputation/hosting context for one IOC, keyed by `ioc_id`. Sparse — most
+/// IOCs never get enriched; the Store holds these in a separate list.
+pub const IocEnrichment = struct {
+    ioc_id: u32,
+    status: EnrichStatus = .none,
+    source: EnrichSource = .mock,
+    fetched_ms: i64 = 0,
+    err: FixedStr(32) = .{}, // structured error kind: "rate_limited", "timeout", …
+
+    verdict: Verdict = .unknown,
+    det_malicious: u16 = 0,
+    det_suspicious: u16 = 0,
+    det_harmless: u16 = 0,
+    det_undetected: u16 = 0,
+    reputation: i32 = 0,
+    threat_label: FixedStr(48) = .{},
+    first_seen_ms: i64 = 0,
+    last_seen_ms: i64 = 0,
+
+    // domain-type extras
+    registrar: FixedStr(48) = .{},
+    creation_ms: i64 = 0, // newly-registered-domain signal when recent
+    categories: FixedStr(96) = .{},
+
+    // ip-type extras
+    asn: u32 = 0,
+    as_owner: FixedStr(48) = .{},
+    country: FixedStr(4) = .{},
+    network: FixedStr(24) = .{}, // CIDR
+
+    // url-scan extras
+    scan_score: u8 = 0, // 0..100
+    brands: FixedStr(48) = .{},
+    page_domain: FixedStr(64) = .{},
+    page_ip: FixedStr(46) = .{},
+    tls_issuer: FixedStr(48) = .{},
+
+    /// Contacted-infrastructure pivots: Ioc.id refs (0 = empty slot).
+    pivot_ids: [ENRICH_PIVOT_CAP]u32 = @splat(0),
+    pivot_count: u8 = 0,
+
+    pub fn detTotal(self: *const IocEnrichment) u32 {
+        return @as(u32, self.det_malicious) + self.det_suspicious +
+            self.det_harmless + self.det_undetected;
+    }
+
+    /// "57/72"-style detection ratio: engines flagging vs. engines total.
+    pub fn detRatio(self: *const IocEnrichment) struct { hit: u32, total: u32 } {
+        return .{
+            .hit = @as(u32, self.det_malicious) + self.det_suspicious,
+            .total = self.detTotal(),
+        };
+    }
+};
+
+pub const ScanState = enum(u8) {
+    submitted,
+    pending,
+    done,
+    err,
+
+    pub fn label(self: ScanState) [:0]const u8 {
+        return switch (self) {
+            .submitted => "SUBMITTED",
+            .pending => "PENDING",
+            .done => "DONE",
+            .err => "ERROR",
+        };
+    }
+};
+
+/// A url-scan submission lifecycle: submit → pending → done/err.
+pub const UrlScanSubmission = struct {
+    id: u32,
+    ioc_id: u32, // must reference a url-type Ioc
+    state: ScanState = .submitted,
+    submitted_ms: i64 = 0,
+    completed_ms: i64 = 0,
+    err: FixedStr(32) = .{},
+};
+
+/// Defang an indicator for display OPSEC: "https://x.y/z" → "hxxps://x[.]y/z",
+/// "1.2.3.4" → "1[.]2[.]3[.]4". Hashes/emails pass through untouched (emails
+/// keep their dots — matching how analysts share them is out of scope here;
+/// the click-hazard is URLs/domains/IPs). Output truncates at buf capacity.
+pub fn defang(buf: []u8, ty: IocType, value: []const u8) []const u8 {
+    switch (ty) {
+        .hash_sha256, .email => {
+            const n = @min(value.len, buf.len);
+            @memcpy(buf[0..n], value[0..n]);
+            return buf[0..n];
+        },
+        .ip, .domain, .url => {},
+    }
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < value.len and out < buf.len) {
+        // scheme rewrite: http → hxxp, https → hxxps, ftp → fxp
+        if (i == 0 and std.mem.startsWith(u8, value, "http")) {
+            const s = if (std.mem.startsWith(u8, value, "https")) "hxxps" else "hxxp";
+            const n = @min(s.len, buf.len);
+            @memcpy(buf[0..n], s[0..n]);
+            out = n;
+            i = if (s.len == 5) 5 else 4;
+            continue;
+        }
+        if (i == 0 and std.mem.startsWith(u8, value, "ftp")) {
+            const n = @min(3, buf.len);
+            @memcpy(buf[0..n], "fxp"[0..n]);
+            out = n;
+            i = 3;
+            continue;
+        }
+        if (value[i] == '.') {
+            if (out + 3 > buf.len) break;
+            @memcpy(buf[out..][0..3], "[.]");
+            out += 3;
+            i += 1;
+            continue;
+        }
+        buf[out] = value[i];
+        out += 1;
+        i += 1;
+    }
+    return buf[0..out];
+}
+
+test "yara score + grade bands" {
+    var y = YaraRule{ .id = 1, .technique = 0 };
+    try std.testing.expectEqual(@as(u8, 100), y.score());
+    try std.testing.expectEqual(@as(u8, 'A'), y.grade());
+    y.gates.compile = .fail;
+    try std.testing.expectEqual(@as(u8, 0), y.score());
+    try std.testing.expectEqual(@as(u8, 'F'), y.grade());
+    y.gates.compile = .pass;
+    y.gates.tp = .fail; // 70
+    try std.testing.expectEqual(@as(u8, 'B'), y.grade());
+    y.gates.fp_count = 2; // 70 - 16 = 54
+    try std.testing.expectEqual(@as(u8, 'C'), y.grade());
+}
+
+test "enrichment detection ratio" {
+    var e = IocEnrichment{ .ioc_id = 7 };
+    e.det_malicious = 55;
+    e.det_suspicious = 2;
+    e.det_harmless = 10;
+    e.det_undetected = 5;
+    const r = e.detRatio();
+    try std.testing.expectEqual(@as(u32, 57), r.hit);
+    try std.testing.expectEqual(@as(u32, 72), r.total);
+}
+
+test "defang neutralizes urls, domains, ips" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "hxxps://phish[.]test/login",
+        defang(&buf, .url, "https://phish.test/login"),
+    );
+    try std.testing.expectEqualStrings("evil[.]example[.]com", defang(&buf, .domain, "evil.example.com"));
+    try std.testing.expectEqualStrings("203[.]0[.]113[.]9", defang(&buf, .ip, "203.0.113.9"));
+    try std.testing.expectEqualStrings("abc123", defang(&buf, .hash_sha256, "abc123"));
+}
+
 test "fixed string truncates + round-trips" {
     const S = FixedStr(8);
     const a = S.from("short");

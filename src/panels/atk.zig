@@ -103,8 +103,10 @@ fn drawCell(d: *Dashboard, s: *@import("data").Store, tid: attack.TechniqueId) v
     if (clicked) {
         d.atk_sel = tid;
         d.rul_technique_filter = tid;
+        d.yar_technique_filter = tid; // pre-filter YAR if the analyst tabs over
         d.focusPanel(dash.PANEL_RUL);
     }
+    const yara_cov = s.yaraCoverageForTechnique(tid);
     if (zgui.isItemHovered(.{})) {
         if (zgui.beginTooltip()) {
             zgui.text("{s} \u{2014} {s}", .{ tech.id, tech.name });
@@ -113,12 +115,23 @@ fn drawCell(d: *Dashboard, s: *@import("data").Store, tid: attack.TechniqueId) v
                 1 => "testing only",
                 else => "NONE",
             }});
+            if (yara_cov > 0) {
+                var worst: u8 = 'A';
+                for (s.yara.items) |*y| {
+                    if (y.technique == tid and y.grade() > worst) worst = y.grade();
+                }
+                zgui.textColored(t.identity.detect, "YARA: covered (worst grade {c})", .{worst});
+            }
             if (heat > 0) zgui.textColored(t.sev.crit, "{d} open alert(s)", .{heat});
             zgui.endTooltip();
         }
     }
-    // Name (truncated by column) + heat badge.
+    // Name (truncated by column) + YARA marker + heat badge.
     zgui.textColored(t.text.mid, "{s}", .{tech.name});
+    if (yara_cov == 2) {
+        zgui.sameLine(.{ .spacing = 4 });
+        zgui.textColored(t.identity.detect, "Y", .{});
+    }
     if (heat > 0) {
         zgui.sameLine(.{ .spacing = 4 });
         zgui.textColored(t.sev.crit, "{d}", .{heat});
