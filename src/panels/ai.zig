@@ -24,7 +24,7 @@ pub fn render(d: *Dashboard) void {
     const a = &d.assistant;
 
     // ── Config-needed state ──────────────────────────────────────────────
-    if (!a.cfg.configured() or a.worker == null) {
+    if ((!a.cfg.configured() or a.worker == null) and !a.tour_demo) {
         zgui.textColored(t.sev.warn, "{s} AI assistant not configured", .{ui.fonts.fa.circle_info});
         zgui.spacing();
         zgui.textWrapped("Set the ANTHROPIC_API_KEY environment variable and restart the app to enable the assistant.", .{});
@@ -69,7 +69,9 @@ pub fn render(d: *Dashboard) void {
 
     // ── Transcript ───────────────────────────────────────────────────────
     const avail = zgui.getContentRegionAvail();
-    const input_h: f32 = 96;
+    // Transcript leaves room for chips + a 60px input + the hint line;
+    // undersizing this clips the hint against the panel edge.
+    const input_h: f32 = 118;
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = t.bg.sunken });
     if (zgui.beginChild("##ai_transcript", .{ .w = avail[0], .h = @max(80, avail[1] - input_h) })) {
         if (a.transcript.items.len == 0) {
@@ -137,17 +139,29 @@ fn renderItem(d: *Dashboard, it: *dash.ChatItem, idx: usize) void {
             zgui.textWrapped("{s}", .{it.text});
         },
         .tool_call => {
-            var lb: [96]u8 = undefined;
-            const lbl = std.fmt.bufPrintZ(&lb, "{s} {s}({s})##aitc{d}", .{
-                ui.fonts.fa.caret_right, it.metaSlice(), it.text, idx,
-            }) catch "tool";
-            zgui.textColored(t.text.lo, "{s}", .{lbl});
+            // Collapsible "called <tool>" card; the ##id keeps ImGui's label
+            // unique WITHOUT leaking into the visible text.
+            var hb: [80]u8 = undefined;
+            const head = std.fmt.bufPrintZ(&hb, "called {s}##aitc{d}", .{ it.metaSlice(), idx }) catch "called tool";
+            if (it.expanded) zgui.setNextItemOpen(.{ .is_open = true, .cond = .once });
+            zgui.pushStyleColor4f(.{ .idx = .text, .c = t.text.lo });
+            const open = zgui.treeNode(head);
+            zgui.popStyleColor(.{ .count = 1 });
+            if (open) {
+                zgui.pushTextWrapPos(0);
+                zgui.textColored(t.text.mid, "{s}", .{it.text});
+                zgui.popTextWrapPos();
+                zgui.treePop();
+            }
         },
         .tool_result => {
-            const col = if (it.is_error) t.sev.crit else t.text.lo;
-            var hb: [64]u8 = undefined;
-            const head = std.fmt.bufPrintZ(&hb, "{s} \u{2192}##aitr{d}", .{ it.metaSlice(), idx }) catch "result";
-            if (zgui.treeNode(head)) {
+            const col = if (it.is_error) t.sev.crit else t.text.mid;
+            var hb: [80]u8 = undefined;
+            const head = std.fmt.bufPrintZ(&hb, "result: {s}##aitr{d}", .{ it.metaSlice(), idx }) catch "result";
+            zgui.pushStyleColor4f(.{ .idx = .text, .c = if (it.is_error) t.sev.crit else t.text.lo });
+            const open = zgui.treeNode(head);
+            zgui.popStyleColor(.{ .count = 1 });
+            if (open) {
                 zgui.pushTextWrapPos(0);
                 zgui.textColored(col, "{s}", .{it.text});
                 zgui.popTextWrapPos();

@@ -231,6 +231,14 @@ pub fn gateColor(pass: bool) [4]f32 {
     return if (pass) t.ok else t.crit;
 }
 
+/// ATT&CK technique id lookup by string (e.g. "T1059.001"); null if absent.
+fn findTechnique(id: []const u8) ?attack.TechniqueId {
+    for (attack.techniques, 0..) |tech, i| {
+        if (std.mem.eql(u8, tech.id, id)) return @intCast(i);
+    }
+    return null;
+}
+
 /// Toggleable filter chip: filled when on, outlined when off.
 pub fn filterChip(label: [:0]const u8, on: bool, hue: [4]f32) bool {
     const t = ui.theme.default;
@@ -496,12 +504,14 @@ pub const AssistantUi = struct {
     attach_alert: bool = false,
     attach_ioc: bool = false,
     scroll_to_bottom: bool = false,
+    /// Tour-only: render the transcript even without a configured worker.
+    tour_demo: bool = false,
 
     pub fn statusSlice(self: *const AssistantUi) []const u8 {
         return self.status[0..self.status_len];
     }
 
-    fn setStatus(self: *AssistantUi, s: []const u8) void {
+    pub fn setStatus(self: *AssistantUi, s: []const u8) void {
         const n = @min(s.len, self.status.len);
         @memcpy(self.status[0..n], s[0..n]);
         self.status_len = @intCast(n);
@@ -608,6 +618,11 @@ pub const Dashboard = struct {
     // -- AI assistant --
     assistant: AssistantUi = .{},
 
+    // -- Guided-tour harness --
+    tour_scene: usize = 0,
+    tour_frame: u32 = 0,
+    tour_cap_seq: u32 = 0,
+
     pub const JOB_ENRICH: usize = 2;
     pub const JOB_YARA_CI: usize = 4;
 
@@ -655,7 +670,7 @@ pub const Dashboard = struct {
         }) catch null;
     }
 
-    fn appendChat(self: *Dashboard, kind: anytype, text: []const u8, meta: []const u8, is_error: bool) void {
+    pub fn appendChat(self: *Dashboard, kind: anytype, text: []const u8, meta: []const u8, is_error: bool) void {
         const owned = self.allocator.dupe(u8, text) catch return;
         var item: ChatItem = .{ .kind = kind, .text = owned, .is_error = is_error };
         const mn = @min(meta.len, item.meta.len);
@@ -754,6 +769,221 @@ pub const Dashboard = struct {
                 .idle => self.assistant.busy = false,
             }
         }
+    }
+
+    // ── Guided-tour capture harness ──────────────────────────────────────
+    //
+    // `--tour <dir>` drives the app through a scripted sequence of scenes,
+    // mutating the SAME state fields a real click would, and requests frame
+    // captures. Stills capture one settled frame; GIF scenes capture a strip
+    // the encoder assembles. Everything is deterministic (fixed synthetic dt
+    // set by main.zig), so the tour reproduces byte-for-byte.
+
+    pub const TourKind = enum { still, gif };
+
+    pub const TourScene = struct {
+        name: []const u8,
+        ws: ui.layout.Workspace,
+        kind: TourKind,
+        /// Frames to hold the scene before/while capturing.
+        hold: u32,
+        /// First frame (into the hold) to begin capturing.
+        cap_from: u32,
+        /// Capture every Nth frame from cap_from to hold end.
+        cap_stride: u32 = 1,
+    };
+
+    pub const tour_scenes = [_]TourScene{
+        .{ .name = "01-triage", .ws = .triage, .kind = .still, .hold = 40, .cap_from = 38 },
+        .{ .name = "02-alert-select", .ws = .triage, .kind = .still, .hold = 30, .cap_from = 28 },
+        .{ .name = "03-hunt", .ws = .hunt, .kind = .still, .hold = 36, .cap_from = 34 },
+        .{ .name = "04-timeline-brush", .ws = .hunt, .kind = .gif, .hold = 64, .cap_from = 4, .cap_stride = 3 },
+        .{ .name = "05-process-tree", .ws = .hunt, .kind = .still, .hold = 30, .cap_from = 28 },
+        .{ .name = "06-detect", .ws = .detect, .kind = .still, .hold = 36, .cap_from = 34 },
+        .{ .name = "07-yara-detail", .ws = .detect, .kind = .still, .hold = 30, .cap_from = 28 },
+        .{ .name = "08-yara-ci", .ws = .detect, .kind = .gif, .hold = 150, .cap_from = 2, .cap_stride = 7 },
+        .{ .name = "09-attack-drill", .ws = .detect, .kind = .still, .hold = 30, .cap_from = 28 },
+        .{ .name = "10-intel", .ws = .intel, .kind = .still, .hold = 36, .cap_from = 34 },
+        .{ .name = "11-enrich-job", .ws = .intel, .kind = .gif, .hold = 160, .cap_from = 2, .cap_stride = 7 },
+        .{ .name = "12-enrich-detail", .ws = .intel, .kind = .still, .hold = 30, .cap_from = 28 },
+        .{ .name = "13-pivot", .ws = .intel, .kind = .gif, .hold = 96, .cap_from = 4, .cap_stride = 6 },
+        .{ .name = "14-ops", .ws = .ops, .kind = .still, .hold = 36, .cap_from = 34 },
+        .{ .name = "15-ai-config", .ws = .ops, .kind = .still, .hold = 30, .cap_from = 28 },
+        .{ .name = "16-ai-chat", .ws = .ops, .kind = .gif, .hold = 90, .cap_from = 2, .cap_stride = 5 },
+    };
+
+    /// What main.zig should capture this frame (null = capture nothing).
+    pub const TourCapture = struct {
+        scene: []const u8,
+        seq: u32,
+        kind: TourKind,
+    };
+
+    /// Advance the tour by one frame. Returns a capture request (or null),
+    /// and drives the scene's on-screen state. `done` flips true when the
+    /// whole tour has been captured.
+    pub fn tourFrame(self: *Dashboard, done: *bool) ?TourCapture {
+        if (self.tour_scene >= tour_scenes.len) {
+            done.* = true;
+            return null;
+        }
+        const sc = &tour_scenes[self.tour_scene];
+        const local = self.tour_frame;
+
+        if (local == 0) {
+            self.tourResetTransient();
+            if (ui.layout.active != sc.ws) ui.layout.switchTo(sc.ws);
+            self.tourSetup(self.tour_scene);
+        }
+        self.tourAnimate(self.tour_scene, local);
+
+        var cap: ?TourCapture = null;
+        if (local >= sc.cap_from and (local - sc.cap_from) % sc.cap_stride == 0) {
+            cap = .{ .scene = sc.name, .seq = self.tour_cap_seq, .kind = sc.kind };
+            self.tour_cap_seq += 1;
+        }
+
+        self.tour_frame += 1;
+        if (self.tour_frame >= sc.hold) {
+            self.tour_scene += 1;
+            self.tour_frame = 0;
+            self.tour_cap_seq = 0;
+        }
+        return cap;
+    }
+
+    /// Clean slate between scenes: drop floated panels and scene-scoped
+    /// filters so nothing leaks into the next capture.
+    fn tourResetTransient(self: *Dashboard) void {
+        self.panel_force_open = @splat(false);
+        self.rul_technique_filter = null;
+        self.yar_technique_filter = null;
+        self.evt_range = null;
+        @memset(&self.cmd_buf, 0);
+        self.palette_match_count = 0;
+    }
+
+    /// One-time state setup when a scene begins.
+    fn tourSetup(self: *Dashboard, scene: usize) void {
+        const sc = &tour_scenes[scene];
+        const s = &self.store;
+        if (std.mem.eql(u8, sc.name, "02-alert-select")) {
+            self.focusPanel(PANEL_ALQ);
+            // Newest open alert for a populated detail view.
+            var i = s.alerts.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (s.alerts.items[i].status.isOpen()) {
+                    self.alq_sel = s.alerts.items[i].id;
+                    break;
+                }
+            }
+        } else if (std.mem.eql(u8, sc.name, "04-timeline-brush")) {
+            self.focusPanel(PANEL_TLN);
+            self.evt_range = null;
+        } else if (std.mem.eql(u8, sc.name, "05-process-tree")) {
+            self.focusPanel(PANEL_PRC);
+        } else if (std.mem.eql(u8, sc.name, "07-yara-detail")) {
+            self.focusPanel(PANEL_YAR);
+            self.yar_sel = 2; // Webshell_PHP_Eval_Base64 — shows an FP gate story
+        } else if (std.mem.eql(u8, sc.name, "08-yara-ci")) {
+            self.focusPanel(PANEL_YAR);
+            self.startJob(JOB_YARA_CI);
+        } else if (std.mem.eql(u8, sc.name, "09-attack-drill")) {
+            self.focusPanel(PANEL_ATK);
+            // Drill T1059.001 (PowerShell) → RUL filter, as a cell click does.
+            if (findTechnique("T1059.001")) |tid| {
+                self.atk_sel = tid;
+                self.rul_technique_filter = tid;
+                self.yar_technique_filter = tid;
+            }
+        } else if (std.mem.eql(u8, sc.name, "11-enrich-job")) {
+            self.focusPanel(PANEL_IOC);
+            // Queue a handful of unenriched IOCs so verdicts fill on screen.
+            var ids: [12]u32 = undefined;
+            var n: usize = 0;
+            for (s.iocs.items) |*ic| {
+                if (n >= ids.len) break;
+                if (s.enrichmentForIoc(ic.id) == null) {
+                    ids[n] = ic.id;
+                    n += 1;
+                }
+            }
+            self.requestEnrichment(ids[0..n]);
+        } else if (std.mem.eql(u8, sc.name, "12-enrich-detail")) {
+            self.focusPanel(PANEL_ENR);
+            // A malicious IP with rich hosting context + pivots.
+            self.enr_sel = self.tourFirstVerdict(.malicious) orelse (if (s.enrichments.items.len > 0) s.enrichments.items[0].ioc_id else null);
+            self.enr_history_len = 0;
+        } else if (std.mem.eql(u8, sc.name, "13-pivot")) {
+            self.focusPanel(PANEL_ENR);
+            self.enr_sel = self.tourFirstVerdict(.malicious) orelse (if (s.enrichments.items.len > 0) s.enrichments.items[0].ioc_id else null);
+            self.enr_history_len = 0;
+        } else if (std.mem.eql(u8, sc.name, "15-ai-config")) {
+            self.focusPanel(PANEL_AI);
+        } else if (std.mem.eql(u8, sc.name, "16-ai-chat")) {
+            self.focusPanel(PANEL_AI);
+            self.tourSeedChat();
+        }
+    }
+
+    /// Per-frame animation within a scene (brush sweep, pivot hops, typing).
+    fn tourAnimate(self: *Dashboard, scene: usize, local: u32) void {
+        const sc = &tour_scenes[scene];
+        if (std.mem.eql(u8, sc.name, "04-timeline-brush")) {
+            // Sweep a widening brush across the last third of the window.
+            const span = data.mock.WORLD_SPAN_MS;
+            const base = self.gen.base_ms;
+            const start = base - @divFloor(span * 40, 100);
+            const grow = @as(i64, local) * @divFloor(span, 240);
+            self.evt_range = .{ start, @min(base, start + grow) };
+        } else if (std.mem.eql(u8, sc.name, "13-pivot")) {
+            // Hop along the pivot chain every ~24 frames.
+            if (local > 0 and local % 24 == 0) {
+                if (self.enr_sel) |cur| {
+                    if (self.store.enrichmentForIoc(cur)) |e| {
+                        if (e.pivot_count > 0) {
+                            const pick = e.pivot_ids[(local / 24) % e.pivot_count];
+                            if (self.enr_history_len < self.enr_history.len) {
+                                self.enr_history[self.enr_history_len] = cur;
+                                self.enr_history_len += 1;
+                            }
+                            self.enr_sel = pick;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn tourExpandLast(self: *Dashboard) void {
+        const n = self.assistant.transcript.items.len;
+        if (n > 0) self.assistant.transcript.items[n - 1].expanded = true;
+    }
+
+    fn tourFirstVerdict(self: *Dashboard, want: domain.Verdict) ?u32 {
+        for (self.store.enrichments.items) |*e| {
+            if (e.status == .done and e.verdict == want and e.pivot_count > 0) return e.ioc_id;
+        }
+        return null;
+    }
+
+    fn tourSeedChat(self: *Dashboard) void {
+        if (self.assistant.transcript.items.len > 0) return; // once
+        self.assistant.tour_demo = true;
+        self.assistant.mcp_state = .ready;
+        self.assistant.last_in_tokens = 1840;
+        self.assistant.last_out_tokens = 213;
+        self.appendChat(.user, "Is 45.144.68.79 malicious, and do any of our IOCs touch the same hosting?", "", false);
+        self.appendChat(.tool_call, "{\"ip\": \"45.144.68.79\"}", "ti_lookup_ip", false);
+        self.tourExpandLast();
+        self.appendChat(.tool_result, "{\"verdict\": \"malicious\", \"detection_ratio\": \"39/65\", \"reputation\": -43, \"asn\": \"AS44477\", \"as_owner\": \"STARK-INDUSTRIES\", \"country\": \"MD\", \"network\": \"45.144.68.0/24\"}", "ti_lookup_ip", false);
+        self.tourExpandLast();
+        self.appendChat(.tool_call, "{\"value_contains\": \"44477\"}", "get_iocs", false);
+        self.appendChat(.tool_result, "{\"iocs\": [{\"type\": \"domain\", \"value\": \"sync-5512[.]org\", \"verdict\": \"MALICIOUS\"}], \"returned\": 1}", "get_iocs", false);
+        self.tourExpandLast();
+        self.appendChat(.assistant, "Yes \u{2014} 45.144.68.79 is malicious (39/65 engines, reputation \u{2212}43) hosted on AS44477 STARK-INDUSTRIES in Moldova, a bulletproof-hosting AS. One of your indicators shares it: the domain sync-5512[.]org resolves into the same /24 and is already flagged MALICIOUS. Recommend pivoting on that domain in ENR and checking NET for endpoints that beaconed to either.", "", false);
+        self.assistant.scroll_to_bottom = true;
     }
 
     pub fn setStateDir(self: *Dashboard, dir: []const u8) void {

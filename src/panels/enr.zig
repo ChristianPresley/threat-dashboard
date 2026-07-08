@@ -124,11 +124,12 @@ pub fn render(d: *Dashboard) void {
     zgui.textColored(t.text.lo, "malicious {d} \u{00B7} suspicious {d} \u{00B7} harmless {d} \u{00B7} undetected {d}", .{
         e.det_malicious, e.det_suspicious, e.det_harmless, e.det_undetected,
     });
-    zgui.sameLine(.{ .spacing = 12 });
+    // Reputation + threat label on their own line so a long label can't be
+    // clipped by the panel edge.
     zgui.textColored(if (e.reputation < 0) t.sev.crit else t.text.mid, "reputation {d}", .{e.reputation});
     if (e.threat_label.len > 0) {
         zgui.sameLine(.{ .spacing = 12 });
-        zgui.textColored(t.sev.serious, "{s}", .{e.threat_label.slice()});
+        zgui.textColored(t.sev.serious, "threat: {s}", .{e.threat_label.slice()});
     }
     {
         var b1: [20]u8 = undefined;

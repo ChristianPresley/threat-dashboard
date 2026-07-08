@@ -34,6 +34,7 @@ pub fn main(init: std.process.Init) !void {
     var do_pgload = false;
     var mcp_check = false;
     var ai_ping = false;
+    var tour_dir: ?[:0]const u8 = null;
 
     while (args_iter.next()) |arg| {
         if (std.mem.eql(u8, arg, "pgload")) {
@@ -67,6 +68,11 @@ pub fn main(init: std.process.Init) !void {
             // GUI: --validate cycling + capture one PNG per workspace into <dir>.
             validate_mode = true;
             screenshot_dir = args_iter.next() orelse "screenshots";
+        } else if (std.mem.eql(u8, arg, "--tour")) {
+            // GUI: drive a scripted feature tour, capturing numbered PNG
+            // frames (stills + GIF strips) into <dir>, then exit. Runs at a
+            // fixed synthetic dt so captures are deterministic.
+            tour_dir = args_iter.next() orelse "tour";
         } else if (std.mem.eql(u8, arg, "--mailbox")) {
             // Uncapped present mode (MAILBOX). Default is FIFO (vsync) so an
             // idle terminal doesn't burn a CPU core + GPU re-rendering.
@@ -107,9 +113,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // Validation/screenshot cycles are frame-count-bounded — run them at
-    // MAILBOX rate so a bounded cycle takes ~1s instead of 4s at vsync.
-    if (validate_mode) render.setPreferMailbox(true);
+    // Validation/screenshot cycles + the guided tour are frame-count-bounded
+    // — run them at MAILBOX rate so a bounded run finishes in ~1s per phase
+    // instead of stalling on vsync.
+    if (validate_mode or tour_dir != null) render.setPreferMailbox(true);
 
     // Headless pgload: mock world → PostgreSQL, then exit.
     if (do_pgload) {
@@ -493,6 +500,21 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // GUI tour harness: prepare the output dir + suppress persistence so the
+    // scripted run never clobbers the user's saved layout/state.
+    if (tour_dir) |dir| {
+        dashboard.ui_state_save_suppressed = true;
+        ui.layout.save_suppressed = true;
+        std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
+            std.log.err("tour: could not create '{s}': {}", .{ dir, err });
+            tour_dir = null;
+        };
+        if (tour_dir != null and !renderer.swapchain.readback) {
+            std.log.err("tour: swapchain lacks TRANSFER_SRC — cannot capture.", .{});
+            tour_dir = null;
+        }
+    }
+
     // Fullscreen-toggle state: stash windowed pos+size so F11 restores them.
     var is_fullscreen: bool = false;
     var saved_x: c_int = 0;
@@ -560,11 +582,29 @@ pub fn main(init: std.process.Init) !void {
         if (fb_w == 0 or fb_h == 0) continue;
 
         const now = glfw.glfwGetTime();
-        const dt: f32 = @floatCast(now - last_time);
+        // The tour runs at a FIXED synthetic dt so animations (job progress,
+        // brush sweep) are byte-reproducible regardless of frame timing. At
+        // dt=1/12 a mock job (progress += dt*0.12) completes in ~100 frames,
+        // which the job scenes are sized to capture start→finish.
+        const dt: f32 = if (tour_dir != null) 1.0 / 12.0 else blk: {
+            const d: f32 = @floatCast(now - last_time);
+            break :blk if (d > 0) d else 1.0 / 60.0;
+        };
         last_time = now;
 
         zgui.io.setDisplaySize(@floatFromInt(fb_w), @floatFromInt(fb_h));
-        zgui.io.setDeltaTime(if (dt > 0) dt else 1.0 / 60.0);
+        zgui.io.setDeltaTime(dt);
+
+        // Guided tour: drive the scripted scene state + decide capture.
+        var tour_cap: ?Dashboard.TourCapture = null;
+        if (tour_dir != null) {
+            var tour_done = false;
+            tour_cap = dashboard.tourFrame(&tour_done);
+            if (tour_done) {
+                std.log.info("tour: complete", .{});
+                break;
+            }
+        }
 
         // Decide BEFORE dashboard.render (which decrements validate_cycle)
         // whether to capture this frame: late in each workspace's hold
@@ -584,7 +624,13 @@ pub fn main(init: std.process.Init) !void {
         errdefer renderer.abortFrame(ctx);
 
         try imgui_backend.render(ctx.cmd, ctx.extent, ctx.frame_index);
-        if (capture_this_frame) {
+        if (tour_cap) |tc| {
+            const cap = try renderer.endFrameCapture(ctx, allocator);
+            defer allocator.free(cap.pixels);
+            var name_buf: [80]u8 = undefined;
+            const base = std.fmt.bufPrint(&name_buf, "{s}-{d:0>3}", .{ tc.scene, tc.seq }) catch "tour";
+            writeScreenshot(allocator, io, tour_dir.?, base, cap);
+        } else if (capture_this_frame) {
             const cap = try renderer.endFrameCapture(ctx, allocator);
             defer allocator.free(cap.pixels);
             var name_buf: [64]u8 = undefined;
@@ -691,6 +737,7 @@ fn printUsage() void {
         \\  --mcp-check         Spawn the threat-intel MCP server, list its tools, exit
         \\  --validate          Force-cycle all workspaces for a bounded run, then exit
         \\  --screenshot <dir>  --validate + write one PNG per workspace into <dir>
+        \\  --tour <dir>        Drive a scripted feature tour, capturing frames into <dir>, then exit
         \\  --mailbox           Uncapped MAILBOX presentation (default: FIFO vsync)
         \\  --demo              Show the ImPlot-bindings demo window
         \\  --window <WxH>      Initial window size, e.g. 1280x800 (default 1400x900)

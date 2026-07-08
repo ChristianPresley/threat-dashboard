@@ -60,7 +60,7 @@ pub fn render(d: *Dashboard) void {
         zgui.tableSetupColumn("Value", .{ .flags = .{ .width_stretch = true } });
         zgui.tableSetupColumn("Conf", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 44 });
         zgui.tableSetupColumn("Verdict", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 90 });
-        zgui.tableSetupColumn("Feed", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 140 });
+        zgui.tableSetupColumn("Feed", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 165 });
         zgui.tableSetupColumn("Last seen", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 76 });
         zgui.tableSetupColumn("Hits", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 44 });
         zgui.tableSetupScrollFreeze(0, 1);
