@@ -128,7 +128,7 @@ pub fn render(d: *Dashboard) void {
     }
 
     // ── Time & tables ────────────────────────────────────────────────────
-    if (section("Time & tables", "timestamp utc local relative timezone clock age", true)) {
+    if (section("Time & tables", "timestamp utc local relative timezone clock age defang copy clipboard ioc", true)) {
         enumCombo(ui.fmt.TimeStyle, "timestamps##set_ts", &p.time_style, d);
         zgui.sameLine(.{ .spacing = 8 });
         var ex1: [16]u8 = undefined;
@@ -139,6 +139,14 @@ pub fn render(d: *Dashboard) void {
         zgui.pushTextWrapPos(0);
         zgui.textColored(t.text.lo, "UTC is the SOC convention \u{2014} cross-timezone timelines need one reference. CSV exports stay UTC regardless.", .{});
         zgui.popTextWrapPos();
+
+        var dfc = p.defang_copy;
+        if (zgui.checkbox("defang IOC values on copy##set_dfc", .{ .v = &dfc })) {
+            p.defang_copy = dfc;
+            changed(d);
+        }
+        zgui.sameLine(.{ .spacing = 8 });
+        zgui.textColored(t.text.lo, "hxxps://x[.]y in the clipboard \u{2014} a ticket paste can never be a live link", .{});
     }
 
     // ── Notifications ────────────────────────────────────────────────────

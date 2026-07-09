@@ -488,6 +488,7 @@ const UiStateJson = struct {
     pref_sev_palette: []const u8 = "standard",
     pref_density: []const u8 = "cozy",
     pref_time_style: []const u8 = "utc",
+    pref_defang_copy: bool = true,
     pref_font_scale: f32 = 1.0,
     pref_reduced_motion: bool = false,
     pref_focus_ring_always: bool = false,

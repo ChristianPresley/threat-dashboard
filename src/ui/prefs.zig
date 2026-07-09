@@ -88,6 +88,10 @@ pub const Prefs = struct {
     /// persistent ring noisy; keyboard-first ones should turn it on.
     focus_ring_always: bool = false,
     time_style: fmt.TimeStyle = .utc,
+    /// Copy IOC values defanged ("hxxps://x[.]y") so a paste into a ticket
+    /// or chat can never be an accidental live link. Off = raw values for
+    /// tools that need to match on the real indicator.
+    defang_copy: bool = true,
     /// info/ok toast lifetime (seconds); warn shows 2×. WCAG 2.2.1:
     /// user-adjustable; toasts also pause while hovered and every one is
     /// retained in LOG.

@@ -138,8 +138,9 @@ change takes effect the frame it happens and persists to
   200 % (WCAG 1.4.4), and density (compact / cozy / comfortable — the
   latter reaches ≥24 px hit targets, WCAG 2.5.8).
 - **Time & tables** — timestamps in UTC (SOC convention), local time, or
-  relative ("4m"); every panel header shows the frame of reference and
-  CSV exports stay UTC regardless.
+  relative ("4m"); time columns carry their frame of reference and CSV
+  exports stay UTC regardless. IOC values copy **defanged** by default
+  (`hxxps://x[.]y`) so a ticket paste can never be a live link.
 - **Notifications** — toast duration (WCAG 2.2.1), a minimum-severity
   toast floor, and do-not-disturb (alert-fatigue controls; serious/crit
   still escalate to the banner, and everything is retained in LOG).

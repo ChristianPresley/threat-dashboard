@@ -109,10 +109,18 @@ pub fn render(d: *Dashboard) void {
                 var vl: [140]u8 = undefined;
                 const vlbl = std.fmt.bufPrintZ(&vl, "{s}##iocv{d}", .{ ic.value.slice(), ic.id }) catch continue;
                 if (zgui.selectable(vlbl, .{})) {
-                    var copy_buf: [136:0]u8 = undefined;
-                    const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{ic.value.slice()}) catch "";
-                    zgui.setClipboardText(cz);
-                    ui.events.post(.ok, "intel", "IOC value copied to clipboard", .{});
+                    var copy_buf: [200:0]u8 = undefined;
+                    if (ui.prefs.current.defang_copy) {
+                        var df: [180]u8 = undefined;
+                        const safe = domain.defang(&df, ic.type, ic.value.slice());
+                        const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{safe}) catch "";
+                        zgui.setClipboardText(cz);
+                        ui.events.post(.ok, "intel", "IOC copied DEFANGED (raw copy: SET \u{2192} Time & tables)", .{});
+                    } else {
+                        const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{ic.value.slice()}) catch "";
+                        zgui.setClipboardText(cz);
+                        ui.events.post(.ok, "intel", "raw IOC value copied to clipboard", .{});
+                    }
                 }
                 if (pl.on(2)) {
                     _ = zgui.tableNextColumn();
