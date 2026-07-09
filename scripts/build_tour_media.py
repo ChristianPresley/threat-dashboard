@@ -32,6 +32,11 @@ SCENES = {
     "16-ai-chat":        ("gif", 260),
     "17-settings":       ("still", None),
     "18-theme-tour":     ("gif", 700),
+    "19-ir-triage":      ("gif", 400),
+    "20-ir-scope":       ("gif", 300),
+    "21-ir-chain":       ("still", None),
+    "22-ir-verdict":     ("gif", 200),
+    "23-ir-contain":     ("gif", 350),
 }
 
 GIF_WIDTH = 1120   # downscale for a readable-but-compact GIF

@@ -771,6 +771,10 @@ pub const Dashboard = struct {
 
     // -- Guided-tour harness --
     tour_scene: usize = 0,
+    /// IR-story continuity (scenes 19-23): the critical alert under
+    /// investigation and the case opened to contain it.
+    tour_ir_alert: ?u32 = null,
+    tour_ir_case: ?u16 = null,
     tour_frame: u32 = 0,
     tour_cap_seq: u32 = 0,
 
@@ -1075,6 +1079,17 @@ pub const Dashboard = struct {
         // Live re-theming: 4 × 28-frame segments (dark → midnight →
         // high-contrast → dark+Okabe-Ito), 2 captures per segment.
         .{ .name = "18-theme-tour", .ws = .triage, .kind = .gif, .hold = 112, .cap_from = 6, .cap_stride = 14 },
+        // ── IR story: track down → identify → resolve one critical ──────
+        // 19: triage walks the queue to the newest open CRIT (detail opens)
+        // 20: scope — type the victim host into Event Search live
+        // 21: the process chain behind the alert (PRC)
+        // 22: identify — enrich the C2 indicator, verdict fills MALICIOUS
+        // 23: contain — ack → case → resolve, watched by PST's counters
+        .{ .name = "19-ir-triage", .ws = .triage, .kind = .gif, .hold = 72, .cap_from = 2, .cap_stride = 6 },
+        .{ .name = "20-ir-scope", .ws = .hunt, .kind = .gif, .hold = 84, .cap_from = 2, .cap_stride = 6 },
+        .{ .name = "21-ir-chain", .ws = .hunt, .kind = .still, .hold = 30, .cap_from = 28 },
+        .{ .name = "22-ir-verdict", .ws = .intel, .kind = .gif, .hold = 140, .cap_from = 2, .cap_stride = 7 },
+        .{ .name = "23-ir-contain", .ws = .triage, .kind = .gif, .hold = 100, .cap_from = 2, .cap_stride = 6 },
     };
 
     /// What main.zig should capture this frame (null = capture nothing).
@@ -1196,7 +1211,95 @@ pub const Dashboard = struct {
             self.tourSeedChat();
         } else if (std.mem.eql(u8, sc.name, "17-settings")) {
             self.focusPanel(PANEL_SET);
+        } else if (std.mem.eql(u8, sc.name, "19-ir-triage")) {
+            self.focusPanel(PANEL_ALQ);
+            self.alq_sel = null;
+            self.tour_ir_alert = self.tourNewestOpenCrit();
+        } else if (std.mem.eql(u8, sc.name, "20-ir-scope")) {
+            self.focusPanel(PANEL_EVT);
+            @memset(&self.evt_filter_buf, 0);
+        } else if (std.mem.eql(u8, sc.name, "21-ir-chain")) {
+            self.focusPanel(PANEL_PRC);
+            // Select the flagged chain on the victim host — the story must
+            // stay on one machine (chain roots = technique-tagged events
+            // with no parent, same collection PRC renders).
+            const host = self.tourIrHost();
+            self.prc_sel_root = null;
+            for (s.events.items) |*e| {
+                if (e.technique != null and e.parent == null and
+                    std.mem.eql(u8, s.hostName(e.host), host))
+                {
+                    self.prc_sel_root = e.id;
+                    break;
+                }
+            }
+        } else if (std.mem.eql(u8, sc.name, "22-ir-verdict")) {
+            self.focusPanel(PANEL_ENR);
+            self.enr_history_len = 0;
+            // The C2 indicator. enrichmentFor is a PURE function of the
+            // IOC value, so the scene can pre-evaluate candidates and pick
+            // an unenriched one whose verdict will come back MALICIOUS —
+            // the "identify the threat" beat must not enrich clean. Prefer
+            // contacted (hits > 0), then IPs, then anything malicious.
+            var pick: ?u32 = null;
+            var pick_ip: ?u32 = null;
+            var pick_any: ?u32 = null;
+            for (s.iocs.items) |*ic| {
+                if (s.enrichmentForIoc(ic.id) != null) continue;
+                const future = data.mock.Generator.enrichmentFor(s, ic, unixNowMs());
+                if (future.verdict != .malicious) continue;
+                if (pick_any == null) pick_any = ic.id;
+                if (ic.type == .ip and pick_ip == null) pick_ip = ic.id;
+                if (ic.hits > 0) {
+                    pick = ic.id;
+                    if (ic.type == .ip) break;
+                }
+            }
+            if (pick == null) pick = pick_ip orelse pick_any;
+            if (pick) |id| {
+                self.enr_sel = id;
+                self.requestEnrichment(&[_]u32{id});
+            }
+        } else if (std.mem.eql(u8, sc.name, "23-ir-contain")) {
+            self.focusPanel(PANEL_ALQ);
+            self.alq_sel = self.tour_ir_alert;
+            // Open the containment case the assignment lands in.
+            var title_buf: [96]u8 = undefined;
+            const host = self.tourIrHost();
+            const title = std.fmt.bufPrint(&title_buf, "C2 exfiltration \u{2014} {s}", .{host}) catch "C2 exfiltration";
+            if (s.addCase(.{
+                .id = 0,
+                .title = domain.FixedStr(96).from(title),
+                .severity = .critical,
+                .status = .active,
+                .assignee = domain.FixedStr(24).from("cpresley"),
+                .opened_ms = unixNowMs(),
+                .updated_ms = unixNowMs(),
+            })) |cid| {
+                self.tour_ir_case = cid;
+                self.cas_sel = cid;
+            }
         }
+    }
+
+    /// Newest open critical alert — the IR story's subject.
+    fn tourNewestOpenCrit(self: *Dashboard) ?u32 {
+        var i = self.store.alerts.items.len;
+        while (i > 0) {
+            i -= 1;
+            const a = &self.store.alerts.items[i];
+            if (a.severity == .critical and a.status.isOpen()) return a.id;
+        }
+        return null;
+    }
+
+    /// The victim host from the story alert's entity ("WS-HR-02 · a.garcia").
+    fn tourIrHost(self: *Dashboard) []const u8 {
+        const id = self.tour_ir_alert orelse return "host";
+        const a = self.store.alertById(id) orelse return "host";
+        const ent = a.entity.slice();
+        const cut = std.mem.indexOf(u8, ent, " \u{00B7}") orelse ent.len;
+        return ent[0..cut];
     }
 
     /// Per-frame animation within a scene (brush sweep, pivot hops, typing).
@@ -1209,6 +1312,48 @@ pub const Dashboard = struct {
             const start = base - @divFloor(span * 40, 100);
             const grow = @as(i64, local) * @divFloor(span, 240);
             self.evt_range = .{ start, @min(base, start + grow) };
+        } else if (std.mem.eql(u8, sc.name, "19-ir-triage")) {
+            // Walk the selection down the queue, landing on the CRIT: three
+            // newest open alerts first, the story alert last.
+            const target = self.tour_ir_alert orelse return;
+            var path: [4]u32 = .{ 0, 0, 0, 0 };
+            var n: usize = 0;
+            var i = self.store.alerts.items.len;
+            while (i > 0 and n < 3) {
+                i -= 1;
+                const a = &self.store.alerts.items[i];
+                if (a.status.isOpen() and a.id != target) {
+                    path[n] = a.id;
+                    n += 1;
+                }
+            }
+            path[n] = target;
+            const idx = @min(local / 14, n);
+            self.alq_sel = path[idx];
+        } else if (std.mem.eql(u8, sc.name, "20-ir-scope")) {
+            // Type the victim host into the EVT filter, one char per ~6
+            // frames — rows narrow live like an analyst scoping a host.
+            const host = self.tourIrHost();
+            const chars = @min(local / 6, host.len);
+            @memset(&self.evt_filter_buf, 0);
+            @memcpy(self.evt_filter_buf[0..chars], host[0..chars]);
+        } else if (std.mem.eql(u8, sc.name, "23-ir-contain")) {
+            // Beats: ack (MTTA stamps) → assign to the case → resolve the
+            // alert + mark the case contained. Real Store mutations — the
+            // audit trail and a PG provider see exactly what clicks do.
+            const id = self.tour_ir_alert orelse return;
+            if (local == 16) {
+                // Ack only advances a NEW alert — re-acking one already
+                // under investigation would read as a status downgrade.
+                if (self.store.alertById(id)) |a| {
+                    if (a.status == .new) _ = self.store.setAlertStatus(id, .acked, unixNowMs());
+                }
+            } else if (local == 44) {
+                if (self.tour_ir_case) |cid| _ = self.store.assignAlertToCase(id, cid, unixNowMs());
+            } else if (local == 72) {
+                _ = self.store.setAlertStatus(id, .resolved, unixNowMs());
+                if (self.tour_ir_case) |cid| _ = self.store.setCaseStatus(cid, .contained, unixNowMs());
+            }
         } else if (std.mem.eql(u8, sc.name, "18-theme-tour")) {
             // 28-frame segments: dark → midnight → high-contrast →
             // dark + Okabe-Ito. Only touch prefs at boundaries so the
