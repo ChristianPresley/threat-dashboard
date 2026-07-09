@@ -13,7 +13,7 @@ var disable_dwell: ui.confirm.Dwell = .{};
 var disable_pending: ?u16 = null;
 
 fn ruleStatusColor(st: domain.RuleStatus) [4]f32 {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     return switch (st) {
         .enabled => t.sev.ok,
         .testing => t.sev.warn,
@@ -22,7 +22,7 @@ fn ruleStatusColor(st: domain.RuleStatus) [4]f32 {
 }
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // ── Filter bar ───────────────────────────────────────────────────────

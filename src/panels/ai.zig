@@ -10,7 +10,7 @@ const dash = @import("../dashboard.zig");
 const Dashboard = dash.Dashboard;
 
 fn mcpColor(state: anytype) [4]f32 {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     return switch (state) {
         .ready => t.sev.ok,
         .starting => t.sev.warn,
@@ -20,8 +20,18 @@ fn mcpColor(state: anytype) [4]f32 {
 }
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const a = &d.assistant;
+
+    // ── Disabled by preference (compliance hard-off) ─────────────────────
+    if (!ui.prefs.current.ai_enabled) {
+        zgui.pushTextWrapPos(0);
+        defer zgui.popTextWrapPos();
+        zgui.textColored(t.text.lo, "{s} AI assistant disabled", .{ui.fonts.fa.circle_info});
+        zgui.spacing();
+        zgui.textWrapped("The assistant is switched off in Settings (SET \u{2192} AI assistant). No worker thread runs and nothing leaves the machine while disabled.", .{});
+        return;
+    }
 
     // ── Config-needed state ──────────────────────────────────────────────
     if ((!a.cfg.configured() or a.worker == null) and !a.tour_demo) {
@@ -164,7 +174,7 @@ fn copyText(d: *Dashboard, text: []const u8) void {
 }
 
 fn renderItem(d: *Dashboard, it: *dash.ChatItem, idx: usize) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     switch (it.kind) {
         .user => {
             zgui.textColored(t.accent, "you", .{});

@@ -29,6 +29,11 @@ var slots: [CAP]Slot = @splat(.{});
 /// cells don't each read the clock.
 var now_ms: i64 = 0;
 
+/// Reduced-motion gate (WCAG 2.3.3): false ⇒ update() still tracks values
+/// and directions (tick-colored text keeps working) but never emits a
+/// flash alpha, and insert flashes are no-ops.
+pub var enabled: bool = true;
+
 pub fn beginFrame() void {
     now_ms = confirm.nowMs();
 }
@@ -62,6 +67,8 @@ pub fn update(key: u64, value: f64) Result {
 
     if (slot.change_ms == 0) return .{ .alpha = 0, .dir = .none };
 
+    if (!enabled) return .{ .alpha = 0, .dir = slot.dir };
+
     // Throttle: two consecutive changes < ~330ms apart = faster than 3 Hz —
     // suppress the flash until the cadence slows.
     if (slot.prev_change_ms != 0 and slot.change_ms - slot.prev_change_ms < 330) {
@@ -76,6 +83,7 @@ pub fn update(key: u64, value: f64) Result {
 
 /// One-shot row-insert flash: seed a synthetic change now (no direction).
 pub fn markInsert(key: u64) void {
+    if (!enabled) return;
     const slot = find(key);
     slot.* = .{ .key = key, .value_bits = 0, .change_ms = now_ms, .prev_change_ms = 0, .dir = .none };
 }

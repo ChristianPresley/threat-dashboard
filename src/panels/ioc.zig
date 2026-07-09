@@ -11,7 +11,7 @@ const Dashboard = dash.Dashboard;
 const MAX_ROWS = 2048;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     zgui.textColored(t.text.lo, "type:", .{});
@@ -135,8 +135,8 @@ pub fn render(d: *Dashboard) void {
                         var fb: [20]u8 = undefined;
                         var lb2: [20]u8 = undefined;
                         zgui.textColored(t.text.mid, "first seen {s} \u{00B7} last seen {s}", .{
-                            ui.fmt.dateTime(&fb, @divFloor(ic.first_seen_ms, 1000)),
-                            ui.fmt.dateTime(&lb2, @divFloor(ic.last_seen_ms, 1000)),
+                            ui.fmt.tsDate(&fb, @divFloor(ic.first_seen_ms, 1000)),
+                            ui.fmt.tsDate(&lb2, @divFloor(ic.last_seen_ms, 1000)),
                         });
                         zgui.endTooltip();
                     }

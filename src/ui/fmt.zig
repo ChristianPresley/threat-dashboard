@@ -85,12 +85,67 @@ pub fn abbrev(buf: []u8, value: f64) [:0]const u8 {
     return std.fmt.bufPrintZ(buf, "{s}{d:.0}", .{ sign, v }) catch unreachable_short(buf);
 }
 
+// ── Timestamp style (SET preference) ─────────────────────────────────────
+// Data timestamps render through ts()/tsDate() honoring the analyst's
+// choice; panel headers print tsSuffix() once so the frame of reference is
+// always visible (SOC convention: UTC default, cross-tz IR needs it).
+
+pub const TimeStyle = enum(u8) {
+    utc,
+    local,
+    relative,
+
+    pub fn label(self: TimeStyle) [:0]const u8 {
+        return switch (self) {
+            .utc => "UTC (SOC standard)",
+            .local => "Local time",
+            .relative => "Relative (3m ago)",
+        };
+    }
+};
+
+pub var time_style: TimeStyle = .utc;
+/// Local UTC offset in minutes (set once at boot from the OS).
+pub var local_offset_min: i32 = 0;
+/// Wall-clock "now" (unix secs) — dashboard sets it once per frame so
+/// relative timestamps don't each read the OS clock.
+pub var now_ts: i64 = 0;
+
+/// Data timestamp in the analyst's chosen style: HH:MM:SS (UTC or local)
+/// or a compact age ("4m"). THE way panel time columns render.
+pub fn ts(buf: []u8, wall_ts: i64) [:0]const u8 {
+    return switch (time_style) {
+        .utc => clock(buf, wall_ts),
+        .local => clock(buf, wall_ts + @as(i64, local_offset_min) * 60),
+        .relative => age(buf, now_ts - wall_ts),
+    };
+}
+
+/// Date+time variant (MM-DD HH:MM in the chosen zone; relative style still
+/// prints an age — dates read poorly as ages beyond a day anyway).
+pub fn tsDate(buf: []u8, wall_ts: i64) [:0]const u8 {
+    return switch (time_style) {
+        .utc => dateTime(buf, wall_ts),
+        .local => dateTime(buf, wall_ts + @as(i64, local_offset_min) * 60),
+        .relative => age(buf, now_ts - wall_ts),
+    };
+}
+
+/// Frame-of-reference marker for panel headers ("UTC" · "local" · "age").
+pub fn tsSuffix() [:0]const u8 {
+    return switch (time_style) {
+        .utc => "UTC",
+        .local => "local",
+        .relative => "age",
+    };
+}
+
 /// HH:MM:SS from a Unix timestamp (UTC). One "UTC" marker per panel header,
 /// not per cell (§3.2).
-pub fn clock(buf: []u8, ts: i64) [:0]const u8 {
+pub fn clock(buf: []u8, ts_secs: i64) [:0]const u8 {
     const secs_in_day: i64 = 86_400;
     // @mod with a positive divisor is already non-negative.
-    const s = @mod(ts, secs_in_day);
+    const s = @mod(ts_secs, secs_in_day);
     const h: u32 = @intCast(@divFloor(s, 3600));
     const m: u32 = @intCast(@mod(@divFloor(s, 60), 60));
     const sec: u32 = @intCast(@mod(s, 60));
@@ -98,8 +153,8 @@ pub fn clock(buf: []u8, ts: i64) [:0]const u8 {
 }
 
 /// MM-DD HH:MM from a Unix timestamp (UTC).
-pub fn dateTime(buf: []u8, ts: i64) [:0]const u8 {
-    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(ts, 0)) };
+pub fn dateTime(buf: []u8, ts_secs: i64) [:0]const u8 {
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(ts_secs, 0)) };
     const day = epoch.getEpochDay().calculateYearDay();
     const md = day.calculateMonthDay();
     const ds = epoch.getDaySeconds();
@@ -172,6 +227,22 @@ test "signed deltas" {
 test "fixed keeps trailing zeros" {
     var buf: [48]u8 = undefined;
     try std.testing.expectEqualStrings("0.05000", fixed(&buf, 0.05, 5));
+}
+
+test "ts honors time style" {
+    var buf: [48]u8 = undefined;
+    const t: i64 = 1_749_479_525; // 14:32:05 UTC
+    time_style = .utc;
+    try std.testing.expectEqualStrings("14:32:05", ts(&buf, t));
+    try std.testing.expectEqualStrings("UTC", tsSuffix());
+    time_style = .local;
+    local_offset_min = -300; // UTC-5
+    try std.testing.expectEqualStrings("09:32:05", ts(&buf, t));
+    time_style = .relative;
+    now_ts = t + 245;
+    try std.testing.expectEqualStrings("4m", ts(&buf, t));
+    time_style = .utc;
+    local_offset_min = 0;
 }
 
 test "clock and age" {

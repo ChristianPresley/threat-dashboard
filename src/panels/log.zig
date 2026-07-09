@@ -9,7 +9,7 @@ const dash = @import("../dashboard.zig");
 const Dashboard = dash.Dashboard;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const n = ui.events.len();
 
     zgui.textColored(t.text.lo, "sev:", .{});
@@ -21,7 +21,7 @@ pub fn render(d: *Dashboard) void {
         }
     }
     zgui.sameLine(.{ .spacing = 14 });
-    zgui.textColored(t.text.lo, "{d} events \u{00B7} UTC \u{00B7} Ctrl+E exports CSV", .{n});
+    zgui.textColored(t.text.lo, "{d} events \u{00B7} {s} \u{00B7} Ctrl+E exports CSV (UTC)", .{ n, ui.fmt.tsSuffix() });
 
     if (n == 0) {
         zgui.spacing();
@@ -124,7 +124,7 @@ pub fn render(d: *Dashboard) void {
 
                 _ = zgui.tableNextColumn();
                 var cb: [16]u8 = undefined;
-                ui.fmt.rightAlignedTextColored(t.text.lo, ui.fmt.clock(&cb, e.wall_ts));
+                ui.fmt.rightAlignedTextColored(t.text.lo, ui.fmt.ts(&cb, e.wall_ts));
                 _ = zgui.tableNextColumn();
                 zgui.textColored(dash.evSevColor(e.sev), "{s}", .{e.sev.label()});
                 _ = zgui.tableNextColumn();

@@ -430,8 +430,12 @@ pub fn main(init: std.process.Init) !void {
     dashboard.setStateDir(state_dir);
     if (show_demo) dashboard.show_demo_window = true;
 
-    // Restore {workspace, filters, seed} from <state-dir>/ui_state.json.
+    // Restore {workspace, filters, seed, preferences} from
+    // <state-dir>/ui_state.json, then apply prefs (theme variant, severity
+    // palette, density, font scale, toasts, motion) in one shot.
+    ui.prefs.detectLocalOffset();
     dashboard.loadUiState();
+    ui.prefs.apply();
 
     // AI assistant: config from environment (secrets are never persisted).
     // The worker thread is spawned lazily on the first message, so this is
@@ -507,6 +511,9 @@ pub fn main(init: std.process.Init) !void {
         // neither ui_state.json nor layout.ini.
         dashboard.ui_state_save_suppressed = true;
         ui.layout.save_suppressed = true;
+        // Captures compare across machines/sessions: shipped-default prefs,
+        // whatever the dev's ui_state.json says.
+        ui.prefs.resetAll();
         if (screenshot_dir) |dir| {
             std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
                 std.log.warn("screenshot: could not create '{s}': {} — degrading to --validate.", .{ dir, err });
@@ -524,6 +531,7 @@ pub fn main(init: std.process.Init) !void {
     if (tour_dir) |dir| {
         dashboard.ui_state_save_suppressed = true;
         ui.layout.save_suppressed = true;
+        ui.prefs.resetAll();
         std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
             std.log.err("tour: could not create '{s}': {}", .{ dir, err });
             tour_dir = null;
@@ -633,6 +641,10 @@ pub fn main(init: std.process.Init) !void {
         const hold_pos = (Dashboard.VALIDATE_TOTAL -| cycle_before) % Dashboard.VALIDATE_HOLD;
         const capture_this_frame = screenshot_dir != null and forced_ws != null and
             hold_pos == Dashboard.VALIDATE_HOLD - 8;
+        // Second OPS capture with the floating panels (SET/HELP/AI) open —
+        // they're forced open at HOLD-6, so HOLD-3 shows them settled.
+        const capture_floats = screenshot_dir != null and forced_ws != null and
+            forced_ws.? == .ops and hold_pos == Dashboard.VALIDATE_HOLD - 3;
 
         zgui.newFrame();
         dashboard.render(dt);
@@ -656,6 +668,10 @@ pub fn main(init: std.process.Init) !void {
             const ws = forced_ws.?;
             const base = std.fmt.bufPrint(&name_buf, "ws-{d}-{s}", .{ @intFromEnum(ws), ws.tag() }) catch "ws";
             writeScreenshot(allocator, io, screenshot_dir.?, base, cap);
+        } else if (capture_floats) {
+            const cap = try renderer.endFrameCapture(ctx, allocator);
+            defer allocator.free(cap.pixels);
+            writeScreenshot(allocator, io, screenshot_dir.?, "ws-5-FLOATS", cap);
         } else {
             try renderer.endFrame(ctx);
         }

@@ -13,7 +13,7 @@ const Dashboard = dash.Dashboard;
 const MAX_ROWS = 4096;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // ── Filter bar ───────────────────────────────────────────────────────
@@ -160,7 +160,7 @@ pub fn render(d: *Dashboard) void {
                 }
                 zgui.sameLine(.{});
                 zgui.setCursorPosX(cur);
-                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.clock(&cb, @divFloor(a.ts_ms, 1000))});
+                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.ts(&cb, @divFloor(a.ts_ms, 1000))});
 
                 _ = zgui.tableNextColumn();
                 zgui.textColored(dash.sevColor(a.severity), "{s}", .{a.severity.label()});

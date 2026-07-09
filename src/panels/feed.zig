@@ -11,7 +11,7 @@ const dash = @import("../dashboard.zig");
 const Dashboard = dash.Dashboard;
 
 fn feedStatusColor(st: domain.FeedStatus) [4]f32 {
-    const t = ui.theme.default.sev;
+    const t = ui.theme.active.sev;
     return switch (st) {
         .ok => t.ok,
         .syncing => t.info,
@@ -20,7 +20,7 @@ fn feedStatusColor(st: domain.FeedStatus) [4]f32 {
 }
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     zgui.textColored(t.text.lo, "{d} feeds \u{00B7} {d} IOCs", .{ s.feeds.items.len, s.iocs.items.len });

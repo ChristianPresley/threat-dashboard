@@ -15,7 +15,7 @@ var pause_dwell: ui.confirm.Dwell = .{};
 var pause_pending: ?u16 = null;
 
 fn statusColor(st: domain.PipelineStatus) [4]f32 {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     return switch (st) {
         .active => t.sev.ok,
         .paused => t.text.lo,
@@ -25,7 +25,7 @@ fn statusColor(st: domain.PipelineStatus) [4]f32 {
 }
 
 fn runColor(st: domain.RunStatus) [4]f32 {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     return switch (st) {
         .running => t.sev.info,
         .success => t.sev.ok,
@@ -35,7 +35,7 @@ fn runColor(st: domain.RunStatus) [4]f32 {
 }
 
 fn connColor(st: domain.ConnState) [4]f32 {
-    const t = ui.theme.default.sev;
+    const t = ui.theme.active.sev;
     return switch (st) {
         .ok => t.ok,
         .degraded => t.warn,
@@ -74,7 +74,7 @@ fn segSameLine(main: []const u8, meta: []const u8, spacing: f32) void {
 }
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // ── Header strip: pipeline health · tests · 24h volume · run job ────
@@ -465,7 +465,7 @@ fn pipelineMatches(p: *const domain.Pipeline, filter: []const u8) bool {
 // ── Sources strip: registered databases/buckets/topics + Test action ────
 
 fn renderSources(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = t.bg.sunken });
     defer zgui.popStyleColor(.{ .count = 1 });
@@ -528,7 +528,7 @@ fn renderSources(d: *Dashboard) void {
 // ── Builder: create a pipeline from source + steps + sink ───────────────
 
 fn renderBuilder(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
     zgui.pushStyleColor4f(.{ .idx = .child_bg, .c = t.bg.sunken });
     defer zgui.popStyleColor(.{ .count = 1 });
@@ -580,7 +580,7 @@ fn renderBuilder(d: *Dashboard) void {
         }
         zgui.sameLine(.{ .spacing = 8 });
         zgui.setNextItemWidth(160);
-        _ = zgui.inputTextWithHint("##pip_target", .{ .hint = "target (schema.table)", .buf = &d.pip_new_target });
+        _ = zgui.inputTextWithHint("##pip_target", .{ .hint = "schema.table", .buf = &d.pip_new_target });
         zgui.sameLine(.{ .spacing = 8 });
         zgui.setNextItemWidth(90);
         _ = zgui.dragInt("##pip_sched", .{ .v = &d.pip_new_sched, .speed = 1, .min = 0, .max = 1440, .cfmt = "%d min" });

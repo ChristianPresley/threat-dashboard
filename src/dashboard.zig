@@ -166,7 +166,7 @@ pub fn panelWindowName(buf: []u8, idx: usize, ws: ui.layout.Workspace) [:0]const
 
 /// Domain severity → theme color.
 pub fn sevColor(sev: domain.Severity) [4]f32 {
-    const t = ui.theme.default.sev;
+    const t = ui.theme.active.sev;
     return switch (sev) {
         .info => t.info,
         .low => t.ok,
@@ -177,7 +177,7 @@ pub fn sevColor(sev: domain.Severity) [4]f32 {
 }
 
 pub fn sevDimColor(sev: domain.Severity) [4]f32 {
-    const t = ui.theme.default.sev;
+    const t = ui.theme.active.sev;
     return switch (sev) {
         .info => t.info_dim,
         .low => t.ok_dim,
@@ -189,7 +189,7 @@ pub fn sevDimColor(sev: domain.Severity) [4]f32 {
 
 /// Event-spine severity → theme color (LOG/toasts).
 pub fn evSevColor(sev: ui.events.Severity) [4]f32 {
-    const t = ui.theme.default.sev;
+    const t = ui.theme.active.sev;
     return switch (sev) {
         .ok => t.ok,
         .info => t.info,
@@ -200,7 +200,7 @@ pub fn evSevColor(sev: ui.events.Severity) [4]f32 {
 }
 
 pub fn sensorStatusColor(s: domain.SensorStatus) [4]f32 {
-    const t = ui.theme.default.sev;
+    const t = ui.theme.active.sev;
     return switch (s) {
         .ok => t.ok,
         .degraded => t.warn,
@@ -210,7 +210,7 @@ pub fn sensorStatusColor(s: domain.SensorStatus) [4]f32 {
 
 /// YARA quality grade ('A'..'F') → theme score band.
 pub fn gradeColor(g: u8) [4]f32 {
-    const t = ui.theme.default.score;
+    const t = ui.theme.active.score;
     return switch (g) {
         'A' => t.a,
         'B' => t.b,
@@ -222,7 +222,7 @@ pub fn gradeColor(g: u8) [4]f32 {
 
 /// Enrichment verdict → severity family (state, not identity).
 pub fn verdictColor(v: domain.Verdict) [4]f32 {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     return switch (v) {
         .malicious => t.sev.crit,
         .suspicious => t.sev.warn,
@@ -232,7 +232,7 @@ pub fn verdictColor(v: domain.Verdict) [4]f32 {
 }
 
 pub fn gateColor(pass: bool) [4]f32 {
-    const t = ui.theme.default.sev;
+    const t = ui.theme.active.sev;
     return if (pass) t.ok else t.crit;
 }
 
@@ -246,7 +246,7 @@ fn findTechnique(id: []const u8) ?attack.TechniqueId {
 
 /// Toggleable filter chip: filled when on, outlined when off.
 pub fn filterChip(label: [:0]const u8, on: bool, hue: [4]f32) bool {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const fill = if (on) ui.theme.mix(t.bg.elev, hue, 0.35) else t.bg.panel;
     const txt = if (on) t.text.hi else t.text.lo;
     zgui.pushStyleColor4f(.{ .idx = .button, .c = fill });
@@ -332,6 +332,10 @@ fn runSeedCmd(ctx: *anyopaque) void {
     d.regenerateWorld(d.seed +% 1);
 }
 
+fn runPauseCmd(ctx: *anyopaque) void {
+    cmdDash(ctx).togglePause();
+}
+
 const commands = [_]ui.registry.Command{
     // -- Panels --
     .{ .code = "PST", .name = "Posture Summary", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_PST), .desc = "Focus the Posture Summary (open alerts by severity \u{00B7} cases \u{00B7} MTTA \u{00B7} sensor health \u{00B7} 24h sparkline)" },
@@ -355,7 +359,7 @@ const commands = [_]ui.registry.Command{
     .{ .code = "AUD", .name = "Audit Trail", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_AUD), .desc = "Focus the Audit Trail (chain of custody: every analyst/system action, who \u{00B7} what \u{00B7} when)" },
     .{ .code = "LOG", .name = "Event Log", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_LOG), .desc = "Focus the Event Log (app status/event stream, Ctrl+E exports CSV)" },
     .{ .code = "JOB", .name = "Jobs", .kind = .panel, .menu_group = "Panels", .run = makePanelRun(PANEL_JOB), .desc = "Focus Jobs (async work: phase, progress, cancel)" },
-    .{ .code = "SET", .name = "Settings", .kind = .panel, .menu_group = "Panels", .key_hint = "Ctrl+,", .run = makePanelRun(PANEL_SET), .desc = "Focus Settings (mock seed \u{00B7} layout persistence \u{00B7} data providers \u{00B7} AI status)" },
+    .{ .code = "SET", .name = "Settings", .kind = .panel, .menu_group = "Panels", .key_hint = "Ctrl+,", .run = makePanelRun(PANEL_SET), .desc = "Focus Settings (theme \u{00B7} severity palette \u{00B7} density \u{00B7} timestamps \u{00B7} notifications \u{00B7} accessibility \u{00B7} SLA \u{00B7} AI)" },
     .{ .code = "HELP", .name = "Directory", .kind = .panel, .menu_group = "Panels", .key_hint = "?", .run = makePanelRun(PANEL_HELP), .desc = "Focus the HELP directory (codes \u{00B7} keyboard map \u{00B7} command grammar)" },
     .{ .code = "AI", .name = "AI Assistant", .kind = .panel, .menu_group = "Panels", .key_hint = "Ctrl+Shift+A", .run = makePanelRun(PANEL_AI), .desc = "Focus the AI Assistant (Claude chat with read-only dashboard + threat-intel tools)" },
     // -- Workspaces --
@@ -368,6 +372,7 @@ const commands = [_]ui.registry.Command{
     .{ .code = "RESET", .name = "Reset workspace", .kind = .action, .menu_group = "Actions", .run = runResetCmd, .desc = "Rebuild the active workspace's dock preset" },
     .{ .code = "SNAP", .name = "Snapshot layout", .kind = .action, .menu_group = "Actions", .key_hint = "Ctrl+S", .run = runSnapCmd, .desc = "Save the dock layout + UI state now" },
     .{ .code = "SEED", .name = "Regenerate world", .kind = .action, .menu_group = "Actions", .run = runSeedCmd, .desc = "Rebuild the mock world with the next seed (mock-data phase only)" },
+    .{ .code = "PAUSE", .name = "Pause data refresh", .kind = .action, .menu_group = "Actions", .key_hint = "Ctrl+P", .run = runPauseCmd, .desc = "Freeze/unfreeze data refresh \u{2014} rows stop moving during evidence capture; panel actions still write" },
     .{ .code = "DEMO", .name = "Bindings demo", .kind = .action, .menu_group = "Actions", .run = runDemoCmd, .desc = "Toggle the ImPlot-bindings demo window" },
 };
 
@@ -402,6 +407,7 @@ const keymap_global = [_]KeyBinding{
     .{ .chord = "Ctrl+Shift+A", .action = "AI \u{00B7} Assistant (Claude chat with dashboard + threat-intel tools)" },
     .{ .chord = "?", .action = "HELP directory (Shift+/ outside text inputs)" },
     .{ .chord = "Ctrl+S", .action = "snapshot layout + UI state now (toast confirms)" },
+    .{ .chord = "Ctrl+P", .action = "pause/resume data refresh (freeze rows during evidence capture)" },
     .{ .chord = "Esc", .action = "clear command line \u{2192} close popup \u{2192} disarm an armed confirm (never confirms)" },
     .{ .chord = "middle-click", .action = "dismiss a toast" },
 };
@@ -414,7 +420,7 @@ const keymap_cmdline = [_]KeyBinding{
 };
 
 const keymap_tables = [_]KeyBinding{
-    .{ .chord = "Ctrl+F", .action = "focus the panel's filter box (ALQ EVT RUL IOC YAR PIP AUD NET)" },
+    .{ .chord = "Ctrl+F", .action = "focus the panel's filter box (ALQ EVT RUL IOC YAR PIP AUD NET SET)" },
     .{ .chord = "\u{2191} \u{2193}", .action = "row selection (ALQ EVT RUL CAS)" },
     .{ .chord = "Enter", .action = "default row action (ALQ ack \u{00B7} EVT detail \u{00B7} RUL/CAS toggle detail)" },
     .{ .chord = "Ctrl+E", .action = "export visible rows to CSV (LOG \u{2014} toast with path)" },
@@ -474,6 +480,21 @@ const UiStateJson = struct {
     evt_kinds: u32 = 0b1111111,
     yar_fail_only: bool = false,
     tun_threshold: f32 = 0.5,
+    // -- Preferences (SET) — additive; absent fields keep shipped defaults --
+    pref_theme: []const u8 = "dark",
+    pref_sev_palette: []const u8 = "standard",
+    pref_density: []const u8 = "cozy",
+    pref_time_style: []const u8 = "utc",
+    pref_font_scale: f32 = 1.0,
+    pref_reduced_motion: bool = false,
+    pref_focus_ring: bool = false,
+    pref_toast_secs: f32 = 4.0,
+    pref_toast_min_sev: u32 = 0,
+    pref_dnd: bool = false,
+    pref_startup_ws: []const u8 = "last",
+    pref_ai_enabled: bool = true,
+    pref_sla_mtta_min: f32 = 15.0,
+    pref_sla_mttr_hours: f32 = 4.0,
 };
 
 fn packBools(comptime n: usize, bits: *const [n]bool) u32 {
@@ -607,6 +628,10 @@ pub const Dashboard = struct {
     /// False when a real provider (PG) owns the Store — stops the mock
     /// trickle from writing over database truth.
     mock_ticking: bool = true,
+    /// Ctrl+P freeze: no mock trickle, no scheduler, no PG snapshot swaps —
+    /// rows must not move under the cursor mid-investigation. Panel actions
+    /// still write (and still mirror to PG); refresh resumes on unpause.
+    data_paused: bool = false,
     provider_label: [:0]const u8 = "mock generator",
     /// Background PG worker (set by main when --pg is live). Owns the DB
     /// connection; drained once per frame in drainPg.
@@ -727,6 +752,7 @@ pub const Dashboard = struct {
     audit_system: bool = false,
     aud_filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8),
     aud_focus_filter: bool = false,
+    set_focus_filter: bool = false,
 
     // -- Jobs (queue engine; side effects in onJobComplete/onJobCanceled) --
     jobs: data.jobs.Engine,
@@ -860,8 +886,18 @@ pub const Dashboard = struct {
         self.assistant.scroll_to_bottom = true;
     }
 
+    pub fn togglePause(self: *Dashboard) void {
+        self.data_paused = !self.data_paused;
+        if (self.data_paused) {
+            ui.events.post(.info, "world", "data refresh PAUSED (Ctrl+P resumes) \u{2014} panel actions still write", .{});
+        } else {
+            ui.events.post(.ok, "world", "data refresh resumed", .{});
+        }
+    }
+
     /// Send the assistant a message, serializing any attached context.
     pub fn assistantSend(self: *Dashboard, text: []const u8) void {
+        if (!ui.prefs.current.ai_enabled) return;
         const w = self.assistant.worker orelse return;
         self.appendChat(.user, text, "", false);
         // Build attached-context JSON from current selections, if requested.
@@ -967,7 +1003,7 @@ pub const Dashboard = struct {
                     // the worker captured `seq` isn't in this snapshot —
                     // swapping would revert it. Drop; the next cycle
                     // reloads after the write lands.
-                    if (snap.seq == w.mutation_seq.load(.seq_cst)) {
+                    if (snap.seq == w.mutation_seq.load(.seq_cst) and !self.data_paused) {
                         self.store.adoptFrom(snap.st);
                         std.log.scoped(.pg_worker).debug("snapshot swapped in: {d} events / {d} alerts", .{ self.store.events.items.len, self.store.alerts.items.len });
                     } else {
@@ -1290,7 +1326,13 @@ pub const Dashboard = struct {
             self.panel_force_open[PANEL_SET] = true;
             self.panel_force_open[PANEL_HELP] = true;
             self.panel_force_open[PANEL_AI] = true;
-            self.panel_focus_request = PANEL_AI;
+            self.panel_focus_request = PANEL_SET;
+        }
+        // SET foremost for the floats capture (main.zig HOLD-3): re-raise
+        // one frame after the trio appears — appearing windows take the
+        // top of the z-order, so the HOLD-6 focus alone loses to AI.
+        if (ws == .ops and hold_pos == VALIDATE_HOLD - 5) {
+            self.panel_focus_request = PANEL_SET;
         }
         if (ws == .ops and hold_pos == VALIDATE_HOLD - 2) {
             self.panel_force_open[PANEL_SET] = false;
@@ -1306,6 +1348,8 @@ pub const Dashboard = struct {
         self.dt = if (dt > 0) dt else 1.0 / 60.0;
         self.wall_clock_s += @as(f64, self.dt);
         self.ensureAuditHook();
+        // Relative timestamps ("3m ago") read this instead of the OS clock.
+        ui.fmt.now_ts = unixNow();
 
         // Event spine: per-frame flash clock + toast expiry + insert
         // flashes for events that arrived since the previous frame.
@@ -1329,7 +1373,7 @@ pub const Dashboard = struct {
 
         // Mock world heartbeat: trickle events/alerts + sensor drift.
         // Suppressed when a real provider owns the Store.
-        if (self.mock_ticking) self.gen.tick(&self.store, unixNowMs());
+        if (self.mock_ticking and !self.data_paused) self.gen.tick(&self.store, unixNowMs());
         self.tickJobs();
         self.tickScheduler();
         self.drainAssistant();
@@ -1369,6 +1413,7 @@ pub const Dashboard = struct {
         self.pip_focus_filter = false;
         self.aud_focus_filter = false;
         self.net_focus_filter = false;
+        self.set_focus_filter = false;
 
         self.renderToasts(wp, wsz);
         self.renderCritBanner(wp, wsz);
@@ -1413,6 +1458,10 @@ pub const Dashboard = struct {
         // Ctrl+, opens SET.
         if (ctrl and !shift and zgui.isKeyPressed(.comma, false)) self.focusPanel(PANEL_SET);
 
+        // Ctrl+P freezes/unfreezes data refresh (evidence capture: rows
+        // must not move under the cursor).
+        if (ctrl and !shift and zgui.isKeyPressed(.p, false)) self.togglePause();
+
         // Ctrl+Shift+A opens the AI assistant.
         if (ctrl and shift and zgui.isKeyPressed(.a, false)) self.focusPanel(PANEL_AI);
 
@@ -1438,6 +1487,7 @@ pub const Dashboard = struct {
             self.pip_focus_filter = true;
             self.aud_focus_filter = true;
             self.net_focus_filter = true;
+            self.set_focus_filter = true;
         }
 
         // `?` (Shift+/ outside text inputs) opens the HELP directory.
@@ -1482,7 +1532,7 @@ pub const Dashboard = struct {
     }
 
     fn renderTopStripContent(self: *Dashboard) void {
-        const t = ui.theme.default;
+        const t = ui.theme.active;
 
         // ── Left: workspace switcher ─────────────────────────────────────
         inline for (0..ui.layout.workspace_count) |wi| {
@@ -1514,11 +1564,14 @@ pub const Dashboard = struct {
             zgui.popStyleColor(.{ .count = 1 });
         }
 
-        // ── Right: command line · ☰ View · UTC clock ─────────────────────
+        // ── Right: command line · ☰ View · clock (UTC or local per SET) ──
         var clock_buf: [16]u8 = undefined;
         var clock_full: [24]u8 = undefined;
-        const clock_z = std.fmt.bufPrintZ(&clock_full, "{s} UTC", .{
-            ui.fmt.clock(&clock_buf, unixNow()),
+        const strip_local = ui.fmt.time_style == .local;
+        const strip_now = if (strip_local) unixNow() + @as(i64, ui.fmt.local_offset_min) * 60 else unixNow();
+        const clock_z = std.fmt.bufPrintZ(&clock_full, "{s} {s}", .{
+            ui.fmt.clock(&clock_buf, strip_now),
+            if (strip_local) "local" else "UTC",
         }) catch "";
 
         const view_label: [:0]const u8 = fa_bars ++ " View";
@@ -1622,7 +1675,7 @@ pub const Dashboard = struct {
                 .no_nav_focus = true,
             };
             if (zgui.begin("##cmd_sugg", .{ .flags = flags })) {
-                const t = ui.theme.default;
+                const t = ui.theme.active;
                 for (self.palette_matches[0..self.palette_match_count], 0..) |m, i| {
                     const cmd = &commands[m.idx];
                     const selected = i == self.palette_sel;
@@ -1924,7 +1977,7 @@ pub const Dashboard = struct {
     /// under PG) and suppressed inside the validate/tour harnesses so
     /// captures stay reproducible.
     fn tickScheduler(self: *Dashboard) void {
-        if (!self.mock_ticking or self.validate_cycle > 0 or self.tour_running) return;
+        if (!self.mock_ticking or self.data_paused or self.validate_cycle > 0 or self.tour_running) return;
         const now = unixNowMs();
         if (now - self.sched_last_ms < 5_000) return;
         self.sched_last_ms = now;
@@ -1990,7 +2043,7 @@ pub const Dashboard = struct {
     fn renderViewMenu(self: *Dashboard) void {
         if (!zgui.beginPopup("##view_menu", .{})) return;
         defer zgui.endPopup();
-        const t = ui.theme.default;
+        const t = ui.theme.active;
 
         var group: []const u8 = "";
         for (&commands) |*cmd| {
@@ -2257,7 +2310,7 @@ pub const Dashboard = struct {
 
     fn renderToasts(self: *Dashboard, wp: [2]f32, wsz: [2]f32) void {
         _ = self;
-        const t = ui.theme.default;
+        const t = ui.theme.active;
         const right = wp[0] + wsz[0] - 10;
         var bottom = wp[1] + wsz[1] - FOOTER_H - 10;
 
@@ -2298,7 +2351,7 @@ pub const Dashboard = struct {
                     .col = zgui.colorConvertFloat4ToU32(evSevColor(e.sev)),
                 });
                 var cb: [16]u8 = undefined;
-                zgui.textColored(t.text.mid, "{s}  {s}", .{ e.sourceSlice(), ui.fmt.clock(&cb, e.wall_ts) });
+                zgui.textColored(t.text.mid, "{s}  {s}", .{ e.sourceSlice(), ui.fmt.ts(&cb, e.wall_ts) });
 
                 var dismissed = false;
                 {
@@ -2330,7 +2383,7 @@ pub const Dashboard = struct {
     fn renderCritBanner(self: *Dashboard, wp: [2]f32, wsz: [2]f32) void {
         _ = self;
         if (ui.events.banner == null) return;
-        const t = ui.theme.default;
+        const t = ui.theme.active;
         const bsev = ui.events.banner_sev;
         const col = evSevColor(bsev);
         const dim = if (bsev == .crit) t.sev.crit_dim else t.sev.serious_dim;
@@ -2390,7 +2443,7 @@ pub const Dashboard = struct {
     }
 
     fn renderFooterContent(self: *Dashboard) void {
-        const t = ui.theme.default;
+        const t = ui.theme.active;
 
         // Sensor-fleet LEDs by kind: worst status wins per kind family.
         const led_defs = [_]struct { label: [:0]const u8, kinds: []const domain.SensorKind }{
@@ -2439,13 +2492,29 @@ pub const Dashboard = struct {
             zgui.textColored(t.text.mid, "{d:.0} eps", .{eps});
         }
 
-        // Right side: seed · workspace · clock.
+        // Data-refresh freeze indicator — amber, impossible to miss.
+        if (self.data_paused) {
+            zgui.sameLine(.{ .spacing = 16 });
+            zgui.textColored(t.amber, "{s} PAUSED \u{00B7} Ctrl+P", .{ui.fonts.fa.stop});
+            if (zgui.isItemHovered(.{})) {
+                if (zgui.beginTooltip()) {
+                    zgui.text("data refresh frozen \u{2014} no new events, no snapshot swaps; panel actions still write", .{});
+                    zgui.endTooltip();
+                }
+            }
+        }
+
+        // Right side: seed · workspace · clock (footer clock stays absolute
+        // even in relative timestamp mode — "0s ago" tells nobody the time).
         var right_buf: [96]u8 = undefined;
         var cb: [16]u8 = undefined;
-        const right_txt = std.fmt.bufPrintZ(&right_buf, "seed {d} \u{00B7} {s} \u{00B7} {s} UTC", .{
+        const local_mode = ui.fmt.time_style == .local;
+        const clock_now = if (local_mode) unixNow() + @as(i64, ui.fmt.local_offset_min) * 60 else unixNow();
+        const right_txt = std.fmt.bufPrintZ(&right_buf, "seed {d} \u{00B7} {s} \u{00B7} {s} {s}", .{
             self.seed,
             ui.layout.active.tag(),
-            ui.fmt.clock(&cb, unixNow()),
+            ui.fmt.clock(&cb, clock_now),
+            if (local_mode) "local" else "UTC",
         }) catch "";
         const w = zgui.calcTextSize(right_txt, .{})[0];
         const avail = zgui.getContentRegionAvail()[0];
@@ -2464,10 +2533,11 @@ pub const Dashboard = struct {
         var pbuf: [300]u8 = undefined;
         const path = self.uiStatePath(&pbuf) orelse return;
 
-        var jbuf: [1024]u8 = undefined;
+        var jbuf: [2048]u8 = undefined;
         // Fields are JSON-escape-free by construction (enum tags, ints,
         // filter strings that panels keep to plain ASCII).
-        const json = std.fmt.bufPrint(&jbuf, "{{\n  \"schema_version\": 1,\n  \"workspace\": \"{s}\",\n  \"seed\": {d},\n  \"alq_show_closed\": {},\n  \"evt_filter\": \"{s}\",\n  \"alq_filter\": \"{s}\",\n  \"rul_filter\": \"{s}\",\n  \"ioc_filter\": \"{s}\",\n  \"yar_filter\": \"{s}\",\n  \"pip_filter\": \"{s}\",\n  \"alq_sev\": {d},\n  \"log_sev\": {d},\n  \"ioc_types\": {d},\n  \"evt_kinds\": {d},\n  \"yar_fail_only\": {},\n  \"tun_threshold\": {d:.3}\n}}\n", .{
+        const p = &ui.prefs.current;
+        const json = std.fmt.bufPrint(&jbuf, "{{\n  \"schema_version\": 1,\n  \"workspace\": \"{s}\",\n  \"seed\": {d},\n  \"alq_show_closed\": {},\n  \"evt_filter\": \"{s}\",\n  \"alq_filter\": \"{s}\",\n  \"rul_filter\": \"{s}\",\n  \"ioc_filter\": \"{s}\",\n  \"yar_filter\": \"{s}\",\n  \"pip_filter\": \"{s}\",\n  \"alq_sev\": {d},\n  \"log_sev\": {d},\n  \"ioc_types\": {d},\n  \"evt_kinds\": {d},\n  \"yar_fail_only\": {},\n  \"tun_threshold\": {d:.3},\n  \"pref_theme\": \"{s}\",\n  \"pref_sev_palette\": \"{s}\",\n  \"pref_density\": \"{s}\",\n  \"pref_time_style\": \"{s}\",\n  \"pref_font_scale\": {d:.2},\n  \"pref_reduced_motion\": {},\n  \"pref_focus_ring\": {},\n  \"pref_toast_secs\": {d:.1},\n  \"pref_toast_min_sev\": {d},\n  \"pref_dnd\": {},\n  \"pref_startup_ws\": \"{s}\",\n  \"pref_ai_enabled\": {},\n  \"pref_sla_mtta_min\": {d:.1},\n  \"pref_sla_mttr_hours\": {d:.1}\n}}\n", .{
             @tagName(ui.layout.active),
             self.seed,
             self.alq_show_closed,
@@ -2483,6 +2553,20 @@ pub const Dashboard = struct {
             packBools(7, &self.evt_kind_show),
             self.yar_fail_only,
             self.tun_threshold,
+            @tagName(p.theme_variant),
+            @tagName(p.sev_palette),
+            @tagName(p.density),
+            @tagName(p.time_style),
+            p.font_scale,
+            p.reduced_motion,
+            p.focus_ring_always,
+            p.toast_secs,
+            p.toast_min_sev,
+            p.dnd,
+            @tagName(p.startup_ws),
+            p.ai_enabled,
+            p.sla_mtta_min,
+            p.sla_mttr_hours,
         }) catch return;
         ui.layout.atomicWrite(path, json) catch |err| {
             std.log.warn("ui_state: save failed: {s}", .{@errorName(err)});
@@ -2525,6 +2609,39 @@ pub const Dashboard = struct {
         unpackBools(7, v.evt_kinds, &self.evt_kind_show);
         self.yar_fail_only = v.yar_fail_only;
         self.tun_threshold = std.math.clamp(v.tun_threshold, 0.0, 1.0);
+
+        // Preferences: unknown enum strings keep the shipped default (a
+        // renamed variant must never brick the state file). NOTE: this only
+        // fills prefs.current — the GUI boot path calls ui.prefs.apply()
+        // after load (selftest runs headless, no zgui context to style).
+        const p = &ui.prefs.current;
+        if (std.meta.stringToEnum(ui.theme.Variant, v.pref_theme)) |x| p.theme_variant = x;
+        if (std.meta.stringToEnum(ui.prefs.SevPalette, v.pref_sev_palette)) |x| p.sev_palette = x;
+        if (std.meta.stringToEnum(ui.prefs.Density, v.pref_density)) |x| p.density = x;
+        if (std.meta.stringToEnum(ui.fmt.TimeStyle, v.pref_time_style)) |x| p.time_style = x;
+        if (std.meta.stringToEnum(ui.prefs.StartupWs, v.pref_startup_ws)) |x| p.startup_ws = x;
+        p.font_scale = v.pref_font_scale;
+        p.reduced_motion = v.pref_reduced_motion;
+        p.focus_ring_always = v.pref_focus_ring;
+        p.toast_secs = v.pref_toast_secs;
+        p.toast_min_sev = @intCast(@min(v.pref_toast_min_sev, 2));
+        p.dnd = v.pref_dnd;
+        p.ai_enabled = v.pref_ai_enabled;
+        p.sla_mtta_min = v.pref_sla_mtta_min;
+        p.sla_mttr_hours = v.pref_sla_mttr_hours;
+        p.clampAll();
+
+        // Startup workspace: a pinned choice overrides the remembered one.
+        switch (p.startup_ws) {
+            .last => {},
+            .triage => ui.layout.switchTo(.triage),
+            .hunt => ui.layout.switchTo(.hunt),
+            .detect => ui.layout.switchTo(.detect),
+            .intel => ui.layout.switchTo(.intel),
+            .ops => ui.layout.switchTo(.ops),
+        }
+        self.ui_state_last_ws = ui.layout.active;
+
         // Seed restore only when the current world was built with the
         // default: an explicit --seed wins.
         if (v.seed != self.seed and self.seed == 42) {
