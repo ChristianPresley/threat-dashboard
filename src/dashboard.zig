@@ -1071,6 +1071,10 @@ pub const Dashboard = struct {
         .{ .name = "14-ops", .ws = .ops, .kind = .still, .hold = 36, .cap_from = 34 },
         .{ .name = "15-ai-config", .ws = .ops, .kind = .still, .hold = 30, .cap_from = 28 },
         .{ .name = "16-ai-chat", .ws = .ops, .kind = .gif, .hold = 90, .cap_from = 2, .cap_stride = 5 },
+        .{ .name = "17-settings", .ws = .ops, .kind = .still, .hold = 30, .cap_from = 28 },
+        // Live re-theming: 4 × 28-frame segments (dark → midnight →
+        // high-contrast → dark+Okabe-Ito), 2 captures per segment.
+        .{ .name = "18-theme-tour", .ws = .triage, .kind = .gif, .hold = 112, .cap_from = 6, .cap_stride = 14 },
     };
 
     /// What main.zig should capture this frame (null = capture nothing).
@@ -1124,6 +1128,9 @@ pub const Dashboard = struct {
         self.evt_range = null;
         @memset(&self.cmd_buf, 0);
         self.palette_match_count = 0;
+        // The theme scene mutates prefs — every scene starts from defaults.
+        ui.prefs.current = .{};
+        ui.prefs.apply_pending = true;
     }
 
     /// One-time state setup when a scene begins.
@@ -1187,6 +1194,8 @@ pub const Dashboard = struct {
         } else if (std.mem.eql(u8, sc.name, "16-ai-chat")) {
             self.focusPanel(PANEL_AI);
             self.tourSeedChat();
+        } else if (std.mem.eql(u8, sc.name, "17-settings")) {
+            self.focusPanel(PANEL_SET);
         }
     }
 
@@ -1200,6 +1209,21 @@ pub const Dashboard = struct {
             const start = base - @divFloor(span * 40, 100);
             const grow = @as(i64, local) * @divFloor(span, 240);
             self.evt_range = .{ start, @min(base, start + grow) };
+        } else if (std.mem.eql(u8, sc.name, "18-theme-tour")) {
+            // 28-frame segments: dark → midnight → high-contrast →
+            // dark + Okabe-Ito. Only touch prefs at boundaries so the
+            // apply (next frame start) settles before each capture.
+            if (local % 28 == 0) {
+                const p = &ui.prefs.current;
+                p.* = .{};
+                switch (local / 28) {
+                    1 => p.theme_variant = .midnight,
+                    2 => p.theme_variant = .high_contrast,
+                    3 => p.sev_palette = .cvd,
+                    else => {},
+                }
+                ui.prefs.apply_pending = true;
+            }
         } else if (std.mem.eql(u8, sc.name, "13-pivot")) {
             // Hop along the pivot chain every ~24 frames.
             if (local > 0 and local % 24 == 0) {

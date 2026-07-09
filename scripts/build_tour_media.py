@@ -30,6 +30,8 @@ SCENES = {
     "14-ops":            ("still", None),
     "15-ai-config":      ("still", None),
     "16-ai-chat":        ("gif", 260),
+    "17-settings":       ("still", None),
+    "18-theme-tour":     ("gif", 700),
 }
 
 GIF_WIDTH = 1120   # downscale for a readable-but-compact GIF
