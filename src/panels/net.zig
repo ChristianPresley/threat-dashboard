@@ -12,7 +12,7 @@ const Dashboard = dash.Dashboard;
 const MAX_ROWS = 4096;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // ── Filter bar ───────────────────────────────────────────────────────
@@ -66,7 +66,7 @@ pub fn render(d: *Dashboard) void {
     // (460px) exceeded the HUNT slot outright, crushing trailing columns
     // into unreadable fragments.
     const cols = [_]ui.table.Col{
-        .{ .name = "Time", .w = 72 },
+        .{ .name = ui.fmt.tsColHeader(), .w = 72 },
         .{ .name = "Host", .w = 100 },
         .{ .name = "Process", .w = 110, .prio = 1 },
         .{ .name = "Dst", .w = 150 },
@@ -106,7 +106,7 @@ pub fn render(d: *Dashboard) void {
                 zgui.sameLine(.{});
                 zgui.setCursorPosX(cur);
                 var cb: [16]u8 = undefined;
-                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.clock(&cb, @divFloor(e.ts_ms, 1000))});
+                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.ts(&cb, @divFloor(e.ts_ms, 1000))});
                 _ = zgui.tableNextColumn();
                 zgui.textUnformattedColored(t.text.hi, s.hostName(e.host));
                 if (pl.on(2)) {

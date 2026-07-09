@@ -14,6 +14,7 @@ pub const table = @import("table.zig");
 pub const dbgate = @import("dbgate.zig");
 pub const flash = @import("flash.zig");
 pub const stale = @import("stale.zig");
+pub const prefs = @import("prefs.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

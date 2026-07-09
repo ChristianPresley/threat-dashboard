@@ -12,7 +12,7 @@ const Dashboard = dash.Dashboard;
 const MAX_ROWS = 8192;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // ── Filter bar ───────────────────────────────────────────────────────
@@ -102,14 +102,20 @@ pub fn render(d: *Dashboard) void {
     const detail_h: f32 = if (d.evt_sel != null) 96 else 0;
     const table_h = @max(80, avail[1] - detail_h);
 
-    const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };
-    if (zgui.beginTable("##evt_table", .{ .column = 6, .flags = flags, .outer_size = .{ avail[0], table_h } })) {
-        zgui.tableSetupColumn("Time", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 72 });
-        zgui.tableSetupColumn("Kind", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 52 });
-        zgui.tableSetupColumn("Host", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 100 });
-        zgui.tableSetupColumn("User", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 86 });
-        zgui.tableSetupColumn("Process", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 120 });
-        zgui.tableSetupColumn("Detail", .{ .flags = .{ .width_stretch = true } });
+    // Width plan: Process drops first (repeated in the detail pane), then
+    // User, then Host — Detail (cmdline) must keep readable width.
+    const cols = [_]ui.table.Col{
+        .{ .name = ui.fmt.tsColHeader(), .w = 72 },
+        .{ .name = "Kind", .w = 52 },
+        .{ .name = "Host", .w = 100, .prio = 1 },
+        .{ .name = "User", .w = 86, .prio = 2 },
+        .{ .name = "Process", .w = 120, .prio = 3 },
+        .{ .name = "Detail" },
+    };
+    const pl = ui.table.plan(&cols, avail[0], 160);
+    const flags = zgui.TableFlags{ .resizable = true, .no_saved_settings = true, .borders = .{ .inner_h = true }, .scroll_y = true };
+    if (zgui.beginTable("##evt_table", .{ .column = pl.count, .flags = flags, .outer_size = .{ avail[0], table_h } })) {
+        ui.table.setup(&cols, &pl);
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
@@ -140,16 +146,22 @@ pub fn render(d: *Dashboard) void {
                 zgui.sameLine(.{});
                 zgui.setCursorPosX(cur);
                 var cb: [16]u8 = undefined;
-                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.clock(&cb, @divFloor(e.ts_ms, 1000))});
+                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.ts(&cb, @divFloor(e.ts_ms, 1000))});
 
                 _ = zgui.tableNextColumn();
                 zgui.textColored(if (e.technique != null) dash.sevColor(e.severity) else t.text.mid, "{s}", .{e.kind.label()});
-                _ = zgui.tableNextColumn();
-                zgui.textUnformattedColored(t.text.hi, s.hostName(e.host));
-                _ = zgui.tableNextColumn();
-                zgui.textUnformattedColored(t.text.mid, s.userName(e.user));
-                _ = zgui.tableNextColumn();
-                zgui.textUnformattedColored(t.text.hi, e.process.slice());
+                if (pl.on(2)) {
+                    _ = zgui.tableNextColumn();
+                    zgui.textUnformattedColored(t.text.hi, s.hostName(e.host));
+                }
+                if (pl.on(3)) {
+                    _ = zgui.tableNextColumn();
+                    zgui.textUnformattedColored(t.text.mid, s.userName(e.user));
+                }
+                if (pl.on(4)) {
+                    _ = zgui.tableNextColumn();
+                    zgui.textUnformattedColored(t.text.hi, e.process.slice());
+                }
                 _ = zgui.tableNextColumn();
                 zgui.textUnformattedColored(t.text.mid, e.cmdline.slice());
             }

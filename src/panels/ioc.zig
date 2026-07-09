@@ -11,7 +11,7 @@ const Dashboard = dash.Dashboard;
 const MAX_ROWS = 2048;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     zgui.textColored(t.text.lo, "type:", .{});
@@ -58,15 +58,21 @@ pub fn render(d: *Dashboard) void {
     zgui.sameLine(.{ .spacing = 10 });
     zgui.textColored(t.text.lo, "{d} / {d} \u{00B7} click value to copy \u{00B7} select row \u{2192} ENR", .{ m, s.iocs.items.len });
 
-    const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };
-    if (zgui.beginTable("##ioc_table", .{ .column = 7, .flags = flags })) {
-        zgui.tableSetupColumn("Type", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 62 });
-        zgui.tableSetupColumn("Value", .{ .flags = .{ .width_stretch = true } });
-        zgui.tableSetupColumn("Conf", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 44 });
-        zgui.tableSetupColumn("Verdict", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 90 });
-        zgui.tableSetupColumn("Feed", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 165 });
-        zgui.tableSetupColumn("Last seen", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 76 });
-        zgui.tableSetupColumn("Hits", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 44 });
+    // Width plan: Feed drops first (fattest, least triage-relevant), then
+    // Last seen, then Conf — Value (the indicator itself) keeps width.
+    const cols = [_]ui.table.Col{
+        .{ .name = "Type", .w = 62 },
+        .{ .name = "Value" },
+        .{ .name = "Conf", .w = 44, .prio = 1 },
+        .{ .name = "Verdict", .w = 90 },
+        .{ .name = "Feed", .w = 165, .prio = 3 },
+        .{ .name = "Last seen", .w = 76, .prio = 2 },
+        .{ .name = "Hits", .w = 44 },
+    };
+    const pl = ui.table.plan(&cols, zgui.getContentRegionAvail()[0], 200);
+    const flags = zgui.TableFlags{ .resizable = true, .no_saved_settings = true, .borders = .{ .inner_h = true }, .scroll_y = true };
+    if (zgui.beginTable("##ioc_table", .{ .column = pl.count, .flags = flags })) {
+        ui.table.setup(&cols, &pl);
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
@@ -103,14 +109,24 @@ pub fn render(d: *Dashboard) void {
                 var vl: [140]u8 = undefined;
                 const vlbl = std.fmt.bufPrintZ(&vl, "{s}##iocv{d}", .{ ic.value.slice(), ic.id }) catch continue;
                 if (zgui.selectable(vlbl, .{})) {
-                    var copy_buf: [136:0]u8 = undefined;
-                    const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{ic.value.slice()}) catch "";
-                    zgui.setClipboardText(cz);
-                    ui.events.post(.ok, "intel", "IOC value copied to clipboard", .{});
+                    var copy_buf: [200:0]u8 = undefined;
+                    if (ui.prefs.current.defang_copy) {
+                        var df: [180]u8 = undefined;
+                        const safe = domain.defang(&df, ic.type, ic.value.slice());
+                        const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{safe}) catch "";
+                        zgui.setClipboardText(cz);
+                        ui.events.post(.ok, "intel", "IOC copied DEFANGED (raw copy: SET \u{2192} Time & tables)", .{});
+                    } else {
+                        const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{ic.value.slice()}) catch "";
+                        zgui.setClipboardText(cz);
+                        ui.events.post(.ok, "intel", "raw IOC value copied to clipboard", .{});
+                    }
                 }
-                _ = zgui.tableNextColumn();
-                const conf_col = if (ic.confidence >= 80) t.sev.ok else if (ic.confidence >= 50) t.sev.warn else t.text.lo;
-                zgui.textColored(conf_col, "{d}", .{ic.confidence});
+                if (pl.on(2)) {
+                    _ = zgui.tableNextColumn();
+                    const conf_col = if (ic.confidence >= 80) t.sev.ok else if (ic.confidence >= 50) t.sev.warn else t.text.lo;
+                    zgui.textColored(conf_col, "{d}", .{ic.confidence});
+                }
                 _ = zgui.tableNextColumn();
                 if (s.enrichmentForIoc(ic.id)) |en| {
                     switch (en.status) {
@@ -122,23 +138,27 @@ pub fn render(d: *Dashboard) void {
                 } else {
                     zgui.textColored(t.text.lo, "\u{00B7}", .{});
                 }
-                _ = zgui.tableNextColumn();
-                if (ic.feed < s.feeds.items.len) {
-                    zgui.textUnformattedColored(t.text.mid, s.feeds.items[ic.feed].name.slice());
+                if (pl.on(4)) {
+                    _ = zgui.tableNextColumn();
+                    if (ic.feed < s.feeds.items.len) {
+                        zgui.textUnformattedColored(t.text.mid, s.feeds.items[ic.feed].name.slice());
+                    }
                 }
-                _ = zgui.tableNextColumn();
-                var ab: [16]u8 = undefined;
-                const age_s = @divFloor(dash.unixNowMs() - ic.last_seen_ms, 1000);
-                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.age(&ab, age_s)});
-                if (zgui.isItemHovered(.{})) {
-                    if (zgui.beginTooltip()) {
-                        var fb: [20]u8 = undefined;
-                        var lb2: [20]u8 = undefined;
-                        zgui.textColored(t.text.mid, "first seen {s} \u{00B7} last seen {s}", .{
-                            ui.fmt.dateTime(&fb, @divFloor(ic.first_seen_ms, 1000)),
-                            ui.fmt.dateTime(&lb2, @divFloor(ic.last_seen_ms, 1000)),
-                        });
-                        zgui.endTooltip();
+                if (pl.on(5)) {
+                    _ = zgui.tableNextColumn();
+                    var ab: [16]u8 = undefined;
+                    const age_s = @divFloor(dash.unixNowMs() - ic.last_seen_ms, 1000);
+                    zgui.textColored(t.text.lo, "{s}", .{ui.fmt.age(&ab, age_s)});
+                    if (zgui.isItemHovered(.{})) {
+                        if (zgui.beginTooltip()) {
+                            var fb: [20]u8 = undefined;
+                            var lb2: [20]u8 = undefined;
+                            zgui.textColored(t.text.mid, "first seen {s} \u{00B7} last seen {s}", .{
+                                ui.fmt.tsDate(&fb, @divFloor(ic.first_seen_ms, 1000)),
+                                ui.fmt.tsDate(&lb2, @divFloor(ic.last_seen_ms, 1000)),
+                            });
+                            zgui.endTooltip();
+                        }
                     }
                 }
                 _ = zgui.tableNextColumn();

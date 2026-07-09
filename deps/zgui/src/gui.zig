@@ -846,6 +846,10 @@ extern fn zguiSetKeyboardFocusHere(offset: c_int) void;
 
 extern fn zguiSetNavCursorVisible(visible: bool) void;
 pub const setNavCursorVisible = zguiSetNavCursorVisible;
+extern fn zguiSetConfigNavCursorVisibleAlways(always: bool) void;
+/// io.ConfigNavCursorVisibleAlways -- keep the keyboard-nav focus ring
+/// visible even after mouse use (WCAG 2.4.7 focus visible).
+pub const setConfigNavCursorVisibleAlways = zguiSetConfigNavCursorVisibleAlways;
 
 extern fn zguiSetNextItemAllowOverlap() void;
 pub const setNextItemAllowOverlap = zguiSetNextItemAllowOverlap;

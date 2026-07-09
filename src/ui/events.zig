@@ -129,6 +129,18 @@ pub fn clear() void {
 
 pub const TOAST_CAP = 3;
 
+// Notification prefs (SET · WCAG 2.2.1 adjustable timing). Every event
+// still lands in the ring/LOG regardless — these only gate the popups.
+pub var toast_ttl_info_ms: i64 = 4_000;
+/// Warnings linger 2x the base TTL — the invariant lives here, not in
+/// whoever sets the base.
+pub const WARN_TTL_FACTOR: i64 = 2;
+/// Events below this severity never toast (they still log).
+pub var toast_min_sev: Severity = .ok;
+/// Do-not-disturb: no toasts at all. serious/crit still escalate to the
+/// banner — safety messaging is exempt from DND by design.
+pub var dnd: bool = false;
+
 pub const Toast = struct {
     seq: u64,
     expires_ms: i64,
@@ -158,7 +170,9 @@ pub fn bannerMsg() []const u8 {
 fn onPost(e: *const Event) void {
     switch (e.sev) {
         .ok, .info, .warn => {
-            const ttl_ms: i64 = if (e.sev == .warn) 8_000 else 4_000;
+            if (dnd) return;
+            if (@intFromEnum(e.sev) < @intFromEnum(toast_min_sev)) return;
+            const ttl_ms: i64 = if (e.sev == .warn) toast_ttl_info_ms * WARN_TTL_FACTOR else toast_ttl_info_ms;
             const t = Toast{ .seq = e.seq, .expires_ms = e.ts_ms + ttl_ms };
             // Fill a free slot, else displace the oldest unpinned.
             var oldest: ?usize = null;
@@ -243,6 +257,33 @@ test "ring ordering, latestFrom, toast + banner routing" {
 
     ackBanner();
     try std.testing.expect(banner == null);
+}
+
+test "toast prefs: DND and min-severity floor gate popups, not the ring" {
+    clear();
+    dnd = true;
+    post(.info, "x", "silent", .{});
+    try std.testing.expectEqual(@as(usize, 1), len());
+    for (toasts) |t| try std.testing.expect(t == null);
+    dnd = false;
+
+    toast_min_sev = .warn;
+    post(.info, "x", "below floor", .{});
+    for (toasts) |t| try std.testing.expect(t == null);
+    post(.warn, "x", "at floor", .{});
+    var n: usize = 0;
+    for (toasts) |t| {
+        if (t != null) n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), n);
+    toast_min_sev = .ok;
+
+    // crit escalation ignores DND (banner is safety messaging).
+    dnd = true;
+    post(.crit, "x", "always banners", .{});
+    try std.testing.expect(banner != null);
+    dnd = false;
+    ackBanner();
 }
 
 test "ring wraps without corruption" {

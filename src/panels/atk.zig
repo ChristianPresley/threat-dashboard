@@ -11,7 +11,7 @@ const dash = @import("../dashboard.zig");
 const Dashboard = dash.Dashboard;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // Legend.
@@ -75,7 +75,7 @@ fn nthTechniqueOfTactic(tac: attack.Tactic, n: usize) ?attack.TechniqueId {
 }
 
 fn drawCell(d: *Dashboard, s: *@import("data").Store, tid: attack.TechniqueId) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const tech = attack.get(tid);
     const cov = s.coverageForTechnique(tid);
     const heat = s.alertHeatForTechnique(tid);

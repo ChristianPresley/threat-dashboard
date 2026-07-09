@@ -13,7 +13,7 @@ const Dashboard = dash.Dashboard;
 const MAX_ROWS = 4096;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // ── Filter bar ───────────────────────────────────────────────────────
@@ -115,20 +115,27 @@ pub fn render(d: *Dashboard) void {
     } else 0;
     const table_h = @max(80, avail[1] - detail_h);
 
+    // Width plan: Rule drops first (code repeats in the detail pane), then
+    // Entity, then Status — Title must keep readable width in narrow docks.
+    const cols = [_]ui.table.Col{
+        .{ .name = ui.fmt.tsColHeader(), .w = 72 },
+        .{ .name = "Sev", .w = 48 },
+        .{ .name = "Status", .w = 70, .prio = 1 },
+        .{ .name = "Title" },
+        .{ .name = "Entity", .w = 170, .prio = 2 },
+        .{ .name = "Rule", .w = 62, .prio = 3 },
+        .{ .name = "Case", .w = 48 },
+    };
+    const pl = ui.table.plan(&cols, avail[0], 180);
     const flags = zgui.TableFlags{
         .resizable = true,
+        .no_saved_settings = true,
         .borders = .{ .inner_h = true },
         .scroll_y = true,
         .row_bg = false,
     };
-    if (zgui.beginTable("##alq_table", .{ .column = 7, .flags = flags, .outer_size = .{ avail[0], table_h } })) {
-        zgui.tableSetupColumn("Time", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 72 });
-        zgui.tableSetupColumn("Sev", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 48 });
-        zgui.tableSetupColumn("Status", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 70 });
-        zgui.tableSetupColumn("Title", .{ .flags = .{ .width_stretch = true } });
-        zgui.tableSetupColumn("Entity", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 170 });
-        zgui.tableSetupColumn("Rule", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 62 });
-        zgui.tableSetupColumn("Case", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 48 });
+    if (zgui.beginTable("##alq_table", .{ .column = pl.count, .flags = flags, .outer_size = .{ avail[0], table_h } })) {
+        ui.table.setup(&cols, &pl);
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
@@ -160,28 +167,34 @@ pub fn render(d: *Dashboard) void {
                 }
                 zgui.sameLine(.{});
                 zgui.setCursorPosX(cur);
-                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.clock(&cb, @divFloor(a.ts_ms, 1000))});
+                zgui.textColored(t.text.lo, "{s}", .{ui.fmt.ts(&cb, @divFloor(a.ts_ms, 1000))});
 
                 _ = zgui.tableNextColumn();
                 zgui.textColored(dash.sevColor(a.severity), "{s}", .{a.severity.label()});
-                _ = zgui.tableNextColumn();
-                zgui.textColored(if (a.status == .new) t.accent else text_col, "{s}", .{a.status.label()});
+                if (pl.on(2)) {
+                    _ = zgui.tableNextColumn();
+                    zgui.textColored(if (a.status == .new) t.accent else text_col, "{s}", .{a.status.label()});
+                }
                 _ = zgui.tableNextColumn();
                 zgui.textUnformattedColored(text_col, a.title.slice());
-                _ = zgui.tableNextColumn();
-                zgui.textUnformattedColored(text_col, a.entity.slice());
-                _ = zgui.tableNextColumn();
-                if (a.rule < s.rules.items.len) {
-                    // Click through to the rule in RUL.
-                    const r = &s.rules.items[a.rule];
-                    var rb: [32]u8 = undefined;
-                    const rl = std.fmt.bufPrintZ(&rb, "{s}##alqrule{d}", .{ r.code.slice(), a.id }) catch @as([:0]const u8, "rule");
-                    zgui.pushStyleColor4f(.{ .idx = .text, .c = t.text.mid });
-                    if (zgui.selectable(rl, .{})) {
-                        d.rul_sel = r.id;
-                        d.focusPanel(dash.PANEL_RUL);
+                if (pl.on(4)) {
+                    _ = zgui.tableNextColumn();
+                    zgui.textUnformattedColored(text_col, a.entity.slice());
+                }
+                if (pl.on(5)) {
+                    _ = zgui.tableNextColumn();
+                    if (a.rule < s.rules.items.len) {
+                        // Click through to the rule in RUL.
+                        const r = &s.rules.items[a.rule];
+                        var rb: [32]u8 = undefined;
+                        const rl = std.fmt.bufPrintZ(&rb, "{s}##alqrule{d}", .{ r.code.slice(), a.id }) catch @as([:0]const u8, "rule");
+                        zgui.pushStyleColor4f(.{ .idx = .text, .c = t.text.mid });
+                        if (zgui.selectable(rl, .{})) {
+                            d.rul_sel = r.id;
+                            d.focusPanel(dash.PANEL_RUL);
+                        }
+                        zgui.popStyleColor(.{ .count = 1 });
                     }
-                    zgui.popStyleColor(.{ .count = 1 });
                 }
                 _ = zgui.tableNextColumn();
                 if (a.case_id) |cid| {

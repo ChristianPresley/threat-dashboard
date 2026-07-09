@@ -10,7 +10,7 @@ const dash = @import("../dashboard.zig");
 const Dashboard = dash.Dashboard;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // Chain roots: technique-tagged events with no parent.
@@ -79,7 +79,7 @@ fn inChain(s: *@import("data").Store, e: *const domain.Event, root: u64) bool {
 }
 
 fn drawNode(d: *Dashboard, id: u64, depth: usize) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
     const e = s.eventById(id) orelse return;
     if (depth > 24) return;
@@ -106,7 +106,7 @@ fn drawNode(d: *Dashboard, id: u64, depth: usize) void {
     zgui.sameLine(.{ .spacing = 10 });
     var cb: [16]u8 = undefined;
     var ckb: [40]u8 = undefined;
-    const clock_lbl = std.fmt.bufPrintZ(&ckb, "{s}##prcevt{d}", .{ ui.fmt.clock(&cb, @divFloor(e.ts_ms, 1000)), id }) catch "t";
+    const clock_lbl = std.fmt.bufPrintZ(&ckb, "{s}##prcevt{d}", .{ ui.fmt.ts(&cb, @divFloor(e.ts_ms, 1000)), id }) catch "t";
     zgui.pushStyleColor4f(.{ .idx = .text, .c = t.text.lo });
     // Reverse of EVT's "open in PRC": the timestamp clicks through to EVT.
     if (zgui.selectable(clock_lbl, .{ .w = 44 })) {

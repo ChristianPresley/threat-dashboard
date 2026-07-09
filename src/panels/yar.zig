@@ -14,7 +14,7 @@ var deprecate_dwell: ui.confirm.Dwell = .{};
 var deprecate_pending: ?u16 = null;
 
 fn statusColor(st: domain.YaraStatus) [4]f32 {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     return switch (st) {
         .active => t.sev.ok,
         .draft => t.sev.warn,
@@ -35,7 +35,7 @@ fn gateGlyph(letter: [:0]const u8, pass: bool, tip: []const u8) void {
 }
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // ── Header strip: grades · severity · gate pass rate · slowest ───────
@@ -199,7 +199,7 @@ pub fn render(d: *Dashboard) void {
     var db: [16]u8 = undefined;
     zgui.textColored(t.text.mid, "author {s} \u{00B7} {s} \u{00B7} v{d} \u{00B7} {s} {s}", .{
         if (y.author.len > 0) y.author.slice() else "\u{2014}",
-        ui.fmt.dateTime(&db, @divFloor(y.date_ms, 1000)),
+        ui.fmt.tsDate(&db, @divFloor(y.date_ms, 1000)),
         y.version,
         tech.id,
         tech.name,

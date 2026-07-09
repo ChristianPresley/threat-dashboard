@@ -22,7 +22,7 @@ var head: usize = 0;
 var accum_s: f32 = 0;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // Sample ~4 Hz.

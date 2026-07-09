@@ -89,6 +89,11 @@ extern "C"
         ImGui::SetNavCursorVisible(visible);
     }
 
+    ZGUI_API void zguiSetConfigNavCursorVisibleAlways(bool always)
+    {
+        ImGui::GetIO().ConfigNavCursorVisibleAlways = always;
+    }
+
     ZGUI_API void zguiSetNextItemAllowOverlap() 
     {
         ImGui::SetNextItemAllowOverlap();

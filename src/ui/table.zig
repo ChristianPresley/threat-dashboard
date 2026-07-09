@@ -43,17 +43,21 @@ pub const Plan = struct {
 /// column even when the minimum can't be met.
 pub fn plan(cols: []const Col, avail_w: f32, min_stretch_w: f32) Plan {
     var p = Plan{ .count = @intCast(cols.len) };
-    const cell_pad = 2 * zgui.getStyle().cell_padding[0];
+    const style = zgui.getStyle();
+    const cell_pad = 2 * style.cell_padding[0];
+    // Column widths are char-derived px at 100% — scale with the font so
+    // a 150% analyst does not get clipped headers in every fixed column.
+    const fs = if (style.font_scale_main > 0) style.font_scale_main else 1;
     const scrollbar: f32 = 14;
     while (true) {
         var fixed: f32 = scrollbar;
         var has_stretch = false;
         for (cols, 0..) |c, i| {
             if (!p.vis[i]) continue;
-            fixed += cell_pad + c.w;
+            fixed += cell_pad + c.w * fs;
             if (c.w == 0) has_stretch = true;
         }
-        const need: f32 = if (has_stretch) min_stretch_w else 0;
+        const need: f32 = if (has_stretch) min_stretch_w * fs else 0;
         if (avail_w - fixed >= need) return p;
         var pick: ?usize = null;
         for (cols, 0..) |c, i| {
@@ -66,12 +70,15 @@ pub fn plan(cols: []const Col, avail_w: f32, min_stretch_w: f32) Plan {
     }
 }
 
-/// Emit tableSetupColumn for every visible column.
+/// Emit tableSetupColumn for every visible column (widths follow the
+/// font scale — see plan()).
 pub fn setup(cols: []const Col, p: *const Plan) void {
+    const fs_raw = zgui.getStyle().font_scale_main;
+    const fs = if (fs_raw > 0) fs_raw else 1;
     for (cols, 0..) |c, i| {
         if (!p.vis[i]) continue;
         if (c.w > 0) {
-            zgui.tableSetupColumn(c.name, .{ .flags = .{ .width_fixed = true }, .init_width_or_height = c.w });
+            zgui.tableSetupColumn(c.name, .{ .flags = .{ .width_fixed = true }, .init_width_or_height = c.w * fs });
         } else {
             zgui.tableSetupColumn(c.name, .{ .flags = .{ .width_stretch = true }, .init_width_or_height = c.weight });
         }

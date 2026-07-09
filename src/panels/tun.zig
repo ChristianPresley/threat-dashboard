@@ -12,7 +12,7 @@ var apply_dwell: ui.confirm.Dwell = .{};
 var apply_armed: bool = false;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // Rank rules by FP volume.
@@ -90,8 +90,8 @@ pub fn render(d: *Dashboard) void {
     const cols = [_]ui.table.Col{
         .{ .name = "Code", .w = 60 },
         .{ .name = "Name" },
-        .{ .name = "Fires", .w = 74 },
-        .{ .name = "FP rate", .w = 74 },
+        .{ .name = "Fires", .w = 64 },
+        .{ .name = "FP rate", .w = 64 },
         .{ .name = "Verdict", .w = 78, .prio = 1 },
     };
     const pl = ui.table.plan(&cols, zgui.getContentRegionAvail()[0], 140);

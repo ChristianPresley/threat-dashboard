@@ -15,7 +15,7 @@ var brush_a: f64 = 0; // unix seconds
 var brush_b: f64 = 0;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     const now_ms = dash.unixNowMs();

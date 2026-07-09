@@ -10,7 +10,7 @@ const dash = @import("../dashboard.zig");
 const Dashboard = dash.Dashboard;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
 
     zgui.textColored(t.text.lo, "{d} action(s) recorded \u{00B7} cap {d}", .{ d.audit.items.len, Dashboard.AUDIT_CAP });
     zgui.sameLine(.{ .spacing = 10 });
@@ -24,7 +24,7 @@ pub fn render(d: *Dashboard) void {
 
     const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };
     if (zgui.beginTable("##aud_table", .{ .column = 4, .flags = flags })) {
-        zgui.tableSetupColumn("Time", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 70 });
+        zgui.tableSetupColumn(ui.fmt.tsColHeader(), .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 70 });
         zgui.tableSetupColumn("Actor", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 76 });
         zgui.tableSetupColumn("Action", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 130 });
         zgui.tableSetupColumn("Target", .{ .flags = .{ .width_stretch = true } });
@@ -41,7 +41,7 @@ pub fn render(d: *Dashboard) void {
             zgui.tableNextRow(.{});
             _ = zgui.tableNextColumn();
             var cb: [16]u8 = undefined;
-            zgui.textColored(t.text.lo, "{s}", .{ui.fmt.clock(&cb, @divFloor(e.ts_ms, 1000))});
+            zgui.textColored(t.text.lo, "{s}", .{ui.fmt.ts(&cb, @divFloor(e.ts_ms, 1000))});
             _ = zgui.tableNextColumn();
             const is_system = std.mem.eql(u8, e.actor.slice(), "system");
             zgui.textUnformattedColored(if (is_system) t.text.lo else t.accent, e.actor.slice());

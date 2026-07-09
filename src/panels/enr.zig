@@ -34,15 +34,23 @@ fn submitScan(d: *Dashboard, ioc_id: u32) void {
     ui.events.post(.info, "urlscan", "submission #{d} queued (unlisted)", .{scan_id});
 }
 
-fn defangCopy(value: []const u8) void {
-    var copy_buf: [136:0]u8 = undefined;
-    const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{value}) catch "";
-    zgui.setClipboardText(cz);
-    ui.events.post(.ok, "intel", "raw IOC value copied to clipboard", .{});
+fn copyIocValue(ty: domain.IocType, value: []const u8) void {
+    var copy_buf: [200:0]u8 = undefined;
+    if (ui.prefs.current.defang_copy) {
+        var df: [180]u8 = undefined;
+        const safe = domain.defang(&df, ty, value);
+        const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{safe}) catch "";
+        zgui.setClipboardText(cz);
+        ui.events.post(.ok, "intel", "IOC copied DEFANGED (raw copy: SET \u{2192} Time & tables)", .{});
+    } else {
+        const cz = std.fmt.bufPrintZ(&copy_buf, "{s}", .{value}) catch "";
+        zgui.setClipboardText(cz);
+        ui.events.post(.ok, "intel", "raw IOC value copied to clipboard", .{});
+    }
 }
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // ── Header: selected IOC (defanged) + breadcrumb back ────────────────
@@ -75,10 +83,14 @@ pub fn render(d: *Dashboard) void {
     const shown = domain.defang(&fbuf, ic.type, ic.value.slice());
     var vlbl: [220]u8 = undefined;
     const vz = std.fmt.bufPrintZ(&vlbl, "{s}##enrval", .{shown}) catch "##enrval";
-    if (zgui.smallButton(vz)) defangCopy(ic.value.slice());
+    if (zgui.smallButton(vz)) copyIocValue(ic.type, ic.value.slice());
     if (zgui.isItemHovered(.{})) {
         if (zgui.beginTooltip()) {
-            zgui.textColored(t.text.lo, "click to copy the raw (refanged) value", .{});
+            const copy_hint: [:0]const u8 = if (ui.prefs.current.defang_copy)
+                "click to copy (defanged \u{2014} raw copy toggles in SET)"
+            else
+                "click to copy the raw (refanged) value";
+            zgui.textUnformattedColored(t.text.lo, copy_hint);
             zgui.endTooltip();
         }
     }
@@ -155,8 +167,8 @@ pub fn render(d: *Dashboard) void {
         var b1: [20]u8 = undefined;
         var b2: [20]u8 = undefined;
         zgui.textColored(t.text.lo, "first seen {s} \u{00B7} last seen {s} \u{00B7} src {s}", .{
-            ui.fmt.dateTime(&b1, @divFloor(e.first_seen_ms, 1000)),
-            ui.fmt.dateTime(&b2, @divFloor(e.last_seen_ms, 1000)),
+            ui.fmt.tsDate(&b1, @divFloor(e.first_seen_ms, 1000)),
+            ui.fmt.tsDate(&b2, @divFloor(e.last_seen_ms, 1000)),
             e.source.label(),
         });
     }
@@ -170,7 +182,7 @@ pub fn render(d: *Dashboard) void {
                 const age_days = @divFloor(dash.unixNowMs() - e.creation_ms, std.time.ms_per_day);
                 zgui.sameLine(.{ .spacing = 12 });
                 var cb: [20]u8 = undefined;
-                zgui.textColored(t.text.lo, "created {s}", .{ui.fmt.dateTime(&cb, @divFloor(e.creation_ms, 1000))});
+                zgui.textColored(t.text.lo, "created {s}", .{ui.fmt.tsDate(&cb, @divFloor(e.creation_ms, 1000))});
                 if (age_days < 30) {
                     zgui.sameLine(.{ .spacing = 6 });
                     zgui.textColored(t.sev.warn, "[NRD \u{00B7} {d}d old]", .{age_days});

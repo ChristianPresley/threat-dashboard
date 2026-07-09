@@ -8,8 +8,33 @@ const domain = @import("domain");
 const dash = @import("../dashboard.zig");
 const Dashboard = dash.Dashboard;
 
+/// One SLA stat: "MTTA 14m" colored ok/amber/red against a target, with
+/// the target itself in the tooltip so the color is explainable.
+fn slaTile(label: [:0]const u8, mean_ms: ?i64, target_secs: f64, buf: *[16]u8) void {
+    const t = ui.theme.active;
+    if (mean_ms) |ms| {
+        const secs: f64 = @floatFromInt(@divFloor(ms, 1000));
+        const col = if (secs <= target_secs)
+            t.sev.ok
+        else if (secs <= target_secs * 2.0)
+            t.sev.warn
+        else
+            t.sev.crit;
+        zgui.textColored(col, "{s} {s}", .{ label, ui.fmt.age(buf, @divFloor(ms, 1000)) });
+        if (zgui.isItemHovered(.{})) {
+            if (zgui.beginTooltip()) {
+                var tb: [16]u8 = undefined;
+                zgui.text("target {s} (set in SET \u{2192} Triage SLA) \u{00B7} ok \u{2264} target \u{00B7} amber \u{2264} 2\u{00D7} \u{00B7} red beyond", .{ui.fmt.age(&tb, @intFromFloat(target_secs))});
+                zgui.endTooltip();
+            }
+        }
+    } else {
+        zgui.textColored(t.text.lo, "{s} \u{2014}", .{label});
+    }
+}
+
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     const by_sev = s.openAlertCountBySeverity();
@@ -47,7 +72,9 @@ pub fn render(d: *Dashboard) void {
         zgui.textColored(if (n > 0) dash.sevColor(sv) else t.text.lo, "{s} {d}", .{ sv.label(), n });
     }
 
-    // Triage SLA: real MTTA/MTTR from the alert ack/resolve stamps.
+    // Triage SLA: real MTTA/MTTR from the alert ack/resolve stamps,
+    // threshold-colored against the SET targets (ok ≤ target, amber ≤ 2×,
+    // red beyond — threshold stat tiles beat gauges).
     {
         var triaged: u32 = 0;
         for (s.alerts.items) |*a| {
@@ -56,19 +83,46 @@ pub fn render(d: *Dashboard) void {
         const means = s.triageMeans();
         zgui.sameLine(.{ .spacing = 22 });
         var mb: [16]u8 = undefined;
-        if (means.mtta_ms) |ms| {
-            zgui.textColored(t.text.mid, "MTTA {s}", .{ui.fmt.age(&mb, @divFloor(ms, 1000))});
-        } else {
-            zgui.textColored(t.text.lo, "MTTA \u{2014}", .{});
-        }
+        slaTile("MTTA", means.mtta_ms, ui.prefs.current.sla_mtta_min * 60.0, &mb);
         zgui.sameLine(.{ .spacing = 10 });
-        if (means.mttr_ms) |ms| {
-            zgui.textColored(t.text.mid, "MTTR {s}", .{ui.fmt.age(&mb, @divFloor(ms, 1000))});
-        } else {
-            zgui.textColored(t.text.lo, "MTTR \u{2014}", .{});
-        }
+        slaTile("MTTR", means.mttr_ms, ui.prefs.current.sla_mttr_hours * 3600.0, &mb);
         zgui.sameLine(.{ .spacing = 10 });
         zgui.textColored(t.text.mid, "triaged {d}", .{triaged});
+    }
+
+    // ── Open-alert severity mix: one stacked bar (glanceable proportions;
+    // the chips above carry the exact counts) ────────────────────────────
+    if (open_total > 0) {
+        zgui.spacing();
+        const dl = zgui.getWindowDrawList();
+        const pos = zgui.getCursorScreenPos();
+        const w = zgui.getContentRegionAvail()[0];
+        const bar_h: f32 = 6;
+        var x = pos[0];
+        inline for (order) |sv| {
+            const n = by_sev[@intFromEnum(sv)];
+            if (n > 0) {
+                const frac = @as(f32, @floatFromInt(n)) / @as(f32, @floatFromInt(open_total));
+                // Any nonzero count paints ≥2px — one critical alert in a
+                // sea of low must never vanish from this bar — and the
+                // 1px gap only applies when the segment can afford it.
+                const seg = @max(w * frac, 2);
+                const gap: f32 = if (seg > 3) 1 else 0;
+                dl.addRectFilled(.{
+                    .pmin = .{ x, pos[1] },
+                    .pmax = .{ @min(x + seg - gap, pos[0] + w), pos[1] + bar_h },
+                    .col = zgui.colorConvertFloat4ToU32(dash.sevColor(sv)),
+                });
+                x += seg;
+            }
+        }
+        zgui.dummy(.{ .w = w, .h = bar_h + 2 });
+        if (zgui.isItemHovered(.{})) {
+            if (zgui.beginTooltip()) {
+                zgui.text("open-alert severity mix \u{2014} exact counts in the chips above", .{});
+                zgui.endTooltip();
+            }
+        }
     }
 
     zgui.spacing();

@@ -153,6 +153,100 @@ pub const default: Tokens = .{};
 /// Runtime token set — panels read through this.
 pub var active: Tokens = default;
 
+// ── Variants + alternate palettes (prefs.apply() composes these) ─────────
+
+/// Surface family. `dark` is the shipped baseline; `midnight` drops every
+/// background a step for dim SOC floors; `high_contrast` raises text and
+/// border luminance.
+pub const Variant = enum(u8) {
+    dark,
+    midnight,
+    high_contrast,
+
+    pub fn label(self: Variant) [:0]const u8 {
+        return switch (self) {
+            .dark => "Dark (default)",
+            .midnight => "Midnight",
+            .high_contrast => "High contrast",
+        };
+    }
+};
+
+/// Surface/text token set per theme variant. `dark` is `default`.
+/// `midnight` steps every background down for dim ops floors (text tokens
+/// unchanged — contrast only improves on darker surfaces). `high_contrast`
+/// raises text ≥7:1 (AAA) and borders ≥4.5:1 on every bg step.
+pub fn tokensFor(variant: Variant) Tokens {
+    return switch (variant) {
+        .midnight => blk: {
+            var t: Tokens = .{};
+            t.bg = .{
+                .sunken = hex(0x050608),
+                .base = hex(0x090B0E),
+                .panel = hex(0x10141B),
+                .elev = hex(0x1A212C),
+                .hover = hex(0x2C3949),
+                .selected = hex(0x1A3557),
+            };
+            t.stripe_alt = hex(0x12161D);
+            break :blk t;
+        },
+        .high_contrast => blk: {
+            var t: Tokens = .{};
+            t.text = .{
+                .hi = hex(0xFFFFFF),
+                .mid = hex(0xC9D3DE),
+                .lo = hex(0x9AA6B2),
+                .inverse = hex(0x0A0C10),
+            };
+            t.border = .{
+                .subtle = hex(0x6B7689),
+                .strong = hex(0x9AA6BA),
+            };
+            t.accent = hex(0x6CB0FF);
+            break :blk t;
+        },
+        .dark => default,
+    };
+}
+
+/// Recompute the five *_dim banner/fill tones against a surface. Variants
+/// change bg.panel — dims blended for the wrong surface read as a glow.
+pub fn deriveDims(sev: Severity, panel_bg: Rgba) Severity {
+    var s = sev;
+    s.ok_dim = mix(panel_bg, s.ok, 0.16);
+    s.info_dim = mix(panel_bg, s.info, 0.16);
+    s.warn_dim = mix(panel_bg, s.warn, 0.16);
+    s.serious_dim = mix(panel_bg, s.serious, 0.16);
+    s.crit_dim = mix(panel_bg, s.crit, 0.16);
+    return s;
+}
+
+/// Okabe-Ito severity ramp (CVD-safe): lightness rises monotonically
+/// crit→warn and hue survives all three dichromacies. Dim (banner) fills
+/// are derived at ~16% over the panel surface so variants stay coherent.
+pub fn sevCvd(panel_bg: Rgba) Severity {
+    return deriveDims(.{
+        .ok = hex(0x009E73), // bluish green
+        .info = hex(0x56B4E9), // sky blue
+        .warn = hex(0xF0E442), // yellow
+        .serious = hex(0xE69F00), // orange
+        .crit = hex(0xD55E00), // vermillion
+        .off = hex(0x6E7681),
+    }, panel_bg);
+}
+
+/// Score bands matching the CVD severity ramp (A best → F worst).
+pub fn scoreCvd() Score {
+    return .{
+        .a = hex(0x009E73),
+        .b = hex(0x56B4E9),
+        .c = hex(0xF0E442),
+        .d = hex(0xE69F00),
+        .f = hex(0xD55E00),
+    };
+}
+
 /// Apply the full ImGui style: every color from tokens + metrics.
 pub fn apply() void {
     const t = &active;

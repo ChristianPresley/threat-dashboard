@@ -126,6 +126,40 @@ directory with the full keyboard map. Panels drag/dock/tab freely
 (ImGui docking); `RESET` rebuilds the active workspace's preset;
 `Ctrl+S` snapshots layout + UI state.
 
+## Settings & accessibility
+
+`Ctrl+,` (or `SET`) opens a deep, live-applying settings surface — every
+change takes effect the frame it happens and persists to
+`ui_state.json`:
+
+- **Appearance** — theme variant (dark / midnight for dim SOC floors /
+  high-contrast AAA), severity palette (standard or colorblind-safe
+  Okabe-Ito, applied everywhere severity renders), font scale up to
+  200 % (WCAG 1.4.4), and density (compact / cozy / comfortable — the
+  latter reaches ≥24 px hit targets, WCAG 2.5.8).
+- **Time & tables** — timestamps in UTC (SOC convention), local time, or
+  relative ("4m"); time columns carry their frame of reference and CSV
+  exports stay UTC regardless. IOC values copy **defanged** by default
+  (`hxxps://x[.]y`) so a ticket paste can never be a live link.
+- **Notifications** — toast duration (WCAG 2.2.1), a minimum-severity
+  toast floor, and do-not-disturb (alert-fatigue controls; serious/crit
+  still escalate to the banner, and everything is retained in LOG).
+- **Motion & accessibility** — reduced motion (disables value/insert
+  flashes, WCAG 2.3.3) and an always-visible keyboard focus ring
+  (WCAG 2.4.7). Severity is never color-only: every chip prints its
+  label.
+- **Triage SLA** — MTTA/MTTR targets that drive the threshold-colored
+  tiles in PST (ok ≤ target, amber ≤ 2×, red beyond).
+- **Data & world** — `Ctrl+P` pauses all data refresh (mock trickle,
+  scheduler, and PG snapshot swaps) so rows don't move under the cursor
+  during evidence capture; panel actions still write.
+- **AI assistant** — a hard off-switch: new requests are blocked and
+  any in-flight run is canceled the moment it's disabled.
+
+Known limitation, stated honestly: ImGui exposes no OS accessibility
+tree, so screen readers cannot see the UI; LOG's `Ctrl+E` CSV export is
+the plain-text escape hatch.
+
 ## Data
 
 v1 ships a **deterministic mock world** (diurnal telemetry + scripted
@@ -162,4 +196,4 @@ with backoff and reloads database truth.
 ImGui's own ini writer is disabled; `src/ui/layout.zig` saves
 `layout.ini` crash-safely (tmp file + atomic rename) every 60 s when
 dirty, on workspace switch, and on exit. `ui_state.json` persists the
-active workspace, seed, and filters.
+active workspace, seed, filters, and every SET preference.

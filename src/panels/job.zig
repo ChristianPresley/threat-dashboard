@@ -11,7 +11,7 @@ const dash = @import("../dashboard.zig");
 const Dashboard = dash.Dashboard;
 
 fn stateColor(st: data.jobs.JobState) [4]f32 {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     return switch (st) {
         .queued => t.text.mid,
         .running => t.sev.info,
@@ -22,7 +22,7 @@ fn stateColor(st: data.jobs.JobState) [4]f32 {
 }
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const e = &d.jobs;
 
     // ── Header: queue stats + start buttons ─────────────────────────────

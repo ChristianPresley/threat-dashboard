@@ -24,18 +24,18 @@ fn startMetaEdit(d: *Dashboard, c: *const domain.Case) void {
 }
 
 fn caseStatusColor(st: domain.CaseStatus) [4]f32 {
-    const t = ui.theme.default.sev;
+    const t = ui.theme.active.sev;
     return switch (st) {
         .open => t.info,
         .active => t.warn,
         .contained => t.serious,
         .eradicated => t.ok,
-        .closed => ui.theme.default.text.lo,
+        .closed => ui.theme.active.text.lo,
     };
 }
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
     const s = &d.store;
 
     // ── Header: counts + case creation ───────────────────────────────────

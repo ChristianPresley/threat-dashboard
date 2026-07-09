@@ -8,7 +8,7 @@ const dash = @import("../dashboard.zig");
 const Dashboard = dash.Dashboard;
 
 pub fn render(d: *Dashboard) void {
-    const t = ui.theme.default;
+    const t = ui.theme.active;
 
     zgui.textColored(t.text.mid, "Every panel has a CODE \u{2014} type it into the command line (Ctrl+K) and press Enter.", .{});
     zgui.spacing();
