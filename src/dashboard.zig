@@ -481,15 +481,18 @@ const UiStateJson = struct {
     yar_fail_only: bool = false,
     tun_threshold: f32 = 0.5,
     // -- Preferences (SET) — additive; absent fields keep shipped defaults --
-    pref_theme: []const u8 = "dark",
+    // Keys are pref_<Prefs field name> — save and load DERIVE from
+    // ui.prefs.Prefs via inline for, so a new preference only needs its
+    // matching decl here (enum fields ride as tag strings).
+    pref_theme_variant: []const u8 = "dark",
     pref_sev_palette: []const u8 = "standard",
     pref_density: []const u8 = "cozy",
     pref_time_style: []const u8 = "utc",
     pref_font_scale: f32 = 1.0,
     pref_reduced_motion: bool = false,
-    pref_focus_ring: bool = false,
+    pref_focus_ring_always: bool = false,
     pref_toast_secs: f32 = 4.0,
-    pref_toast_min_sev: u32 = 0,
+    pref_toast_min_sev: u8 = 0,
     pref_dnd: bool = false,
     pref_startup_ws: []const u8 = "last",
     pref_ai_enabled: bool = true,
@@ -897,7 +900,11 @@ pub const Dashboard = struct {
 
     /// Send the assistant a message, serializing any attached context.
     pub fn assistantSend(self: *Dashboard, text: []const u8) void {
-        if (!ui.prefs.current.ai_enabled) return;
+        if (!ui.prefs.current.ai_enabled) {
+            // Never swallow user text silently — say why it went nowhere.
+            ui.events.post(.warn, "ai", "assistant is disabled (SET) — message not sent", .{});
+            return;
+        }
         const w = self.assistant.worker orelse return;
         self.appendChat(.user, text, "", false);
         // Build attached-context JSON from current selections, if requested.
@@ -1014,7 +1021,7 @@ pub const Dashboard = struct {
                 },
                 .state => |st| switch (st) {
                     .connected => ui.events.post(.ok, "db", "PG worker connected — snapshot refresh every {d} s", .{data.pg_worker.REFRESH_MS / 1000}),
-                    .reconnecting => ui.events.post(.warn, "db", "PG connection lost — reconnecting", .{}),
+                    .reconnecting => ui.events.post(.serious, "db", "PG connection lost — reconnecting; panels show the last snapshot", .{}),
                 },
                 .err => |m| {
                     ui.events.post(.warn, "db", "{s}", .{m});
@@ -1326,12 +1333,14 @@ pub const Dashboard = struct {
             self.panel_force_open[PANEL_SET] = true;
             self.panel_force_open[PANEL_HELP] = true;
             self.panel_force_open[PANEL_AI] = true;
-            self.panel_focus_request = PANEL_SET;
+            self.panel_focus_request = PANEL_AI;
         }
-        // SET foremost for the floats capture (main.zig HOLD-3): re-raise
-        // one frame after the trio appears — appearing windows take the
-        // top of the z-order, so the HOLD-6 focus alone loses to AI.
-        if (ws == .ops and hold_pos == VALIDATE_HOLD - 5) {
+        // Float choreography for the two extra captures (main.zig): AI is
+        // foremost from HOLD-6 and captured at HOLD-5 (ws-6-AI); SET is
+        // re-raised at HOLD-4 and captured at HOLD-3 (ws-5-FLOATS) —
+        // appearing windows take the z-order top, so the re-raise must be
+        // a later frame.
+        if (ws == .ops and hold_pos == VALIDATE_HOLD - 4) {
             self.panel_focus_request = PANEL_SET;
         }
         if (ws == .ops and hold_pos == VALIDATE_HOLD - 2) {
@@ -1350,6 +1359,12 @@ pub const Dashboard = struct {
         self.ensureAuditHook();
         // Relative timestamps ("3m ago") read this instead of the OS clock.
         ui.fmt.now_ts = unixNow();
+        ui.prefs.tickLocalOffset();
+        // SET defers style changes here — applying mid-frame tears the frame.
+        if (ui.prefs.apply_pending) {
+            ui.prefs.apply_pending = false;
+            ui.prefs.apply();
+        }
 
         // Event spine: per-frame flash clock + toast expiry + insert
         // flashes for events that arrived since the previous frame.
@@ -1459,8 +1474,9 @@ pub const Dashboard = struct {
         if (ctrl and !shift and zgui.isKeyPressed(.comma, false)) self.focusPanel(PANEL_SET);
 
         // Ctrl+P freezes/unfreezes data refresh (evidence capture: rows
-        // must not move under the cursor).
-        if (ctrl and !shift and zgui.isKeyPressed(.p, false)) self.togglePause();
+        // must not move under the cursor). Suppressed while typing — an
+        // accidental toggle would silently freeze the queue mid-shift.
+        if (ctrl and !shift and !zgui.io.getWantTextInput() and zgui.isKeyPressed(.p, false)) self.togglePause();
 
         // Ctrl+Shift+A opens the AI assistant.
         if (ctrl and shift and zgui.isKeyPressed(.a, false)) self.focusPanel(PANEL_AI);
@@ -1565,14 +1581,8 @@ pub const Dashboard = struct {
         }
 
         // ── Right: command line · ☰ View · clock (UTC or local per SET) ──
-        var clock_buf: [16]u8 = undefined;
-        var clock_full: [24]u8 = undefined;
-        const strip_local = ui.fmt.time_style == .local;
-        const strip_now = if (strip_local) unixNow() + @as(i64, ui.fmt.local_offset_min) * 60 else unixNow();
-        const clock_z = std.fmt.bufPrintZ(&clock_full, "{s} {s}", .{
-            ui.fmt.clock(&clock_buf, strip_now),
-            if (strip_local) "local" else "UTC",
-        }) catch "";
+        var clock_full: [32]u8 = undefined;
+        const clock_z = ui.fmt.wallClock(&clock_full, unixNow());
 
         const view_label: [:0]const u8 = fa_bars ++ " View";
         const style = zgui.getStyle();
@@ -2504,17 +2514,13 @@ pub const Dashboard = struct {
             }
         }
 
-        // Right side: seed · workspace · clock (footer clock stays absolute
-        // even in relative timestamp mode — "0s ago" tells nobody the time).
+        // Right side: seed · workspace · clock.
         var right_buf: [96]u8 = undefined;
-        var cb: [16]u8 = undefined;
-        const local_mode = ui.fmt.time_style == .local;
-        const clock_now = if (local_mode) unixNow() + @as(i64, ui.fmt.local_offset_min) * 60 else unixNow();
-        const right_txt = std.fmt.bufPrintZ(&right_buf, "seed {d} \u{00B7} {s} \u{00B7} {s} {s}", .{
+        var cb: [32]u8 = undefined;
+        const right_txt = std.fmt.bufPrintZ(&right_buf, "seed {d} \u{00B7} {s} \u{00B7} {s}", .{
             self.seed,
             ui.layout.active.tag(),
-            ui.fmt.clock(&cb, clock_now),
-            if (local_mode) "local" else "UTC",
+            ui.fmt.wallClock(&cb, unixNow()),
         }) catch "";
         const w = zgui.calcTextSize(right_txt, .{})[0];
         const avail = zgui.getContentRegionAvail()[0];
@@ -2536,8 +2542,7 @@ pub const Dashboard = struct {
         var jbuf: [2048]u8 = undefined;
         // Fields are JSON-escape-free by construction (enum tags, ints,
         // filter strings that panels keep to plain ASCII).
-        const p = &ui.prefs.current;
-        const json = std.fmt.bufPrint(&jbuf, "{{\n  \"schema_version\": 1,\n  \"workspace\": \"{s}\",\n  \"seed\": {d},\n  \"alq_show_closed\": {},\n  \"evt_filter\": \"{s}\",\n  \"alq_filter\": \"{s}\",\n  \"rul_filter\": \"{s}\",\n  \"ioc_filter\": \"{s}\",\n  \"yar_filter\": \"{s}\",\n  \"pip_filter\": \"{s}\",\n  \"alq_sev\": {d},\n  \"log_sev\": {d},\n  \"ioc_types\": {d},\n  \"evt_kinds\": {d},\n  \"yar_fail_only\": {},\n  \"tun_threshold\": {d:.3},\n  \"pref_theme\": \"{s}\",\n  \"pref_sev_palette\": \"{s}\",\n  \"pref_density\": \"{s}\",\n  \"pref_time_style\": \"{s}\",\n  \"pref_font_scale\": {d:.2},\n  \"pref_reduced_motion\": {},\n  \"pref_focus_ring\": {},\n  \"pref_toast_secs\": {d:.1},\n  \"pref_toast_min_sev\": {d},\n  \"pref_dnd\": {},\n  \"pref_startup_ws\": \"{s}\",\n  \"pref_ai_enabled\": {},\n  \"pref_sla_mtta_min\": {d:.1},\n  \"pref_sla_mttr_hours\": {d:.1}\n}}\n", .{
+        const base = std.fmt.bufPrint(&jbuf, "{{\n  \"schema_version\": 1,\n  \"workspace\": \"{s}\",\n  \"seed\": {d},\n  \"alq_show_closed\": {},\n  \"evt_filter\": \"{s}\",\n  \"alq_filter\": \"{s}\",\n  \"rul_filter\": \"{s}\",\n  \"ioc_filter\": \"{s}\",\n  \"yar_filter\": \"{s}\",\n  \"pip_filter\": \"{s}\",\n  \"alq_sev\": {d},\n  \"log_sev\": {d},\n  \"ioc_types\": {d},\n  \"evt_kinds\": {d},\n  \"yar_fail_only\": {},\n  \"tun_threshold\": {d:.3}", .{
             @tagName(ui.layout.active),
             self.seed,
             self.alq_show_closed,
@@ -2553,21 +2558,25 @@ pub const Dashboard = struct {
             packBools(7, &self.evt_kind_show),
             self.yar_fail_only,
             self.tun_threshold,
-            @tagName(p.theme_variant),
-            @tagName(p.sev_palette),
-            @tagName(p.density),
-            @tagName(p.time_style),
-            p.font_scale,
-            p.reduced_motion,
-            p.focus_ring_always,
-            p.toast_secs,
-            p.toast_min_sev,
-            p.dnd,
-            @tagName(p.startup_ws),
-            p.ai_enabled,
-            p.sla_mtta_min,
-            p.sla_mttr_hours,
         }) catch return;
+        // Preferences are DERIVED from the Prefs struct — a new field
+        // persists by existing (no positional format-arg pairing to skew).
+        var off: usize = base.len;
+        const p = &ui.prefs.current;
+        inline for (@typeInfo(ui.prefs.Prefs).@"struct".fields) |f| {
+            const v = @field(p.*, f.name);
+            const chunk = switch (@typeInfo(f.type)) {
+                .@"enum" => std.fmt.bufPrint(jbuf[off..], ",\n  \"pref_{s}\": \"{s}\"", .{ f.name, @tagName(v) }),
+                .bool => std.fmt.bufPrint(jbuf[off..], ",\n  \"pref_{s}\": {}", .{ f.name, v }),
+                .float => std.fmt.bufPrint(jbuf[off..], ",\n  \"pref_{s}\": {d:.2}", .{ f.name, v }),
+                .int => std.fmt.bufPrint(jbuf[off..], ",\n  \"pref_{s}\": {d}", .{ f.name, v }),
+                else => @compileError("unsupported pref field type: " ++ f.name),
+            } catch return;
+            off += chunk.len;
+        }
+        const tail = std.fmt.bufPrint(jbuf[off..], "\n}}\n", .{}) catch return;
+        off += tail.len;
+        const json = jbuf[0..off];
         ui.layout.atomicWrite(path, json) catch |err| {
             std.log.warn("ui_state: save failed: {s}", .{@errorName(err)});
         };
@@ -2615,30 +2624,23 @@ pub const Dashboard = struct {
         // fills prefs.current — the GUI boot path calls ui.prefs.apply()
         // after load (selftest runs headless, no zgui context to style).
         const p = &ui.prefs.current;
-        if (std.meta.stringToEnum(ui.theme.Variant, v.pref_theme)) |x| p.theme_variant = x;
-        if (std.meta.stringToEnum(ui.prefs.SevPalette, v.pref_sev_palette)) |x| p.sev_palette = x;
-        if (std.meta.stringToEnum(ui.prefs.Density, v.pref_density)) |x| p.density = x;
-        if (std.meta.stringToEnum(ui.fmt.TimeStyle, v.pref_time_style)) |x| p.time_style = x;
-        if (std.meta.stringToEnum(ui.prefs.StartupWs, v.pref_startup_ws)) |x| p.startup_ws = x;
-        p.font_scale = v.pref_font_scale;
-        p.reduced_motion = v.pref_reduced_motion;
-        p.focus_ring_always = v.pref_focus_ring;
-        p.toast_secs = v.pref_toast_secs;
-        p.toast_min_sev = @intCast(@min(v.pref_toast_min_sev, 2));
-        p.dnd = v.pref_dnd;
-        p.ai_enabled = v.pref_ai_enabled;
-        p.sla_mtta_min = v.pref_sla_mtta_min;
-        p.sla_mttr_hours = v.pref_sla_mttr_hours;
+        inline for (@typeInfo(ui.prefs.Prefs).@"struct".fields) |f| {
+            const jv = @field(v, "pref_" ++ f.name);
+            switch (@typeInfo(f.type)) {
+                // Unknown tag strings keep the shipped default — a renamed
+                // variant must never brick the state file.
+                .@"enum" => if (std.meta.stringToEnum(f.type, jv)) |x| {
+                    @field(p, f.name) = x;
+                },
+                else => @field(p, f.name) = jv,
+            }
+        }
         p.clampAll();
 
         // Startup workspace: a pinned choice overrides the remembered one.
-        switch (p.startup_ws) {
-            .last => {},
-            .triage => ui.layout.switchTo(.triage),
-            .hunt => ui.layout.switchTo(.hunt),
-            .detect => ui.layout.switchTo(.detect),
-            .intel => ui.layout.switchTo(.intel),
-            .ops => ui.layout.switchTo(.ops),
+        // StartupWs tags deliberately mirror layout.Workspace tags + "last".
+        if (p.startup_ws != .last) {
+            if (std.meta.stringToEnum(ui.layout.Workspace, @tagName(p.startup_ws))) |w| ui.layout.switchTo(w);
         }
         self.ui_state_last_ws = ui.layout.active;
 

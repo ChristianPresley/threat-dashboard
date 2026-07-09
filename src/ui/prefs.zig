@@ -99,8 +99,9 @@ pub const Prefs = struct {
     /// Do-not-disturb: no toasts at all (LOG + crit banner unaffected).
     dnd: bool = false,
     startup_ws: StartupWs = .last,
-    /// Hard off-switch for the embedded assistant (compliance): the AI
-    /// panel renders a notice and no worker thread is ever spawned.
+    /// Hard off-switch for the embedded assistant (compliance): sends are
+    /// blocked, SET cancels any in-flight run on disable, and the panel
+    /// renders a notice.
     ai_enabled: bool = true,
     /// Triage SLA targets — drive the MTTA/MTTR tile colors in PST.
     sla_mtta_min: f32 = 15.0,
@@ -117,9 +118,13 @@ pub const Prefs = struct {
 
 pub var current: Prefs = .{};
 
+/// Mid-frame style rewrites tear the frame (windows drawn before the
+/// change use the old style). SET sets this instead of calling apply();
+/// Dashboard.render consumes it at the top of the next frame.
+pub var apply_pending: bool = false;
+
 /// Push every preference into the modules that consume it. Cheap — call
-/// whenever anything changes (SET does it per interaction) and once at boot
-/// after ui_state.json load.
+/// at frame START only (boot, harness reset, the apply_pending drain).
 pub fn apply() void {
     current.clampAll();
 
@@ -128,6 +133,10 @@ pub fn apply() void {
     if (current.sev_palette == .cvd) {
         theme.active.sev = theme.sevCvd(theme.active.bg.panel);
         theme.active.score = theme.scoreCvd();
+    } else if (current.theme_variant != .dark) {
+        // Standard hues, non-default surfaces: the hand-tuned dims were
+        // blended against the dark panel — re-derive for this variant.
+        theme.active.sev = theme.deriveDims(theme.active.sev, theme.active.bg.panel);
     }
     theme.apply();
 
@@ -158,7 +167,6 @@ pub fn apply() void {
 
     // ── Notifications ─────────────────────────────────────────────────────
     events.toast_ttl_info_ms = @intFromFloat(current.toast_secs * 1000.0);
-    events.toast_ttl_warn_ms = @intFromFloat(current.toast_secs * 2000.0);
     events.toast_min_sev = @enumFromInt(current.toast_min_sev);
     events.dnd = current.dnd;
 
@@ -170,6 +178,20 @@ pub fn apply() void {
 pub fn resetAll() void {
     current = .{};
     apply();
+}
+
+// ── DST / timezone drift ──────────────────────────────────────────────────
+
+var last_offset_check: i64 = 0;
+
+/// Re-sample the OS timezone about once a minute — a SOC session runs for
+/// days and crosses DST transitions; a frozen boot-time offset would skew
+/// every "local" timestamp by an hour until restart. Reads fmt.now_ts
+/// (the frame clock) so it costs nothing between checks.
+pub fn tickLocalOffset() void {
+    if (fmt.now_ts - last_offset_check < 60) return;
+    last_offset_check = fmt.now_ts;
+    detectLocalOffset();
 }
 
 // ── Local timezone offset (for the "local" time style) ───────────────────
@@ -203,11 +225,17 @@ const kernel32 = struct {
 /// convention: UTC = local + Bias, so the display offset is the negation.
 pub fn detectLocalOffset() void {
     var tzi: TIME_ZONE_INFORMATION = undefined;
-    const code = kernel32.GetTimeZoneInformation(&tzi);
-    const extra: i32 = switch (code) {
+    // TIME_ZONE_ID_UNKNOWN(0)/STANDARD(1)/DAYLIGHT(2) fill tzi;
+    // TIME_ZONE_ID_INVALID (0xFFFFFFFF) leaves it undefined — reading Bias
+    // then would be garbage (and UB). Fall back to UTC.
+    const extra: i32 = switch (kernel32.GetTimeZoneInformation(&tzi)) {
+        0 => 0,
         1 => tzi.StandardBias,
         2 => tzi.DaylightBias,
-        else => 0,
+        else => {
+            fmt.local_offset_min = 0;
+            return;
+        },
     };
     fmt.local_offset_min = -(tzi.Bias + extra);
 }

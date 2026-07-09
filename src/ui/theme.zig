@@ -210,28 +210,30 @@ pub fn tokensFor(variant: Variant) Tokens {
     };
 }
 
+/// Recompute the five *_dim banner/fill tones against a surface. Variants
+/// change bg.panel — dims blended for the wrong surface read as a glow.
+pub fn deriveDims(sev: Severity, panel_bg: Rgba) Severity {
+    var s = sev;
+    s.ok_dim = mix(panel_bg, s.ok, 0.16);
+    s.info_dim = mix(panel_bg, s.info, 0.16);
+    s.warn_dim = mix(panel_bg, s.warn, 0.16);
+    s.serious_dim = mix(panel_bg, s.serious, 0.16);
+    s.crit_dim = mix(panel_bg, s.crit, 0.16);
+    return s;
+}
+
 /// Okabe-Ito severity ramp (CVD-safe): lightness rises monotonically
 /// crit→warn and hue survives all three dichromacies. Dim (banner) fills
 /// are derived at ~16% over the panel surface so variants stay coherent.
 pub fn sevCvd(panel_bg: Rgba) Severity {
-    const crit = hex(0xD55E00); // vermillion
-    const serious = hex(0xE69F00); // orange
-    const warn = hex(0xF0E442); // yellow
-    const info = hex(0x56B4E9); // sky blue
-    const ok = hex(0x009E73); // bluish green
-    return .{
-        .ok = ok,
-        .info = info,
-        .warn = warn,
-        .serious = serious,
-        .crit = crit,
+    return deriveDims(.{
+        .ok = hex(0x009E73), // bluish green
+        .info = hex(0x56B4E9), // sky blue
+        .warn = hex(0xF0E442), // yellow
+        .serious = hex(0xE69F00), // orange
+        .crit = hex(0xD55E00), // vermillion
         .off = hex(0x6E7681),
-        .ok_dim = mix(panel_bg, ok, 0.16),
-        .info_dim = mix(panel_bg, info, 0.16),
-        .warn_dim = mix(panel_bg, warn, 0.16),
-        .serious_dim = mix(panel_bg, serious, 0.16),
-        .crit_dim = mix(panel_bg, crit, 0.16),
-    };
+    }, panel_bg);
 }
 
 /// Score bands matching the CVD severity ramp (A best → F worst).

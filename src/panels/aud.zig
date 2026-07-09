@@ -24,7 +24,7 @@ pub fn render(d: *Dashboard) void {
 
     const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true };
     if (zgui.beginTable("##aud_table", .{ .column = 4, .flags = flags })) {
-        zgui.tableSetupColumn("Time", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 70 });
+        zgui.tableSetupColumn(ui.fmt.tsColHeader(), .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 70 });
         zgui.tableSetupColumn("Actor", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 76 });
         zgui.tableSetupColumn("Action", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 130 });
         zgui.tableSetupColumn("Target", .{ .flags = .{ .width_stretch = true } });

@@ -140,6 +140,29 @@ pub fn tsSuffix() [:0]const u8 {
     };
 }
 
+/// Time-column header carrying the frame of reference — a bare "Time"
+/// column over local/relative timestamps reads as UTC in an IR report.
+pub fn tsColHeader() [:0]const u8 {
+    return switch (time_style) {
+        .utc => "Time UTC",
+        .local => "Time local",
+        .relative => "Age",
+    };
+}
+
+/// Absolute wall clock + zone label for chrome (top strip, footer).
+/// Relative style keeps UTC — a live clock can't be an age. THE single
+/// place the chrome clock derives from, so strip and footer can't skew.
+pub fn wallClock(buf: []u8, now_secs: i64) [:0]const u8 {
+    const local = time_style == .local;
+    const shifted = if (local) now_secs + @as(i64, local_offset_min) * 60 else now_secs;
+    var cb: [16]u8 = undefined;
+    return std.fmt.bufPrintZ(buf, "{s} {s}", .{
+        clock(&cb, shifted),
+        if (local) "local" else "UTC",
+    }) catch unreachable_short(buf);
+}
+
 /// HH:MM:SS from a Unix timestamp (UTC). One "UTC" marker per panel header,
 /// not per cell (§3.2).
 pub fn clock(buf: []u8, ts_secs: i64) [:0]const u8 {

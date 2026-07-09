@@ -81,7 +81,7 @@ pub fn render(d: *Dashboard) void {
     };
     if (zgui.beginTable("##log_table", .{ .column = 4, .flags = flags })) {
         defer zgui.endTable();
-        zgui.tableSetupColumn("Time", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 84 });
+        zgui.tableSetupColumn(ui.fmt.tsColHeader(), .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 84 });
         zgui.tableSetupColumn("Sev", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 64 });
         zgui.tableSetupColumn("Source", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 84 });
         zgui.tableSetupColumn("Message", .{ .flags = .{ .width_stretch = true } });

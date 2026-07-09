@@ -66,7 +66,7 @@ pub fn render(d: *Dashboard) void {
     // (460px) exceeded the HUNT slot outright, crushing trailing columns
     // into unreadable fragments.
     const cols = [_]ui.table.Col{
-        .{ .name = "Time", .w = 72 },
+        .{ .name = ui.fmt.tsColHeader(), .w = 72 },
         .{ .name = "Host", .w = 100 },
         .{ .name = "Process", .w = 110, .prio = 1 },
         .{ .name = "Dst", .w = 150 },

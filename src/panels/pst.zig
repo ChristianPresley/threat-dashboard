@@ -103,10 +103,14 @@ pub fn render(d: *Dashboard) void {
             const n = by_sev[@intFromEnum(sv)];
             if (n > 0) {
                 const frac = @as(f32, @floatFromInt(n)) / @as(f32, @floatFromInt(open_total));
-                const seg = w * frac;
+                // Any nonzero count paints ≥2px — one critical alert in a
+                // sea of low must never vanish from this bar — and the
+                // 1px gap only applies when the segment can afford it.
+                const seg = @max(w * frac, 2);
+                const gap: f32 = if (seg > 3) 1 else 0;
                 dl.addRectFilled(.{
                     .pmin = .{ x, pos[1] },
-                    .pmax = .{ x + seg - 1, pos[1] + bar_h },
+                    .pmax = .{ @min(x + seg - gap, pos[0] + w), pos[1] + bar_h },
                     .col = zgui.colorConvertFloat4ToU32(dash.sevColor(sv)),
                 });
                 x += seg;

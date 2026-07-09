@@ -15,6 +15,12 @@ const Dashboard = dash.Dashboard;
 
 var filter_buf: [48:0]u8 = std.mem.zeroes([48:0]u8);
 
+/// Deferred-save latch: apply() is cheap enough to run per drag frame, but
+/// saveUiState() is a file write — dragging a slider must not rename
+/// ui_state.json 60×/s. Set by changed(), flushed at the end of render()
+/// once no widget is active.
+var save_pending: bool = false;
+
 /// Section gate: with a filter active, only matching sections render (and
 /// render open). Returns whether the section body should draw.
 fn section(name: [:0]const u8, keywords: []const u8, default_open: bool) bool {
@@ -29,10 +35,28 @@ fn section(name: [:0]const u8, keywords: []const u8, default_open: bool) bool {
     return zgui.collapsingHeader(name, .{ .default_open = default_open });
 }
 
-/// Post-change hook: apply live + persist.
+/// Post-change hook: apply at the top of the NEXT frame (a mid-frame
+/// style rewrite tears the frame), persist once the interaction ends.
 fn changed(d: *Dashboard) void {
-    ui.prefs.apply();
-    d.saveUiState();
+    _ = d;
+    ui.prefs.apply_pending = true;
+    save_pending = true;
+}
+
+/// One combo per preference enum: every variant exposes label(), selection
+/// writes through and queues apply+save. Keeps the five combos identical.
+fn enumCombo(comptime E: type, label: [:0]const u8, val: *E, d: *Dashboard) void {
+    zgui.setNextItemWidth(260);
+    if (zgui.beginCombo(label, .{ .preview_value = val.label() })) {
+        inline for (@typeInfo(E).@"enum".fields) |f| {
+            const v: E = @enumFromInt(f.value);
+            if (zgui.selectable(v.label(), .{ .selected = val.* == v })) {
+                val.* = v;
+                changed(d);
+            }
+        }
+        zgui.endCombo();
+    }
 }
 
 pub fn render(d: *Dashboard) void {
@@ -48,8 +72,9 @@ pub fn render(d: *Dashboard) void {
     _ = zgui.inputTextWithHint("##set_filter", .{ .hint = "filter settings (Ctrl+F)", .buf = &filter_buf });
     zgui.sameLine(.{ .spacing = 10 });
     if (zgui.smallButton("Reset ALL to defaults##set")) {
-        ui.prefs.resetAll();
-        d.saveUiState();
+        ui.prefs.current = .{};
+        ui.prefs.apply_pending = true; // applied at next frame start
+        save_pending = true;
         ui.events.post(.ok, "settings", "all preferences reset to shipped defaults", .{});
     }
     zgui.sameLine(.{ .spacing = 8 });
@@ -58,35 +83,15 @@ pub fn render(d: *Dashboard) void {
 
     // ── Appearance ───────────────────────────────────────────────────────
     if (section("Appearance", "theme dark midnight contrast color palette severity colorblind cvd font scale size density row height", true)) {
-        // Theme variant.
-        zgui.setNextItemWidth(260);
-        if (zgui.beginCombo("theme##set_theme", .{ .preview_value = p.theme_variant.label() })) {
-            inline for (@typeInfo(ui.theme.Variant).@"enum".fields) |f| {
-                const v: ui.theme.Variant = @enumFromInt(f.value);
-                if (zgui.selectable(v.label(), .{ .selected = p.theme_variant == v })) {
-                    p.theme_variant = v;
-                    changed(d);
-                }
-            }
-            zgui.endCombo();
-        }
+        enumCombo(ui.theme.Variant, "theme##set_theme", &p.theme_variant, d);
         zgui.sameLine(.{ .spacing = 8 });
         zgui.textColored(t.text.lo, "midnight = dim SOC floor \u{00B7} high contrast = AAA text", .{});
 
         // Severity palette + live swatch preview.
-        zgui.setNextItemWidth(260);
-        if (zgui.beginCombo("severity palette##set_pal", .{ .preview_value = p.sev_palette.label() })) {
-            inline for (@typeInfo(ui.prefs.SevPalette).@"enum".fields) |f| {
-                const v: ui.prefs.SevPalette = @enumFromInt(f.value);
-                if (zgui.selectable(v.label(), .{ .selected = p.sev_palette == v })) {
-                    p.sev_palette = v;
-                    changed(d);
-                }
-            }
-            zgui.endCombo();
-        }
+        enumCombo(ui.prefs.SevPalette, "severity palette##set_pal", &p.sev_palette, d);
         zgui.sameLine(.{ .spacing = 8 });
-        // Swatches render from the ACTIVE tokens, so this row IS the preview.
+        // Swatches render from the ACTIVE tokens, so this row IS the
+        // preview; grouped so the tooltip covers the whole row.
         const sw = [_]struct { name: [:0]const u8, c: [4]f32 }{
             .{ .name = "CRIT", .c = t.sev.crit },
             .{ .name = "HIGH", .c = t.sev.serious },
@@ -94,10 +99,12 @@ pub fn render(d: *Dashboard) void {
             .{ .name = "INFO", .c = t.sev.info },
             .{ .name = "OK", .c = t.sev.ok },
         };
+        zgui.beginGroup();
         inline for (sw, 0..) |s, i| {
             if (i > 0) zgui.sameLine(.{ .spacing = 6 });
             zgui.textColored(s.c, "\u{25A0} {s}", .{s.name});
         }
+        zgui.endGroup();
         if (zgui.isItemHovered(.{})) {
             if (zgui.beginTooltip()) {
                 zgui.text("Okabe-Ito ramp survives deuteranopia/protanopia/tritanopia;\nseverity always prints its label too \u{2014} color is never the only channel.", .{});
@@ -115,35 +122,14 @@ pub fn render(d: *Dashboard) void {
         zgui.sameLine(.{ .spacing = 8 });
         zgui.textColored(t.text.lo, "up to 200% (WCAG 1.4.4)", .{});
 
-        // Density.
-        zgui.setNextItemWidth(260);
-        if (zgui.beginCombo("density##set_den", .{ .preview_value = p.density.label() })) {
-            inline for (@typeInfo(ui.prefs.Density).@"enum".fields) |f| {
-                const v: ui.prefs.Density = @enumFromInt(f.value);
-                if (zgui.selectable(v.label(), .{ .selected = p.density == v })) {
-                    p.density = v;
-                    changed(d);
-                }
-            }
-            zgui.endCombo();
-        }
+        enumCombo(ui.prefs.Density, "density##set_den", &p.density, d);
         zgui.sameLine(.{ .spacing = 8 });
         zgui.textColored(t.text.lo, "comfortable reaches \u{2265}24px hit targets (WCAG 2.5.8)", .{});
     }
 
     // ── Time & tables ────────────────────────────────────────────────────
     if (section("Time & tables", "timestamp utc local relative timezone clock age", true)) {
-        zgui.setNextItemWidth(260);
-        if (zgui.beginCombo("timestamps##set_ts", .{ .preview_value = p.time_style.label() })) {
-            inline for (@typeInfo(ui.fmt.TimeStyle).@"enum".fields) |f| {
-                const v: ui.fmt.TimeStyle = @enumFromInt(f.value);
-                if (zgui.selectable(v.label(), .{ .selected = p.time_style == v })) {
-                    p.time_style = v;
-                    changed(d);
-                }
-            }
-            zgui.endCombo();
-        }
+        enumCombo(ui.fmt.TimeStyle, "timestamps##set_ts", &p.time_style, d);
         zgui.sameLine(.{ .spacing = 8 });
         var ex1: [16]u8 = undefined;
         zgui.textColored(t.text.lo, "a 4-min-old row shows \u{201C}{s}\u{201D} \u{00B7} local offset {d} min", .{
@@ -190,6 +176,15 @@ pub fn render(d: *Dashboard) void {
 
         if (zgui.smallButton("Send a test toast##set")) {
             ui.events.post(.info, "settings", "test toast \u{2014} this is what {d:.0}s feels like", .{p.toast_secs});
+        }
+        // The test posts .info — say so when the analyst's own gates would
+        // swallow it, or the button looks broken.
+        if (p.dnd) {
+            zgui.sameLine(.{ .spacing = 8 });
+            zgui.textColored(t.sev.warn, "DND is on \u{2014} the test lands in LOG only (that's the setting working)", .{});
+        } else if (p.toast_min_sev > 1) {
+            zgui.sameLine(.{ .spacing = 8 });
+            zgui.textColored(t.sev.warn, "floor is warnings-only \u{2014} an info test lands in LOG only", .{});
         }
     }
 
@@ -279,10 +274,15 @@ pub fn render(d: *Dashboard) void {
         if (zgui.checkbox("enable the AI assistant##set_ai", .{ .v = &ai_on })) {
             p.ai_enabled = ai_on;
             changed(d);
-            if (!ai_on) ui.events.post(.info, "settings", "AI assistant disabled \u{2014} no worker runs, nothing leaves the machine", .{});
+            if (!ai_on) {
+                // Hard-off must also stop an in-flight agentic run — the
+                // cancel flag aborts it at the next loop boundary.
+                if (d.assistant.worker) |w| w.cancel();
+                ui.events.post(.info, "settings", "AI assistant disabled \u{2014} new requests blocked, in-flight run canceled", .{});
+            }
         }
         zgui.sameLine(.{ .spacing = 8 });
-        zgui.textColored(t.text.lo, "hard off-switch \u{2014} compliance-safe", .{});
+        zgui.textColored(t.text.lo, "blocks new requests + cancels any in-flight run", .{});
 
         const cfg = &d.assistant.cfg;
         if (cfg.configured()) {
@@ -301,17 +301,7 @@ pub fn render(d: *Dashboard) void {
 
     // ── Startup & layout ─────────────────────────────────────────────────
     if (section("Startup & layout", "workspace boot launch default reset save autosave", false)) {
-        zgui.setNextItemWidth(260);
-        if (zgui.beginCombo("startup workspace##set_sw", .{ .preview_value = p.startup_ws.label() })) {
-            inline for (@typeInfo(ui.prefs.StartupWs).@"enum".fields) |f| {
-                const v: ui.prefs.StartupWs = @enumFromInt(f.value);
-                if (zgui.selectable(v.label(), .{ .selected = p.startup_ws == v })) {
-                    p.startup_ws = v;
-                    changed(d);
-                }
-            }
-            zgui.endCombo();
-        }
+        enumCombo(ui.prefs.StartupWs, "startup workspace##set_sw", &p.startup_ws, d);
         zgui.sameLine(.{ .spacing = 8 });
         zgui.textColored(t.text.lo, "\u{201C}last used\u{201D} restores whatever was open at exit", .{});
 
@@ -332,5 +322,11 @@ pub fn render(d: *Dashboard) void {
     if (section("About", "version keyboard help", false)) {
         zgui.textColored(t.text.mid, "threat-dashboard \u{00B7} Zig + Vulkan + ImGui docking", .{});
         zgui.textColored(t.text.lo, "F1\u{2026}F5 workspaces \u{00B7} Ctrl+K command line \u{00B7} ? directory \u{00B7} Ctrl+Shift+A assistant \u{00B7} Ctrl+P pause", .{});
+    }
+
+    // Deferred persistence: one write when the drag/click ends, not per frame.
+    if (save_pending and !zgui.isAnyItemActive()) {
+        save_pending = false;
+        d.saveUiState();
     }
 }

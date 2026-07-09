@@ -29,7 +29,7 @@ pub fn render(d: *Dashboard) void {
         defer zgui.popTextWrapPos();
         zgui.textColored(t.text.lo, "{s} AI assistant disabled", .{ui.fonts.fa.circle_info});
         zgui.spacing();
-        zgui.textWrapped("The assistant is switched off in Settings (SET \u{2192} AI assistant). No worker thread runs and nothing leaves the machine while disabled.", .{});
+        zgui.textWrapped("The assistant is switched off in Settings (SET \u{2192} AI assistant). New requests are blocked and any in-flight run was canceled when it was switched off.", .{});
         return;
     }
 

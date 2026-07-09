@@ -132,7 +132,9 @@ pub const TOAST_CAP = 3;
 // Notification prefs (SET · WCAG 2.2.1 adjustable timing). Every event
 // still lands in the ring/LOG regardless — these only gate the popups.
 pub var toast_ttl_info_ms: i64 = 4_000;
-pub var toast_ttl_warn_ms: i64 = 8_000;
+/// Warnings linger 2x the base TTL — the invariant lives here, not in
+/// whoever sets the base.
+pub const WARN_TTL_FACTOR: i64 = 2;
 /// Events below this severity never toast (they still log).
 pub var toast_min_sev: Severity = .ok;
 /// Do-not-disturb: no toasts at all. serious/crit still escalate to the
@@ -170,7 +172,7 @@ fn onPost(e: *const Event) void {
         .ok, .info, .warn => {
             if (dnd) return;
             if (@intFromEnum(e.sev) < @intFromEnum(toast_min_sev)) return;
-            const ttl_ms: i64 = if (e.sev == .warn) toast_ttl_warn_ms else toast_ttl_info_ms;
+            const ttl_ms: i64 = if (e.sev == .warn) toast_ttl_info_ms * WARN_TTL_FACTOR else toast_ttl_info_ms;
             const t = Toast{ .seq = e.seq, .expires_ms = e.ts_ms + ttl_ms };
             // Fill a free slot, else displace the oldest unpinned.
             var oldest: ?usize = null;

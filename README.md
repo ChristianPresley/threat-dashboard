@@ -152,8 +152,8 @@ change takes effect the frame it happens and persists to
 - **Data & world** — `Ctrl+P` pauses all data refresh (mock trickle,
   scheduler, and PG snapshot swaps) so rows don't move under the cursor
   during evidence capture; panel actions still write.
-- **AI assistant** — a hard off-switch: no worker thread runs and
-  nothing leaves the machine while disabled.
+- **AI assistant** — a hard off-switch: new requests are blocked and
+  any in-flight run is canceled the moment it's disabled.
 
 Known limitation, stated honestly: ImGui exposes no OS accessibility
 tree, so screen readers cannot see the UI; LOG's `Ctrl+E` CSV export is

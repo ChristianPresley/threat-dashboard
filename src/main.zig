@@ -641,10 +641,14 @@ pub fn main(init: std.process.Init) !void {
         const hold_pos = (Dashboard.VALIDATE_TOTAL -| cycle_before) % Dashboard.VALIDATE_HOLD;
         const capture_this_frame = screenshot_dir != null and forced_ws != null and
             hold_pos == Dashboard.VALIDATE_HOLD - 8;
-        // Second OPS capture with the floating panels (SET/HELP/AI) open —
-        // they're forced open at HOLD-6, so HOLD-3 shows them settled.
+        // Extra OPS captures with the floating panels (SET/HELP/AI) open —
+        // forced open at HOLD-6 with AI foremost (captured HOLD-5); SET is
+        // re-raised at HOLD-4 (captured HOLD-3). Keep these offsets in sync
+        // with tickValidateHarness.
         const capture_floats = screenshot_dir != null and forced_ws != null and
             forced_ws.? == .ops and hold_pos == Dashboard.VALIDATE_HOLD - 3;
+        const capture_ai = screenshot_dir != null and forced_ws != null and
+            forced_ws.? == .ops and hold_pos == Dashboard.VALIDATE_HOLD - 5;
 
         zgui.newFrame();
         dashboard.render(dt);
@@ -672,6 +676,10 @@ pub fn main(init: std.process.Init) !void {
             const cap = try renderer.endFrameCapture(ctx, allocator);
             defer allocator.free(cap.pixels);
             writeScreenshot(allocator, io, screenshot_dir.?, "ws-5-FLOATS", cap);
+        } else if (capture_ai) {
+            const cap = try renderer.endFrameCapture(ctx, allocator);
+            defer allocator.free(cap.pixels);
+            writeScreenshot(allocator, io, screenshot_dir.?, "ws-6-AI", cap);
         } else {
             try renderer.endFrame(ctx);
         }

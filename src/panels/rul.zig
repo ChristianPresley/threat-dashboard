@@ -93,15 +93,21 @@ pub fn render(d: *Dashboard) void {
     const detail_h: f32 = if (d.rul_sel != null) 120 else 0;
     const table_h = @max(80, avail[1] - detail_h);
 
-    const flags = zgui.TableFlags{ .resizable = true, .borders = .{ .inner_h = true }, .scroll_y = true, .sortable = false };
-    if (zgui.beginTable("##rul_table", .{ .column = 7, .flags = flags, .outer_size = .{ avail[0], table_h } })) {
-        zgui.tableSetupColumn("Code", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 62 });
-        zgui.tableSetupColumn("Status", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 74 });
-        zgui.tableSetupColumn("Sev", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 46 });
-        zgui.tableSetupColumn("Name", .{ .flags = .{ .width_stretch = true } });
-        zgui.tableSetupColumn("Technique", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 84 });
-        zgui.tableSetupColumn("Fires 7d", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 64 });
-        zgui.tableSetupColumn("FP%", .{ .flags = .{ .width_fixed = true }, .init_width_or_height = 48 });
+    const flags = zgui.TableFlags{ .resizable = true, .no_saved_settings = true, .borders = .{ .inner_h = true }, .scroll_y = true, .sortable = false };
+    // Width plan: Technique drops first (repeated in the detail pane),
+    // then FP%, then Fires — Name must keep readable width in narrow docks.
+    const cols = [_]ui.table.Col{
+        .{ .name = "Code", .w = 62 },
+        .{ .name = "Status", .w = 74 },
+        .{ .name = "Sev", .w = 46 },
+        .{ .name = "Name" },
+        .{ .name = "Technique", .w = 84, .prio = 3 },
+        .{ .name = "Fires 7d", .w = 64, .prio = 1 },
+        .{ .name = "FP%", .w = 48, .prio = 2 },
+    };
+    const pl = ui.table.plan(&cols, avail[0], 170);
+    if (zgui.beginTable("##rul_table", .{ .column = pl.count, .flags = flags, .outer_size = .{ avail[0], table_h } })) {
+        ui.table.setup(&cols, &pl);
         zgui.tableSetupScrollFreeze(0, 1);
         zgui.tableHeadersRow();
 
@@ -130,13 +136,19 @@ pub fn render(d: *Dashboard) void {
             zgui.textColored(dash.sevColor(r.severity), "{s}", .{r.severity.label()});
             _ = zgui.tableNextColumn();
             zgui.textUnformattedColored(if (r.status == .disabled) t.text.lo else t.text.hi, r.name.slice());
-            _ = zgui.tableNextColumn();
-            zgui.textColored(t.text.mid, "{s}", .{domain.attack.get(r.technique).id});
-            _ = zgui.tableNextColumn();
-            zgui.textColored(t.text.mid, "{d}", .{r.fires_7d});
-            _ = zgui.tableNextColumn();
-            const fp = r.fpRate() * 100;
-            zgui.textColored(if (fp > 50) t.sev.warn else t.text.mid, "{d:.0}", .{fp});
+            if (pl.on(4)) {
+                _ = zgui.tableNextColumn();
+                zgui.textColored(t.text.mid, "{s}", .{domain.attack.get(r.technique).id});
+            }
+            if (pl.on(5)) {
+                _ = zgui.tableNextColumn();
+                zgui.textColored(t.text.mid, "{d}", .{r.fires_7d});
+            }
+            if (pl.on(6)) {
+                _ = zgui.tableNextColumn();
+                const fp = r.fpRate() * 100;
+                zgui.textColored(if (fp > 50) t.sev.warn else t.text.mid, "{d:.0}", .{fp});
+            }
         }
         zgui.endTable();
     }
