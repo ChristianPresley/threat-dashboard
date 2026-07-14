@@ -1,0 +1,1 @@
+Behavior-level guide to the Claude Code `/goal` command · documents observable behavior and public hooks mechanics only · see [Methodology & Scope](Methodology-and-Scope) · authoritative reference: [Claude Code docs](https://docs.claude.com/en/docs/claude-code/overview)
